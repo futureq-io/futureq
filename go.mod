@@ -1,4 +1,4 @@
-module github.com/futureq-io/futureq-server
+module github.com/futureq-io/futureq
 
 go 1.23
 
