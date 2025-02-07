@@ -87,6 +87,7 @@ func (h *eightAryHeap) down(i int) {
 				minIdx = child
 			}
 		}
+
 		if minIdx == i {
 			break
 		}
