@@ -1,12 +1,16 @@
 package tree
 
-import "container/list"
+import (
+	"container/list"
+	"slices"
+)
 
 type EightAryHeap interface {
 	Insert(val float64)
 	RangeQuery(min, max float64) []float64
 	PopRangeQuery(min, max float64) []float64
 	Len() int
+	Split() EightAryHeap
 }
 
 type eightAryHeap struct {
@@ -111,6 +115,22 @@ func (h *eightAryHeap) PopRangeQuery(min, max float64) []float64 {
 	return result
 }
 
+func (h *eightAryHeap) Split() EightAryHeap {
+	data := h.values
+	slices.Sort(data)
+
+	mid := len(data) / 2
+	left := data[:mid]
+	right := data[mid:]
+
+	h.convertSortedArrayToHeap(left)
+
+	newHeap := eightAryHeap{}
+	newHeap.convertSortedArrayToHeap(right)
+
+	return &newHeap
+}
+
 ////////////////////////////////////////////////////////////////////
 //       				Helper Functions                          //
 ////////////////////////////////////////////////////////////////////
@@ -169,5 +189,15 @@ func (h *eightAryHeap) removeAt(index int) {
 	// Restore heap property
 	if index < len(h.values) {
 		h.heapifyDown(index)
+	}
+}
+
+func (h *eightAryHeap) convertSortedArrayToHeap(arr []float64) {
+	h.values = arr
+	n := len(h.values)
+
+	// Start heapify from the last non-leaf node
+	for i := (n - 1) / 8; i >= 0; i-- {
+		h.heapifyDown(i)
 	}
 }
