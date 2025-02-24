@@ -47,6 +47,50 @@ func (tree *bPlusPlusTree) Insert(value float64) {
 	}
 }
 
+// RangeQuery returns values within the range [min, max]
+func (tree *bPlusPlusTree) RangeQuery(min, max float64) []float64 {
+	var result []float64
+	node := tree.findLeafNode(min)
+
+	// Scan leaf nodes until max is exceeded
+	for node != nil {
+		res := node.heap.RangeQuery(min, max)
+		result = append(result, res...)
+
+		if len(res) != node.heap.Len() {
+			return result
+		}
+
+		node = node.next
+	}
+
+	return result
+}
+
+// PopRangeQuery removes and returns values within the range [min, max]
+func (tree *bPlusPlusTree) PopRangeQuery(min, max float64) []float64 {
+	var result []float64
+	node := tree.findLeafNode(min)
+	var prev *bPlusTreeNode // Tracks the previous node in the linked list
+
+	// Traverse leaf nodes and remove matching keys
+	for node != nil {
+		res := node.heap.PopRangeQuery(min, max)
+		result = append(result, res...)
+
+		// If the node is empty, remove it
+		if node.heap.Len() == 0 {
+			tree.removeLeafNode(node, prev)
+		} else {
+			prev = node // Update prev only if node still exists
+		}
+
+		node = node.next
+	}
+
+	return result
+}
+
 ////////////////////////////////////////////////////////////////////
 //       				Helper Functions                          //
 ////////////////////////////////////////////////////////////////////
@@ -125,44 +169,40 @@ func (node *bPlusTreeNode) splitInternal() (float64, *bPlusTreeNode) {
 	return splitKey, newNode // Return split key and new internal node
 }
 
-// RangeQuery returns values within the range [min, max]
-func (tree *bPlusPlusTree) RangeQuery(min, max float64) []float64 {
-	var result []float64
-	node := tree.findLeafNode(min)
-
-	// Scan leaf nodes until max is exceeded
-	for node != nil {
-		res := node.heap.RangeQuery(min, max)
-		result = append(result, res...)
-
-		if len(res) != node.heap.Len() {
-			return result
-		}
-
-		node = node.next
+// removeLeafNode removes a leaf node and updates parents recursively
+func (tree *bPlusPlusTree) removeLeafNode(leaf *bPlusTreeNode, prev *bPlusTreeNode) {
+	// Step 1: Update the linked list
+	if prev != nil {
+		prev.next = leaf.next // Bypass this node in linked list
+	} else if tree.root == leaf {
+		tree.root = nil // If the only node is removed, reset tree
+		return
 	}
 
-	return result
+	// Step 2: Find and remove the leaf from its parent
+	tree.removeFromParent(tree.root, leaf)
 }
 
-// PopRangeQuery removes and returns values within the range [min, max]
-func (tree *BPTree) PopRangeQuery(min, max float64) []float64 {
-	var result []float64
-	node := tree.findLeafNode(min)
-
-	for node != nil {
-		newKeys := node.keys[:0] // Create new slice to store remaining keys
-		for _, key := range node.keys {
-			if key >= min && key <= max {
-				result = append(result, key) // Add to result
-			} else {
-				newKeys = append(newKeys, key) // Keep the key
-			}
-		}
-		node.keys = newKeys // Update node keys
-		node = node.next
+// removeFromParent removes a child node reference from its parent
+func (tree *bPlusPlusTree) removeFromParent(parent, child *bPlusTreeNode) {
+	if parent == nil || parent.isLeaf {
+		return // No parent found or root is a leaf
 	}
-	return result
+
+	// Find the child in the parent's children list
+	for i, c := range parent.children {
+		if c == child {
+			// Remove the child reference
+			parent.children = append(parent.children[:i], parent.children[i+1:]...)
+			parent.keys = append(parent.keys[:i], parent.keys[i+1:]...)
+			break
+		}
+	}
+
+	// If parent is now empty, remove it recursively
+	if len(parent.children) == 0 {
+		tree.removeFromParent(tree.root, parent)
+	}
 }
 
 // findLeafNode locates the correct leaf node for a given value
