@@ -1,0 +1,11 @@
+rabbitmq:
+  rabbitmq_server:
+    host: "127.0.0.1"
+    port: 5672
+    username: guest
+    password: guest
+    virtual_host: ""
+  rabbitmq_data_exchange:
+    consume_queue_name: "consume-queue"
+    declare_queue: false
+    produce_queue_name: "produce-queue"
