@@ -33,7 +33,9 @@ func init() {
 
 func startRun(_ *cobra.Command, _ []string) {
 	logger, _ := zap.NewDevelopment()
-	defer logger.Sync()
+	defer func() {
+		_ = logger.Sync()
+	}()
 
 	cfg, err := config.PrepareConfig(configFile)
 	if err != nil {

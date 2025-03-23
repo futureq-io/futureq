@@ -25,13 +25,10 @@ func NewTicker(strg storage.TaskStorage, q q.Q) Ticker {
 
 func (t *ticker) Tick() {
 	ticker := time.NewTicker(1 * time.Second)
-	for {
-		select {
-		case tickedAt := <-ticker.C:
-			result := t.strg.PopLesserThan(tickedAt)
-			for _, re := range result {
-				t.q.Publish(re.Payload())
-			}
+	for tickedAt := range ticker.C {
+		result := t.strg.PopLesserThan(tickedAt)
+		for _, re := range result {
+			t.q.Publish(re.Payload())
 		}
 	}
 }
