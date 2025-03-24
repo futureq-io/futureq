@@ -2,6 +2,9 @@ observability:
   logging:
     level: info
 
+persistence:
+  path: "./data"
+
 rabbitmq:
   rabbitmq_server:
     host: "127.0.0.1"

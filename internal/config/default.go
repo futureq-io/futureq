@@ -6,5 +6,8 @@ var defaultConfig = Config{
 			Level: "info",
 		},
 	},
+	Persistence: Persistence{
+		Path: "./data",
+	},
 	RabbitMQ: nil,
 }
