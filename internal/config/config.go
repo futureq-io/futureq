@@ -11,6 +11,7 @@ import (
 
 type Config struct {
 	Observability Observability `mapstructure:"observability" yaml:"observability"`
+	Persistence   Persistence   `mapstructure:"persistence" yaml:"persistence"`
 	RabbitMQ      *RabbitMQ     `mapstructure:"rabbitmq" yaml:"rabbitmq"`
 }
 
