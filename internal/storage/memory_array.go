@@ -92,7 +92,7 @@ func (s *memoryArray) lesserThan(v time.Time) ([]task, int) {
 		payload, closer, _ := s.db.Get([]byte(result[i].id))
 		_ = closer.Close()
 
-		s.db.Delete([]byte(result[i].id), nil)
+		_ = s.db.Delete([]byte(result[i].id), nil)
 
 		result[i].payload = payload
 	}
