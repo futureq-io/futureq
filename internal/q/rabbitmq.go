@@ -2,8 +2,8 @@ package q
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"log"
 	"strconv"
 	"time"
 
@@ -19,12 +19,14 @@ type rabbitMQ struct {
 	logger     *zap.Logger
 	rabbitConn *amqp.Connection
 	rabbitChan *amqp.Channel
+	storage    storage.TaskStorage
 }
 
-func NewRabbitMQ(cfg config.RabbitMQ, logger *zap.Logger) Q {
+func NewRabbitMQ(cfg config.RabbitMQ, logger *zap.Logger, taskStorage storage.TaskStorage) Q {
 	return &rabbitMQ{
-		cfg:    cfg,
-		logger: logger,
+		cfg:     cfg,
+		logger:  logger,
+		storage: taskStorage,
 	}
 }
 
@@ -44,7 +46,7 @@ func (r *rabbitMQ) Connect() error {
 	return nil
 }
 
-func (r *rabbitMQ) Consume(storage storage.TaskStorage) error {
+func (r *rabbitMQ) Consume() error {
 	if r.cfg.RabbitMQDataExchange.DeclareQueue {
 		_, err := r.rabbitChan.QueueDeclare(
 			r.cfg.RabbitMQDataExchange.ConsumeQueueName,
@@ -60,7 +62,7 @@ func (r *rabbitMQ) Consume(storage storage.TaskStorage) error {
 		}
 	}
 
-	msgs, err := r.rabbitChan.Consume(
+	deliveryChan, err := r.rabbitChan.Consume(
 		r.cfg.RabbitMQDataExchange.ConsumeQueueName,
 		"",
 		true,
@@ -73,42 +75,63 @@ func (r *rabbitMQ) Consume(storage storage.TaskStorage) error {
 		return fmt.Errorf("error in consuming queue: %w", err)
 	}
 
-	go r.consumeLoop(msgs, storage)
-
-	log.Printf(" [*] Waiting for messages. To exit press CTRL+C")
+	go r.consumeLoop(deliveryChan, r.cfg.RabbitMQDataExchange.ConsumeQueueName)
 
 	return nil
 }
 
-func (r *rabbitMQ) consumeLoop(msgs <-chan amqp.Delivery, strg storage.TaskStorage) {
-	for d := range msgs {
-		xFutureReceiveAtVal, ok := d.Headers[xFutureReceiveAtHeader]
-		if !ok {
-			r.logger.Error("Failed to get xFutureReceiveAtHeader")
-			continue
-		}
+func (r *rabbitMQ) consumeLoop(deliveryChan <-chan amqp.Delivery, queue string) {
+	for delivery := range deliveryChan {
 
-		var receivedAt time.Time
-		if xFutureReceiveAtInt64, ok := xFutureReceiveAtVal.(int64); ok {
-			receivedAt = time.UnixMilli(xFutureReceiveAtInt64)
-		} else if xFutureReceiveAtUInt64, ok := xFutureReceiveAtVal.(uint64); ok {
-			receivedAt = time.UnixMilli(int64(xFutureReceiveAtUInt64))
-		} else if xFutureReceiveAtString, ok := xFutureReceiveAtVal.(string); ok {
-			xFutureReceiveAtParsed, err := strconv.ParseInt(xFutureReceiveAtString, 10, 64)
-			if err != nil {
-				r.logger.Error("Failed to get xFutureReceiveAtVal")
-				continue
-			}
+		startedAt := time.Now()
+		err := r.handleDelivery(delivery)
+		duration := time.Since(startedAt)
 
-			receivedAt = time.UnixMilli(xFutureReceiveAtParsed)
+		log := r.logger.With(
+			zap.String("exchange", delivery.Exchange),
+			zap.String("queue", queue),
+			zap.String("routing_key", delivery.RoutingKey),
+			zap.String("consumer_tag", delivery.ConsumerTag),
+			zap.Uint64("delivery_tag", delivery.DeliveryTag),
+			zap.String("message_id", delivery.MessageId),
+			zap.String("user_id", delivery.UserId),
+			zap.String("app_id", delivery.AppId),
+			zap.Error(err),
+			zap.String("duration", duration.String()),
+		)
+		if err != nil {
+			log.Error("error in processing message")
 		} else {
-			r.logger.Error("Failed to get xFutureReceiveAtVal")
-			continue
+			log.Debug("message processed successfully")
+		}
+	}
+}
+
+func (r *rabbitMQ) handleDelivery(delivery amqp.Delivery) error {
+	xFutureReceiveAtVal, ok := delivery.Headers[xFutureReceiveAtHeader]
+	if !ok {
+		return ErrReceivedAtHeaderNotExists
+	}
+
+	var receivedAt time.Time
+	if xFutureReceiveAtInt64, ok := xFutureReceiveAtVal.(int64); ok {
+		receivedAt = time.UnixMilli(xFutureReceiveAtInt64)
+	} else if xFutureReceiveAtUInt64, ok := xFutureReceiveAtVal.(uint64); ok {
+		receivedAt = time.UnixMilli(int64(xFutureReceiveAtUInt64))
+	} else if xFutureReceiveAtString, ok := xFutureReceiveAtVal.(string); ok {
+		xFutureReceiveAtParsed, err := strconv.ParseInt(xFutureReceiveAtString, 10, 64)
+		if err != nil {
+			return ErrInvalidReceivedAtHeaderFormat
 		}
 
-		r.logger.Debug("Received a message")
-		strg.Add(d.Body, receivedAt)
+		receivedAt = time.UnixMilli(xFutureReceiveAtParsed)
+	} else {
+		return ErrInvalidReceivedAtHeaderFormat
 	}
+
+	r.storage.Add(delivery.Body, receivedAt)
+
+	return nil
 }
 
 func (r *rabbitMQ) Publish(payload []byte) {
@@ -141,4 +164,9 @@ func (r *rabbitMQ) Close() {
 
 const (
 	xFutureReceiveAtHeader = "x-future-deliver-at"
+)
+
+var (
+	ErrReceivedAtHeaderNotExists     = errors.New("received at header does not exist")
+	ErrInvalidReceivedAtHeaderFormat = errors.New("invalid received at header format")
 )
