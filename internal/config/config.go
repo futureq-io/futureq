@@ -10,7 +10,8 @@ import (
 )
 
 type Config struct {
-	RabbitMQ *RabbitMQ `mapstructure:"rabbitmq" yaml:"rabbitmq"`
+	Observability Observability `mapstructure:"observability" yaml:"observability"`
+	RabbitMQ      *RabbitMQ     `mapstructure:"rabbitmq" yaml:"rabbitmq"`
 }
 
 func PrepareConfig(path *string) (*Config, error) {
