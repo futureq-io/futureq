@@ -10,7 +10,7 @@ type EightAryHeap interface {
 	RangeQuery(min, max float64) []float64
 	PopRangeQuery(min, max float64) []float64
 	Len() int
-	Split() EightAryHeap
+	Split() (EightAryHeap, float64)
 }
 
 type eightAryHeap struct {
@@ -115,20 +115,21 @@ func (h *eightAryHeap) PopRangeQuery(min, max float64) []float64 {
 	return result
 }
 
-func (h *eightAryHeap) Split() EightAryHeap {
+func (h *eightAryHeap) Split() (EightAryHeap, float64) {
 	data := h.values
 	slices.Sort(data)
 
 	mid := len(data) / 2
-	left := data[:mid]
-	right := data[mid:]
+	var left, right []float64
+	left = append(left, data[:mid]...)
+	right = append(right, data[mid:]...)
 
 	h.convertSortedArrayToHeap(left)
 
-	newHeap := eightAryHeap{}
+	newHeap := new(eightAryHeap)
 	newHeap.convertSortedArrayToHeap(right)
 
-	return &newHeap
+	return newHeap, right[0]
 }
 
 ////////////////////////////////////////////////////////////////////
