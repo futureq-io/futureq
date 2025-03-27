@@ -23,6 +23,8 @@ func NewEightAryHeap() EightAryHeap {
 
 // Insert into the heap with 8-ary logic
 func (h *eightAryHeap) Insert(val float64) {
+	// TODO: don't set duplicate values
+
 	h.values = append(h.values, val)
 	h.heapifyUp(len(h.values) - 1)
 }
@@ -129,7 +131,7 @@ func (h *eightAryHeap) Split() (EightAryHeap, float64) {
 	newHeap := new(eightAryHeap)
 	newHeap.convertSortedArrayToHeap(right)
 
-	return newHeap, right[0]
+	return newHeap, data[mid-1]
 }
 
 ////////////////////////////////////////////////////////////////////

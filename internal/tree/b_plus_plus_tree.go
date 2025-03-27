@@ -2,6 +2,7 @@ package tree
 
 import (
 	"fmt"
+	"slices"
 	"sort"
 )
 
@@ -48,6 +49,7 @@ func (tree *bPlusPlusTree) Insert(value float64) {
 			children: []*bPlusTreeNode{root, newChild},
 			isLeaf:   false,
 		}
+
 		tree.root = newRoot
 	}
 }
@@ -59,19 +61,15 @@ func (tree *bPlusPlusTree) RangeQuery(min, max float64) []float64 {
 
 	// Scan leaf nodes until max is exceeded
 	for node != nil {
-		fmt.Println("^^ heap:", node.heap.(*eightAryHeap).values, "keys:", node.keys)
 		res := node.heap.RangeQuery(min, max)
 		result = append(result, res...)
 
-		if len(res) != node.heap.Len() {
+		if len(res) == 0 {
 			return result
 		}
 
 		node = node.next
 	}
-
-	fmt.Println("range: ", result)
-	fmt.Println("range len: ", len(result))
 
 	return result
 }
@@ -109,7 +107,7 @@ func (node *bPlusTreeNode) insertRecursive(value float64, branchingFactor int) (
 	if node.isLeaf {
 		node.insertIntoLeaf(value)
 
-		if node.heap.Len() < 8 {
+		if node.heap.Len() < branchingFactor {
 			return 0, nil // No need to split
 		}
 
@@ -126,10 +124,13 @@ func (node *bPlusTreeNode) insertRecursive(value float64, branchingFactor int) (
 	}
 
 	// Insert new key into internal node
-	fmt.Println("split key:", splitKey)
-	idx = sort.SearchFloat64s(node.keys, splitKey)
-	node.keys = append(node.keys[:idx], append([]float64{splitKey}, node.keys[idx:]...)...)
-	node.children = append(node.children[:idx], append([]*bPlusTreeNode{newChild}, node.children[idx:]...)...)
+	var keys []float64
+	keys = append(node.keys[:idx], append([]float64{splitKey}, node.keys[idx:]...)...)
+	node.keys = keys
+
+	var children []*bPlusTreeNode
+	children = append(node.children[:idx+1], append([]*bPlusTreeNode{newChild}, node.children[idx+1:]...)...)
+	node.children = children
 
 	// If internal node is full, split it
 	if len(node.keys) < branchingFactor {
@@ -141,10 +142,6 @@ func (node *bPlusTreeNode) insertRecursive(value float64, branchingFactor int) (
 
 // insertIntoLeaf inserts a value into a leaf node in sorted order
 func (node *bPlusTreeNode) insertIntoLeaf(value float64) {
-	// this part is additional
-	//i := sort.SearchFloat64s(node.keys, value)
-	//node.keys = append(node.keys[:i], append([]float64{value}, node.keys[i:]...)...)
-
 	// Insert into heap
 	node.heap.Insert(value)
 }
@@ -155,7 +152,6 @@ func (node *bPlusTreeNode) splitLeaf() (float64, *bPlusTreeNode) {
 		isLeaf: true,
 		next:   node.next, // Maintain linked list for range queries
 	}
-	//node.keys = node.keys[:mid] // Keep first half in original node
 	node.next = newNode // Update linked list
 
 	// split heap
@@ -170,13 +166,25 @@ func (node *bPlusTreeNode) splitInternal() (float64, *bPlusTreeNode) {
 	mid := len(node.keys) / 2
 	splitKey := node.keys[mid]
 
+	var newNodeKey []float64
+	newNodeKey = append(newNodeKey, node.keys[mid:]...)
+
+	var newNodeChildren []*bPlusTreeNode
+	newNodeChildren = append(newNodeChildren, node.children[mid:]...)
+
 	newNode := &bPlusTreeNode{
-		keys:     node.keys[mid:],     // Move half of the keys to new node
-		children: node.children[mid:], // Move half of the children to new node
+		keys:     newNodeKey,      // Move half of the keys to new node
+		children: newNodeChildren, // Move half of the children to new node
 		isLeaf:   false,
 	}
-	node.keys = node.keys[:mid]           // Keep first half in original node
-	node.children = node.children[:mid+1] // Keep corresponding children
+
+	var keys []float64
+	keys = append(keys, node.keys[:mid]...)
+	node.keys = keys // Keep first half in original node
+
+	var children []*bPlusTreeNode
+	children = append(children, node.children[:mid+1]...)
+	node.children = children // Keep corresponding children
 
 	return splitKey, newNode // Return split key and new internal node
 }
@@ -221,9 +229,7 @@ func (tree *bPlusPlusTree) removeFromParent(parent, child *bPlusTreeNode) {
 func (tree *bPlusPlusTree) findLeafNode(value float64) *bPlusTreeNode {
 	node := tree.root
 	for !node.isLeaf {
-		fmt.Println("keys:", node.keys, "value:", value, "children:", node.children)
 		i := sort.SearchFloat64s(node.keys, value)
-		fmt.Println("selected i:", i)
 		node = node.children[i]
 	}
 
@@ -236,12 +242,16 @@ func (tree *bPlusPlusTree) Print() {
 	node := tree.root
 
 	for !node.isLeaf {
+		fmt.Println("internal node keys:", node.keys)
+		fmt.Println("-------------------------------------")
 		node = node.children[0]
 	}
 
 	index := 0
 	for node != nil {
-		fmt.Println("leaf node", index, "keys:", node.keys, "heap:", node.heap.(*eightAryHeap).values)
+		heapData := node.heap.(*eightAryHeap).values
+		slices.Sort(heapData)
+		fmt.Println("leaf node", index, "keys:", node.keys, "heap:", heapData)
 		node = node.next
 		index++
 	}
