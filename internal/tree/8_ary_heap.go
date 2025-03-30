@@ -106,11 +106,11 @@ func (h *eightAryHeap) PopRangeQuery(min, max float64) []float64 {
 		// Add children (up to 8)
 		for k := 1; k <= 8; k++ {
 			childIndex := (index * 8) + k
-			if childIndex == -1 || childIndex >= len(h.values) {
+			if childIndex >= len(h.values) {
 				break
 			}
 
-			queue.PushBack(childIndex)
+			queue.PushFront(childIndex)
 		}
 	}
 

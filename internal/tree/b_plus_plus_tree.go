@@ -1,8 +1,6 @@
 package tree
 
 import (
-	"fmt"
-	"slices"
 	"sort"
 )
 
@@ -10,8 +8,6 @@ type BPlusPlusTree interface {
 	Insert(value float64)
 	RangeQuery(min, max float64) []float64
 	PopRangeQuery(min, max float64) []float64
-
-	Print()
 }
 
 type bPlusPlusTree struct {
@@ -23,8 +19,10 @@ type bPlusTreeNode struct {
 	isLeaf   bool
 	keys     []float64
 	children []*bPlusTreeNode
-	heap     EightAryHeap   // Used only in leaf nodes
+	heap     EightAryHeap // Used only in leaf nodes
+	parent   *bPlusTreeNode
 	next     *bPlusTreeNode // Pointer to next leaf node (for range queries)
+	prev     *bPlusTreeNode // Pointer to prev leaf node (for range queries)
 }
 
 func NewBPlusPlusTree(branchingFactor int) BPlusPlusTree {
@@ -48,7 +46,11 @@ func (tree *bPlusPlusTree) Insert(value float64) {
 			keys:     []float64{splitKey},
 			children: []*bPlusTreeNode{root, newChild},
 			isLeaf:   false,
+			parent:   nil,
 		}
+
+		root.parent = newRoot
+		newChild.parent = newRoot
 
 		tree.root = newRoot
 	}
@@ -78,18 +80,25 @@ func (tree *bPlusPlusTree) RangeQuery(min, max float64) []float64 {
 func (tree *bPlusPlusTree) PopRangeQuery(min, max float64) []float64 {
 	var result []float64
 	node := tree.findLeafNode(min)
-	var prev *bPlusTreeNode // Tracks the previous node in the linked list
 
 	// Traverse leaf nodes and remove matching keys
 	for node != nil {
 		res := node.heap.PopRangeQuery(min, max)
 		result = append(result, res...)
 
+		if len(res) == 0 {
+			break
+		}
+
 		// If the node is empty, remove it
 		if node.heap.Len() == 0 {
-			tree.removeLeafNode(node, prev)
-		} else {
-			prev = node // Update prev only if node still exists
+			// remove this leaf node from node.prev.parent
+			if node.prev != nil && node.prev.parent != node.parent {
+				node.prev.parent.removeNodeFromParent(node)
+			}
+
+			// remove leaf node
+			node.removeLeafNode()
 		}
 
 		node = node.next
@@ -123,6 +132,8 @@ func (node *bPlusTreeNode) insertRecursive(value float64, branchingFactor int) (
 		return 0, nil
 	}
 
+	newChild.parent = node
+
 	// Insert new key into internal node
 	var keys []float64
 	keys = append(node.keys[:idx], append([]float64{splitKey}, node.keys[idx:]...)...)
@@ -151,7 +162,14 @@ func (node *bPlusTreeNode) splitLeaf() (float64, *bPlusTreeNode) {
 	newNode := &bPlusTreeNode{
 		isLeaf: true,
 		next:   node.next, // Maintain linked list for range queries
+		prev:   node,
+		parent: nil,
 	}
+
+	if node.next != nil {
+		node.next.prev = newNode
+	}
+
 	node.next = newNode // Update linked list
 
 	// split heap
@@ -175,6 +193,7 @@ func (node *bPlusTreeNode) splitInternal() (float64, *bPlusTreeNode) {
 	newNode := &bPlusTreeNode{
 		keys:     newNodeKey,      // Move half of the keys to new node
 		children: newNodeChildren, // Move half of the children to new node
+		parent:   nil,             // this parameter set in upper function
 		isLeaf:   false,
 	}
 
@@ -189,42 +208,6 @@ func (node *bPlusTreeNode) splitInternal() (float64, *bPlusTreeNode) {
 	return splitKey, newNode // Return split key and new internal node
 }
 
-// removeLeafNode removes a leaf node and updates parents recursively
-func (tree *bPlusPlusTree) removeLeafNode(leaf *bPlusTreeNode, prev *bPlusTreeNode) {
-	// Step 1: Update the linked list
-	if prev != nil {
-		prev.next = leaf.next // Bypass this node in linked list
-	} else if tree.root == leaf {
-		tree.root = nil // If the only node is removed, reset tree
-		return
-	}
-
-	// Step 2: Find and remove the leaf from its parent
-	tree.removeFromParent(tree.root, leaf)
-}
-
-// removeFromParent removes a child node reference from its parent
-func (tree *bPlusPlusTree) removeFromParent(parent, child *bPlusTreeNode) {
-	if parent == nil || parent.isLeaf {
-		return // No parent found or root is a leaf
-	}
-
-	// Find the child in the parent's children list
-	for i, c := range parent.children {
-		if c == child {
-			// Remove the child reference
-			parent.children = append(parent.children[:i], parent.children[i+1:]...)
-			parent.keys = append(parent.keys[:i], parent.keys[i+1:]...)
-			break
-		}
-	}
-
-	// If parent is now empty, remove it recursively
-	if len(parent.children) == 0 {
-		tree.removeFromParent(tree.root, parent)
-	}
-}
-
 // findLeafNode locates the correct leaf node for a given value
 func (tree *bPlusPlusTree) findLeafNode(value float64) *bPlusTreeNode {
 	node := tree.root
@@ -236,23 +219,58 @@ func (tree *bPlusPlusTree) findLeafNode(value float64) *bPlusTreeNode {
 	return node
 }
 
-/////////////////////////////////////////////////////////////////////////////////////
+func (node *bPlusTreeNode) removeLeafNode() {
+	// step 1: remove this leaf node from node.parent
+	// TODO: check this shit
+	node.parent.removeNodeFromParent(node)
 
-func (tree *bPlusPlusTree) Print() {
-	node := tree.root
+	// step 2: update next of prev node
+	node.prev.next = node.next
+	node.next.prev = node.prev
+}
 
-	for !node.isLeaf {
-		fmt.Println("internal node keys:", node.keys)
-		fmt.Println("-------------------------------------")
-		node = node.children[0]
+func (node *bPlusTreeNode) removeNodeFromParent(child *bPlusTreeNode) {
+	if node.isLeaf {
+		return
 	}
 
-	index := 0
-	for node != nil {
-		heapData := node.heap.(*eightAryHeap).values
-		slices.Sort(heapData)
-		fmt.Println("leaf node", index, "keys:", node.keys, "heap:", heapData)
-		node = node.next
-		index++
+	// Find the child in the parent's children list
+	for i := range node.children {
+		if node.children[i] == child {
+			if i == len(node.children)-1 {
+				node.children = node.children[:i]
+				node.keys = node.keys[:i-1]
+				break
+			}
+
+			// Remove the child reference
+			node.children = append(node.children[:i], node.children[i+1:]...)
+			node.keys = append(node.keys[:i], node.keys[i+1:]...)
+			break
+		}
+	}
+
+	// If parent is now empty, remove it recursively
+	if len(node.children) == 0 {
+		node.parent.removeNodeFromParent(node)
 	}
 }
+
+///////////////////////////////////////////////////////////////////////////////////////
+//
+//func (tree *bPlusPlusTree) Print() {
+//	node := tree.root
+//
+//	for !node.isLeaf {
+//		node = node.children[0]
+//	}
+//
+//	index := 0
+//	for node != nil {
+//		heapData := node.heap.(*eightAryHeap).values
+//		slices.Sort(heapData)
+//		fmt.Println("leaf node", index, "keys:", node.keys, "heap:", heapData)
+//		node = node.next
+//		index++
+//	}
+//}
