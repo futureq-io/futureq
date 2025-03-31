@@ -11,26 +11,26 @@ type BPlusPlusTree interface {
 }
 
 type bPlusPlusTree struct {
-	root            *bPlusTreeNode
+	root            *bPlusPlusTreeNode
 	BranchingFactor int // branching factor of B+ Tree
 }
 
 // TODO: add lock
 
-type bPlusTreeNode struct {
+type bPlusPlusTreeNode struct {
 	isLeaf   bool
 	keys     []float64
-	children []*bPlusTreeNode
+	children []*bPlusPlusTreeNode
 	heap     EightAryHeap // Used only in leaf nodes
-	parent   *bPlusTreeNode
-	next     *bPlusTreeNode // Pointer to next leaf node (for range queries)
-	prev     *bPlusTreeNode // Pointer to prev leaf node (for range queries)
+	parent   *bPlusPlusTreeNode
+	next     *bPlusPlusTreeNode // Pointer to next leaf node (for range queries)
+	prev     *bPlusPlusTreeNode // Pointer to prev leaf node (for range queries)
 }
 
 func NewBPlusPlusTree(branchingFactor int) BPlusPlusTree {
 	return &bPlusPlusTree{
 		BranchingFactor: branchingFactor,
-		root: &bPlusTreeNode{
+		root: &bPlusPlusTreeNode{
 			isLeaf: true,
 			heap:   NewEightAryHeap(),
 		},
@@ -44,9 +44,9 @@ func (tree *bPlusPlusTree) Insert(value float64) {
 
 	// If root was split, create a new root
 	if newChild != nil {
-		newRoot := &bPlusTreeNode{
+		newRoot := &bPlusPlusTreeNode{
 			keys:     []float64{splitKey},
-			children: []*bPlusTreeNode{root, newChild},
+			children: []*bPlusPlusTreeNode{root, newChild},
 			isLeaf:   false,
 			parent:   nil,
 		}
@@ -128,7 +128,7 @@ func (tree *bPlusPlusTree) PopRangeQuery(min, max float64) []float64 {
 ////////////////////////////////////////////////////////////////////
 
 // insertRecursive inserts a value into the subtree and returns a split key and new child (if needed)
-func (node *bPlusTreeNode) insertRecursive(value float64, branchingFactor int) (float64, *bPlusTreeNode) {
+func (node *bPlusPlusTreeNode) insertRecursive(value float64, branchingFactor int) (float64, *bPlusPlusTreeNode) {
 	if node.isLeaf {
 		node.insertIntoLeaf(value)
 
@@ -155,8 +155,8 @@ func (node *bPlusTreeNode) insertRecursive(value float64, branchingFactor int) (
 	keys = append(node.keys[:idx], append([]float64{splitKey}, node.keys[idx:]...)...)
 	node.keys = keys
 
-	var children []*bPlusTreeNode
-	children = append(node.children[:idx+1], append([]*bPlusTreeNode{newChild}, node.children[idx+1:]...)...)
+	var children []*bPlusPlusTreeNode
+	children = append(node.children[:idx+1], append([]*bPlusPlusTreeNode{newChild}, node.children[idx+1:]...)...)
 	node.children = children
 
 	// If internal node is full, split it
@@ -168,14 +168,14 @@ func (node *bPlusTreeNode) insertRecursive(value float64, branchingFactor int) (
 }
 
 // insertIntoLeaf inserts a value into a leaf node in sorted order
-func (node *bPlusTreeNode) insertIntoLeaf(value float64) {
+func (node *bPlusPlusTreeNode) insertIntoLeaf(value float64) {
 	// Insert into heap
 	node.heap.Insert(value)
 }
 
 // splitLeaf splits a full leaf node and returns the split key and new node
-func (node *bPlusTreeNode) splitLeaf() (float64, *bPlusTreeNode) {
-	newNode := &bPlusTreeNode{
+func (node *bPlusPlusTreeNode) splitLeaf() (float64, *bPlusPlusTreeNode) {
+	newNode := &bPlusPlusTreeNode{
 		isLeaf: true,
 		next:   node.next, // Maintain linked list for range queries
 		prev:   node,
@@ -196,17 +196,17 @@ func (node *bPlusTreeNode) splitLeaf() (float64, *bPlusTreeNode) {
 }
 
 // splitInternal splits a full internal node and returns the split key and new node
-func (node *bPlusTreeNode) splitInternal() (float64, *bPlusTreeNode) {
+func (node *bPlusPlusTreeNode) splitInternal() (float64, *bPlusPlusTreeNode) {
 	mid := len(node.keys) / 2
 	splitKey := node.keys[mid]
 
 	var newNodeKey []float64
 	newNodeKey = append(newNodeKey, node.keys[mid:]...)
 
-	var newNodeChildren []*bPlusTreeNode
+	var newNodeChildren []*bPlusPlusTreeNode
 	newNodeChildren = append(newNodeChildren, node.children[mid:]...)
 
-	newNode := &bPlusTreeNode{
+	newNode := &bPlusPlusTreeNode{
 		keys:     newNodeKey,      // Move half of the keys to new node
 		children: newNodeChildren, // Move half of the children to new node
 		parent:   nil,             // this parameter set in upper function
@@ -217,7 +217,7 @@ func (node *bPlusTreeNode) splitInternal() (float64, *bPlusTreeNode) {
 	keys = append(keys, node.keys[:mid]...)
 	node.keys = keys // Keep first half in original node
 
-	var children []*bPlusTreeNode
+	var children []*bPlusPlusTreeNode
 	children = append(children, node.children[:mid+1]...)
 	node.children = children // Keep corresponding children
 
@@ -225,7 +225,7 @@ func (node *bPlusTreeNode) splitInternal() (float64, *bPlusTreeNode) {
 }
 
 // findLeafNode locates the correct leaf node for a given value
-func (tree *bPlusPlusTree) findLeafNode(value float64) *bPlusTreeNode {
+func (tree *bPlusPlusTree) findLeafNode(value float64) *bPlusPlusTreeNode {
 	node := tree.root
 	for !node.isLeaf {
 		i := sort.SearchFloat64s(node.keys, value)
@@ -235,7 +235,7 @@ func (tree *bPlusPlusTree) findLeafNode(value float64) *bPlusTreeNode {
 	return node
 }
 
-func (node *bPlusTreeNode) removeLeafNode() {
+func (node *bPlusPlusTreeNode) removeLeafNode() {
 	// step 1: remove this leaf node from node.parent
 	node.parent.removeNodeFromParent(node)
 
@@ -249,7 +249,7 @@ func (node *bPlusTreeNode) removeLeafNode() {
 	}
 }
 
-func (node *bPlusTreeNode) removeNodeFromParent(child *bPlusTreeNode) {
+func (node *bPlusPlusTreeNode) removeNodeFromParent(child *bPlusPlusTreeNode) {
 	if node.isLeaf {
 		return
 	}
