@@ -11,6 +11,7 @@ type EightAryHeap interface {
 	PopRangeQuery(min, max float64) []float64
 	Len() int
 	Split() (EightAryHeap, float64)
+	GetData() []float64
 }
 
 type eightAryHeap struct {
@@ -203,4 +204,12 @@ func (h *eightAryHeap) convertSortedArrayToHeap(arr []float64) {
 	for i := (n - 1) / 8; i >= 0; i-- {
 		h.heapifyDown(i)
 	}
+}
+
+func (h *eightAryHeap) GetData() []float64 {
+	var result []float64
+	result = append(result, h.values...)
+	slices.Sort(result)
+
+	return result
 }

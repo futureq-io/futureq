@@ -15,6 +15,8 @@ type bPlusPlusTree struct {
 	BranchingFactor int // branching factor of B+ Tree
 }
 
+// TODO: add lock
+
 type bPlusTreeNode struct {
 	isLeaf   bool
 	keys     []float64
@@ -59,19 +61,28 @@ func (tree *bPlusPlusTree) Insert(value float64) {
 // RangeQuery returns values within the range [min, max]
 func (tree *bPlusPlusTree) RangeQuery(min, max float64) []float64 {
 	var result []float64
-	node := tree.findLeafNode(min)
+	nodeMin := tree.findLeafNode(min)
+	nodeMax := tree.findLeafNode(max)
 
 	// Scan leaf nodes until max is exceeded
-	for node != nil {
-		res := node.heap.RangeQuery(min, max)
+	if nodeMin == nodeMax {
+		res := nodeMin.heap.RangeQuery(min, max)
 		result = append(result, res...)
 
-		if len(res) == 0 {
-			return result
-		}
+		return result
+	}
 
+	res := nodeMin.heap.RangeQuery(min, max)
+	result = append(result, res...)
+
+	node := nodeMin.next
+
+	for node != nodeMax {
+		result = append(result, node.heap.GetData()...)
 		node = node.next
 	}
+
+	result = append(result, node.heap.RangeQuery(min, max)...)
 
 	return result
 }
@@ -90,6 +101,8 @@ func (tree *bPlusPlusTree) PopRangeQuery(min, max float64) []float64 {
 			break
 		}
 
+		nextNode := node.next
+
 		// If the node is empty, remove it
 		if node.heap.Len() == 0 {
 			// remove this leaf node from node.prev.parent
@@ -99,9 +112,12 @@ func (tree *bPlusPlusTree) PopRangeQuery(min, max float64) []float64 {
 
 			// remove leaf node
 			node.removeLeafNode()
+
+			// remove this node from memory
+			node = nil
 		}
 
-		node = node.next
+		node = nextNode
 	}
 
 	return result
@@ -221,12 +237,16 @@ func (tree *bPlusPlusTree) findLeafNode(value float64) *bPlusTreeNode {
 
 func (node *bPlusTreeNode) removeLeafNode() {
 	// step 1: remove this leaf node from node.parent
-	// TODO: check this shit
 	node.parent.removeNodeFromParent(node)
 
 	// step 2: update next of prev node
-	node.prev.next = node.next
-	node.next.prev = node.prev
+	if node.prev != nil {
+		node.prev.next = node.next
+	}
+
+	if node.next != nil {
+		node.next.prev = node.prev
+	}
 }
 
 func (node *bPlusTreeNode) removeNodeFromParent(child *bPlusTreeNode) {
