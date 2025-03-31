@@ -5,14 +5,14 @@ import (
 	"testing"
 )
 
-func BenchmarkInsert(b *testing.B) {
+func BenchmarkBPlusPlusTreeInsert(b *testing.B) {
 	tree := NewBPlusPlusTree(1000)
 	for i := 0; i < b.N; i++ {
 		tree.Insert(rand.Float64() * 1000000)
 	}
 }
 
-func BenchmarkRangeQuery(b *testing.B) {
+func BenchmarkBPlusPlusTreeRangeQuery(b *testing.B) {
 	tree := NewBPlusPlusTree(1000)
 	for i := 0; i < 1000; i++ {
 		tree.Insert(rand.Float64() * 1000000)
@@ -27,7 +27,7 @@ func BenchmarkRangeQuery(b *testing.B) {
 	}
 }
 
-func BenchmarkDeleteRange(b *testing.B) {
+func BenchmarkBPlusPlusTreeDeleteRange(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		b.StopTimer()
 
