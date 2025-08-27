@@ -59,10 +59,14 @@ func startRun(_ *cobra.Command, _ []string) {
 		logger, _ = loggerConfig.Build()
 	}
 
-	strg := storage.NewMemoryArray()
+	taskStorage := storage.NewMemoryArray(cfg.Persistence)
+	err = taskStorage.InitiatePersistence()
+	if err != nil {
+		logger.Fatal("error initializing persistence", zap.Error(err))
+	}
 
 	if cfg.RabbitMQ != nil {
-		rabbitmqQ := q.NewRabbitMQ(*cfg.RabbitMQ, logger.Named("rabbitmq"), strg)
+		rabbitmqQ := q.NewRabbitMQ(*cfg.RabbitMQ, logger.Named("rabbitmq"), taskStorage)
 		defer rabbitmqQ.Close()
 
 		err := rabbitmqQ.Connect()
@@ -75,7 +79,7 @@ func startRun(_ *cobra.Command, _ []string) {
 			logger.Fatal("error consuming rabbitmq", zap.Error(err))
 		}
 
-		t := ticker.NewTicker(strg, rabbitmqQ)
+		t := ticker.NewTicker(taskStorage, rabbitmqQ)
 
 		go t.Tick()
 	}

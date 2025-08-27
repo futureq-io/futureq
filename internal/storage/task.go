@@ -6,6 +6,7 @@ import (
 
 type task struct {
 	payload []byte
+	id      string
 	at      time.Time
 }
 
