@@ -145,7 +145,7 @@ func (s *memoryArray) loadTasksFromDisk() error {
 		return nil
 	}
 
-	closer.Close()
+	_ = closer.Close()
 
 	fmt.Println("initiating from disk")
 
