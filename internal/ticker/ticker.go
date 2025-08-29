@@ -28,7 +28,7 @@ func (t *ticker) Tick() {
 	for tickedAt := range ticker.C {
 		result := t.strg.PopLesserThan(tickedAt)
 		for _, re := range result {
-			t.q.Publish(re.Payload())
+			t.q.Publish(re.Payload)
 		}
 	}
 }
