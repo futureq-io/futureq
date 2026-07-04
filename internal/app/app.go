@@ -15,7 +15,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/futureq-io/futureq/internal/config"
-	"github.com/futureq-io/futureq/internal/raft"
+	"github.com/futureq-io/futureq/internal/raft/event"
 	"github.com/futureq-io/futureq/internal/repository"
 	"github.com/futureq-io/futureq/internal/storage"
 )

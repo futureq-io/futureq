@@ -5,7 +5,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/futureq-io/futureq/internal/raft"
+	"github.com/futureq-io/futureq/internal/raft/event"
 	"github.com/futureq-io/futureq/internal/storage"
 	"go.uber.org/zap"
 )
