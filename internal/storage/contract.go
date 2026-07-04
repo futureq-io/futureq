@@ -110,10 +110,16 @@ type DB interface {
 	// underlying transaction or snapshot held by the iterator.
 	NewIter(opts *IterOptions) (Iterator, error)
 
-	// Scan iterates over the database and yields keys and values to the provided function.
-	// It processes one record at a time, meaning it never loads the full result set into memory.
-	// Return a false value to stop the Scan.
-	Scan(opts *IterOptions, yield func(key, value []byte) bool) error
+	// Scan iterates over the database and calls yield for each key-value pair.
+	//
+	// MEMORY WARNING: The key and value slices passed to yield are owned by the
+	// underlying storage engine (e.g., mmap for Bolt, block cache for Pebble).
+	// They are ONLY valid for the duration of the yield function call.
+	//
+	// You MUST NOT retain references to key or value after yield returns,
+	// and you MUST NOT modify the bytes within the slices. If you need to keep
+	// the data, you must copy it (e.g., append([]byte(nil), key...)).
+	Scan(opts *IterOptions, yield func(key, value []byte) error) error
 
 	// Flush forces any in-memory data to be written to durable storage.
 	Flush() error

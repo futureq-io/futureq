@@ -164,23 +164,15 @@ func (s *EventStateMachine) PrepareSnapshot() (interface{}, error) {
 }
 
 func (s *EventStateMachine) SaveSnapshot(_ interface{}, w io.Writer, stopc <-chan struct{}) error {
-	iter, err := s.db.NewIter(nil)
-	if err != nil {
-		return err
-	}
-	defer iter.Close()
-
-	for iter.First(); iter.Valid(); iter.Next() {
+	return s.db.Scan(nil, func(key []byte, value []byte) error {
 		select {
 		case <-stopc:
 			return statemachine.ErrSnapshotStopped
 		default:
 		}
 
-		k := make([]byte, len(iter.Key()))
-		copy(k, iter.Key())
-		v := make([]byte, len(iter.Value()))
-		copy(v, iter.Value())
+		k := make([]byte, len(key))
+		v := make([]byte, len(value))
 
 		if err := binary.Write(w, binary.LittleEndian, uint32(len(k))); err != nil {
 			return err
@@ -194,8 +186,9 @@ func (s *EventStateMachine) SaveSnapshot(_ interface{}, w io.Writer, stopc <-cha
 		if _, err := w.Write(v); err != nil {
 			return err
 		}
-	}
-	return iter.Error()
+
+		return nil
+	})
 }
 
 func (s *EventStateMachine) RecoverFromSnapshot(r io.Reader, stopc <-chan struct{}) error {

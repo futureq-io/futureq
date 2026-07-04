@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"fmt"
 	"io"
 
 	"github.com/cockroachdb/pebble/v2"
@@ -86,7 +87,7 @@ func (p *Pebble) NewIter(opts *IterOptions) (Iterator, error) {
 	return &pebbleIterator{iter: iter, snap: snap}, nil
 }
 
-func (p *Pebble) Scan(opts *IterOptions, yield func(key, value []byte) bool) error {
+func (p *Pebble) Scan(opts *IterOptions, yield func(key, value []byte) error) error {
 	snap := p.db.NewSnapshot()
 	defer snap.Close()
 
@@ -106,8 +107,8 @@ func (p *Pebble) Scan(opts *IterOptions, yield func(key, value []byte) bool) err
 	defer iter.Close()
 
 	for iter.First(); iter.Valid(); iter.Next() {
-		if !yield(iter.Key(), iter.Value()) {
-			break
+		if err := yield(iter.Key(), iter.Value()); err != nil {
+			return fmt.Errorf("yield func: %w", err)
 		}
 	}
 

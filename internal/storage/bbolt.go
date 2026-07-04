@@ -117,7 +117,7 @@ func (b *boltDB) NewIter(opts *IterOptions) (Iterator, error) {
 }
 
 // Scan iterates over the bbolt database and yields keys and values to the provided function.
-func (b *boltDB) Scan(opts *IterOptions, yield func(key, value []byte) bool) error {
+func (b *boltDB) Scan(opts *IterOptions, yield func(key, value []byte) error) error {
 	// Open a read-only transaction.
 	// This provides the same consistency guarantees as Pebble's Snapshot.
 	return b.db.View(func(tx *bbolt.Tx) error {
@@ -149,8 +149,8 @@ func (b *boltDB) Scan(opts *IterOptions, yield func(key, value []byte) bool) err
 			}
 
 			// Yield to the caller. If they return false, break the loop early.
-			if !yield(k, v) {
-				break
+			if err := yield(k, v); err != nil {
+				return fmt.Errorf("yield func: %w", err)
 			}
 
 			// Move to the next key in the B+Tree
