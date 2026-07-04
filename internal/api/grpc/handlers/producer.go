@@ -116,7 +116,15 @@ func (ph *ProducerHandler) marshalMessages(
 	nowMs int64,
 	fn func(data *storagepb.StoredMessage) error,
 ) error {
-	for _, msg := range batch.Messages {
+	for i, msg := range batch.Messages {
+		if msg.DelayMs < 0 {
+			return fmt.Errorf("negative delays are not allowed! delay: %d, topic: %s message_idx: %d", msg.DelayMs, msg.Topic, i)
+		}
+
+		if msg.TtlMs < 0 {
+			return fmt.Errorf("negative ttls are not allowed! ttl: %d, topic: %s message_idx: %d", msg.TtlMs, msg.Topic, i)
+		}
+
 		stored := &storagepb.StoredMessage{
 			Topic:            msg.Topic,
 			Payload:          msg.Payload,
