@@ -176,13 +176,13 @@ func (a *App) WithGracefulShutdown() error {
 		a.Logger.Error("failed to flush pebble on shutdown", zap.Error(err))
 	}
 
-	// 4. Safely close Pebble DB.
-	if a.DB != nil && a.DB != nil {
-		a.Logger.Info("closing Pebble DB...")
+	// 4. Safely close DB.
+	if a.DB != nil {
+		a.Logger.Info("closing DB...")
 		if err := a.DB.Close(); err != nil {
-			a.Logger.Error("failed to close Pebble DB", zap.Error(err))
+			a.Logger.Error("failed to close DB", zap.Error(err))
 		} else {
-			a.Logger.Info("Pebble DB closed successfully")
+			a.Logger.Info("DB closed successfully")
 		}
 	}
 
