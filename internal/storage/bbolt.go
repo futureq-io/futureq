@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 
+	"github.com/futureq-io/futureq/internal/config"
 	"go.etcd.io/bbolt"
 	bolt "go.etcd.io/bbolt"
 )
@@ -39,13 +40,13 @@ type boltDB struct {
 
 // NewBoltDB opens a bbolt database at cfg.DataPath and returns it as a
 // storage.DB. The database file is created if it does not exist.
-func NewBoltDB(cfg BoltConfig) (DB, error) {
+func NewBoltDB(cfg config.Bolt) (DB, error) {
 	db, err := bolt.Open(cfg.DataPath, 0600, nil)
 	if err != nil {
 		return nil, fmt.Errorf("bbolt: failed to open %q: %w", cfg.DataPath, err)
 	}
 
-	bname := cfg.Bucket
+	bname := cfg.DefaultBucket
 	if bname == "" {
 		bname = defaultBucket
 	}

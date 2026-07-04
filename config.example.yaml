@@ -33,6 +33,7 @@ observability:
     addr: "0.0.0.0:9090"
 
 storage:
+  type: "pebble"
   minAckLevel: Quorum
 
   # When set to false, the node runs entirely in-memory using a virtual filesystem.
@@ -60,6 +61,10 @@ storage:
     # Size of the active in-memory table in Megabytes.
     # Increase this value for write-heavy workloads. (Must be at least 1MB).
     inMemoryTableSizeMb: 64
+  
+  bolt:
+    dataPath: "./data"
+    defaultBucket: "futureq"
 
 raft:
   enabled: false

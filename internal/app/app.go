@@ -15,7 +15,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/futureq-io/futureq/internal/config"
-	"github.com/futureq-io/futureq/internal/raft/event"
+	raft "github.com/futureq-io/futureq/internal/raft/event"
 	"github.com/futureq-io/futureq/internal/repository"
 	"github.com/futureq-io/futureq/internal/storage"
 )
@@ -54,12 +54,23 @@ func Init(cfg *config.Config, logger *zap.Logger) (*App, error) {
 
 	a.Ctx, a.cancel = context.WithCancelCause(context.Background())
 
-	pebble, err := storage.NewPebble(cfg.Storage.Pebble, logger)
-	if err != nil {
-		return nil, fmt.Errorf("failed to initialize pebble storage: %w", err)
+	var s storage.DB
+	var err error
+	switch cfg.Storage.Type {
+	case "pebble":
+		s, err = storage.NewPebble(cfg.Storage.Pebble, logger)
+		if err != nil {
+			return nil, fmt.Errorf("failed to initialize pebble storage: %w", err)
+		}
+	case "bolt":
+		s, err = storage.NewBoltDB(cfg.Storage.Bolt)
+		if err != nil {
+			return nil, fmt.Errorf("failed to initialize bolt storage: %w", err)
+		}
 	}
 
-	a.DB = pebble
+	a.DB = s
+
 	A = a
 
 	return a, nil

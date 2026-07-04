@@ -50,7 +50,14 @@ type Storage struct {
 	MinAckLevel    AckLevel      `mapstructure:"minAckLevel" yaml:"minAckLevel"`
 	Persist        bool          `mapstructure:"persist" yaml:"persist"`
 	TimeBucketSize time.Duration `mapstructure:"timeBucketSize" yaml:"timeBucketSize"`
+	Type           string        `mapstructure:"type" yaml:"type"`
 	Pebble         Pebble        `mapstructure:"pebble" yaml:"pebble"`
+	Bolt           Bolt
+}
+
+type Bolt struct {
+	DataPath      string `mapstructure:"dataPath" yaml:"dataPath"`
+	DefaultBucket string `mapstructure:"defaultBucket" yaml:"defaultBucket"`
 }
 
 type Pebble struct {
@@ -181,12 +188,17 @@ func (c *Config) validateStorage() error {
 		}
 	}
 
+	if c.Storage.Type != "pebble" && c.Storage.Type != "bolt" {
+		return fmt.Errorf("storage type can only be in (pebble, bolt)")
+	}
+
 	return nil
 }
 
 func (c *Config) runPostLoadHooks() error {
 	if !c.Storage.Persist {
 		c.Storage.Pebble.DataPath = ""
+		c.Storage.Bolt.DataPath = ""
 	}
 
 	return nil

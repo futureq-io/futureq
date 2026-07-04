@@ -24,11 +24,16 @@ var defaultConfig = Config{
 		MinAckLevel:    Quorum,
 		Persist:        true,
 		TimeBucketSize: 1 * time.Millisecond,
+		Type:           "pebble",
 		Pebble: Pebble{
 			DisableWAL:       false,
 			DataPath:         "./data",
 			CacheSizeMB:      16,
 			InMemTableSizeMB: 64,
+		},
+		Bolt: Bolt{
+			DataPath:      "./data",
+			DefaultBucket: "futureq",
 		},
 	},
 
