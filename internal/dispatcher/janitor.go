@@ -61,7 +61,8 @@ func (j *TTLJanitor) sweep() {
 		j.logger.Error("TTL janitor: failed to create iterator", zap.Error(err))
 		return
 	}
-	defer iter.Close()
+
+	defer iter.Close() //nolint:errcheck
 
 	nowMs := time.Now().UnixMilli()
 	var expiredKeys [][]byte

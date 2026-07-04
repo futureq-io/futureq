@@ -6,7 +6,6 @@ import (
 	"io"
 
 	"github.com/futureq-io/futureq/internal/config"
-	"go.etcd.io/bbolt"
 	bolt "go.etcd.io/bbolt"
 )
 
@@ -121,7 +120,7 @@ func (b *boltDB) NewIter(opts *IterOptions) (Iterator, error) {
 func (b *boltDB) Scan(opts *IterOptions, yield func(key, value []byte) error) error {
 	// Open a read-only transaction.
 	// This provides the same consistency guarantees as Pebble's Snapshot.
-	return b.db.View(func(tx *bbolt.Tx) error {
+	return b.db.View(func(tx *bolt.Tx) error {
 		// bbolt stores data in buckets. Grab the default bucket for your KV store.
 		bucket := tx.Bucket(b.bucket)
 		if bucket == nil {

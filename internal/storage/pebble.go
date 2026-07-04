@@ -89,7 +89,8 @@ func (p *Pebble) NewIter(opts *IterOptions) (Iterator, error) {
 
 func (p *Pebble) Scan(opts *IterOptions, yield func(key, value []byte) error) error {
 	snap := p.db.NewSnapshot()
-	defer snap.Close()
+
+	defer snap.Close() //nolint:errcheck
 
 	var po *pebble.IterOptions
 	if opts != nil {
@@ -104,7 +105,7 @@ func (p *Pebble) Scan(opts *IterOptions, yield func(key, value []byte) error) er
 		return err
 	}
 
-	defer iter.Close()
+	defer iter.Close() //nolint:errcheck
 
 	for iter.First(); iter.Valid(); iter.Next() {
 		if err := yield(iter.Key(), iter.Value()); err != nil {

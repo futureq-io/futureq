@@ -50,7 +50,7 @@ func NewEventStateMachineFactory(db storage.DB, repo *repository.EventRepository
 func (s *EventStateMachine) Open(stopc <-chan struct{}) (uint64, error) {
 	val, closer, err := s.db.Get(appliedIndexKey)
 
-	defer closer.Close()
+	defer closer.Close() //nolint:errcheck
 
 	if err != nil {
 		if errors.Is(err, pebble.ErrNotFound) {
@@ -121,7 +121,8 @@ func (s *EventStateMachine) applyEntry(batch storage.Batch, cmd []byte) (statema
 
 func (s *EventStateMachine) Update(entries []statemachine.Entry) ([]statemachine.Entry, error) {
 	batch := s.db.NewBatch()
-	defer batch.Close()
+
+	defer batch.Close() //nolint:errcheck
 
 	var allDeletedKeys [][]byte
 
@@ -197,7 +198,8 @@ func (s *EventStateMachine) RecoverFromSnapshot(r io.Reader, stopc <-chan struct
 	}
 
 	batch := s.db.NewBatch()
-	defer batch.Close()
+
+	defer batch.Close() //nolint:errcheck
 
 	for {
 		select {
@@ -241,7 +243,7 @@ func (s *EventStateMachine) RecoverFromSnapshot(r io.Reader, stopc <-chan struct
 	val, closer, err := s.db.Get(appliedIndexKey)
 	if err == nil {
 		s.lastApplied = binary.BigEndian.Uint64(val)
-		closer.Close()
+		defer closer.Close() //nolint:errcheck
 	} else if !errors.Is(err, pebble.ErrNotFound) {
 		return err
 	}
@@ -254,10 +256,11 @@ func (s *EventStateMachine) clearDB(stopc <-chan struct{}) error {
 	if err != nil {
 		return err
 	}
-	defer iter.Close()
+	defer iter.Close() //nolint:errcheck
 
 	batch := s.db.NewBatch()
-	defer batch.Close()
+
+	defer batch.Close() //nolint:errcheck
 
 	for iter.First(); iter.Valid(); iter.Next() {
 		select {

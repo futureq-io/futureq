@@ -43,7 +43,7 @@ func NewEventRepository(db storage.DB, logger *zap.Logger, bucketSize time.Durat
 	} else {
 		repo.lastID = binary.BigEndian.Uint64(val)
 
-		defer closer.Close()
+		defer closer.Close() //nolint:errcheck
 	}
 
 	return repo, nil

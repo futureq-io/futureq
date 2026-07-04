@@ -149,7 +149,7 @@ func (d *Dispatcher) doPass() int {
 		d.logger.Error("failed to create iterator", zap.Error(err))
 		return 0
 	}
-	defer iter.Close()
+	defer iter.Close() //nolint:errcheck
 
 	// Build a set of active topic hashes for O(1) lookup during iteration.
 	type topicGroupKey struct {

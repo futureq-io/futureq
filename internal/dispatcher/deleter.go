@@ -103,7 +103,7 @@ func (d *Deleter) flush() {
 	} else {
 		// Single-node path: write deletions directly to Pebble.
 		batch := d.db.NewBatch()
-		defer batch.Close()
+		defer batch.Close() //nolint:errcheck
 
 		for _, key := range keysToFlush {
 			if err := batch.Delete(key); err != nil {

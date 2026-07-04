@@ -154,6 +154,10 @@ func (c *Config) validate() error {
 		return err
 	}
 
+	if err := c.validateRaft(); err != nil {
+		return err
+	}
+
 	return nil
 }
 
