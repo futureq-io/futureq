@@ -1,10 +1,3 @@
-## CHANGELOG
+# Changelog
 
-### UNRELEASED
-    CHANGES:
-        - Added gRPC support and removed RabbitMQ
-        - Pebble uses
-    
-    IMPROVEMENTS:
-        - Better logging
-        - Configuration has validations now
+All notable changes to this project will be documented in this file.
