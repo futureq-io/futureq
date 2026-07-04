@@ -15,6 +15,9 @@ var defaultConfig = Config{
 		Logger: Logger{
 			Level: "info",
 		},
+		Metrics: Metrics{
+			Addr: "0.0.0.0:9090",
+		},
 	},
 
 	Storage: Storage{
@@ -46,11 +49,5 @@ var defaultConfig = Config{
 		DeleteBatchIntervalMs:  500,
 		InFlightTimeoutMs:      5000,
 		TTLJanitorIntervalMs:   60000,
-	},
-
-	Cluster: Cluster{
-		GossipListenAddress:  "0.0.0.0:7946",
-		GossipJoinPeers:      []string{},
-		MetricsListenAddress: "0.0.0.0:9090",
 	},
 }

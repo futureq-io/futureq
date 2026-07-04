@@ -13,7 +13,6 @@ import (
 	"github.com/futureq-io/futureq/internal/app"
 	"github.com/futureq-io/futureq/internal/config"
 	"github.com/futureq-io/futureq/internal/dispatcher"
-	"github.com/futureq-io/futureq/internal/membership"
 	pb "github.com/futureq-io/protocol/proto/go"
 )
 
@@ -30,7 +29,6 @@ func New(
 	cfg config.Server,
 	hub *dispatcher.Hub,
 	deleter *dispatcher.Deleter,
-	gossip *membership.Manager,
 	logger *zap.Logger,
 ) *Server {
 	log := logger.Named("grpc_server")
@@ -57,7 +55,6 @@ func New(
 	// Register all service implementations.
 	pb.RegisterFutureQProducerServer(srv, handlers.NewProducerHandler(log))
 	pb.RegisterFutureQConsumerServer(srv, handlers.NewConsumerHandler(log, hub, deleter))
-	pb.RegisterFutureQClusterServer(srv, handlers.NewClusterHandler(log, gossip))
 
 	return &Server{
 		srv:    srv,

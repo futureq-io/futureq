@@ -15,7 +15,6 @@ import (
 	"github.com/futureq-io/futureq/internal/app"
 	"github.com/futureq-io/futureq/internal/config"
 	"github.com/futureq-io/futureq/internal/dispatcher"
-	"github.com/futureq-io/futureq/internal/membership"
 	"github.com/futureq-io/futureq/internal/metrics"
 	"github.com/futureq-io/futureq/pkg/log"
 )
@@ -94,30 +93,11 @@ func startRun(_ *cobra.Command, _ []string) {
 		}
 	}
 
-
 	// ── TTL Janitor ───────────────────────────────────────────────────────────
 	janitor := dispatcher.NewTTLJanitor(a.DB, deleter, janitorInterval, logger)
 
-	// ── Gossip membership (cluster mode only) ─────────────────────────────────
-	var gossipManager *membership.Manager
-	if cfg.Raft.Enabled && len(cfg.Cluster.GossipJoinPeers) > 0 || cfg.Cluster.GossipListenAddress != "" {
-		gossipCfg := membership.Config{
-			NodeID:      cfg.Raft.NodeID,
-			BindAddress: cfg.Cluster.GossipListenAddress,
-			GRPCAddress: cfg.Server.Listen,
-			RaftAddress: cfg.Raft.ListenAddress,
-			JoinPeers:   cfg.Cluster.GossipJoinPeers,
-		}
-		gm, err := membership.NewManager(gossipCfg, logger)
-		if err != nil {
-			logger.Warn("failed to start gossip membership; running without it", zap.Error(err))
-		} else {
-			gossipManager = gm
-		}
-	}
-
 	// ── Prometheus metrics server ──────────────────────────────────────────────
-	metricsSrv := metrics.NewServer(cfg.Cluster.MetricsListenAddress, logger)
+	metricsSrv := metrics.NewServer(cfg.Observability.Metrics.Addr, logger)
 
 	// ── Start background goroutines ───────────────────────────────────────────
 	a.RegisterComponentWithShutdown()
@@ -144,18 +124,8 @@ func startRun(_ *cobra.Command, _ []string) {
 		metricsSrv.Run(a.Ctx)
 	}()
 
-	if gossipManager != nil {
-		a.RegisterComponentWithShutdown()
-		go func() {
-			defer a.ComponentShutdownDone()
-			<-a.Ctx.Done()
-			_ = gossipManager.Leave(context.Background())
-			_ = gossipManager.Shutdown()
-		}()
-	}
-
 	// ── gRPC server ───────────────────────────────────────────────────────────
-	grpcserver.New(cfg.Server, hub, deleter, gossipManager, logger).
+	grpcserver.New(cfg.Server, hub, deleter, logger).
 		Listen().
 		WaitForShutdown(a.Ctx)
 

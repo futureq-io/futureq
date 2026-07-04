@@ -29,6 +29,8 @@ observability:
     # Controls the verbosity of the logs.
     # Valid options: debug, info, warn, error, fatal
     level: info
+  metrics:
+    addr: "0.0.0.0:9090"
 
 storage:
   minAckLevel: Quorum
@@ -122,17 +124,3 @@ consumer:
   # How often (in milliseconds) the TTL janitor performs a full Pebble scan
   # to remove expired messages that were never consumed.
   ttlJanitorIntervalMs: 60000
-
-cluster:
-  # The address the memberlist gossip agent binds to.
-  # Format: "host:port".
-  gossipListenAddress: "0.0.0.0:7946"
-
-  # List of seed peer addresses used when this node joins an existing cluster.
-  # Leave empty for a single-node bootstrap.
-  gossipJoinPeers: []
-
-  # The address for the Prometheus /metrics HTTP endpoint. Set to "" to disable metrics.
-  metricsListenAddress: "0.0.0.0:9090"
-
-
