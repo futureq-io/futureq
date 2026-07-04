@@ -1,6 +1,9 @@
 package storage
 
-import "errors"
+import (
+	"errors"
+	"io"
+)
 
 // ErrNotFound is returned by DB.Get when the requested key does not exist.
 // Implementations must map their own not-found sentinel to this error so that
@@ -95,7 +98,7 @@ type Batch interface {
 type DB interface {
 	// Get retrieves the value stored for key.
 	// Returns ErrNotFound if the key does not exist.
-	Get(key []byte) (value []byte, err error)
+	Get(key []byte) (value []byte, closer io.Closer, err error)
 
 	// NewBatch returns a new empty Batch.
 	// The caller must call Batch.Close when done.

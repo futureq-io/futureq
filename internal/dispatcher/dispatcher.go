@@ -5,11 +5,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cockroachdb/pebble/v2"
 	"go.uber.org/zap"
 	"google.golang.org/protobuf/proto"
 
 	"github.com/futureq-io/futureq/internal/app"
+	"github.com/futureq-io/futureq/internal/storage"
 
 	"github.com/futureq-io/futureq/pkg/utils"
 	pb "github.com/futureq-io/protocol/proto/go"
@@ -34,7 +34,7 @@ type inFlightEntry struct {
 //   - Tracks in-flight messages per consumer; cleans up on consumer disconnect
 //   - Performs TTL checks at dispatch time; expired messages are batched for deletion
 type Dispatcher struct {
-	db              *pebble.DB
+	db              storage.DB
 	hub             *Hub
 	deleter         *Deleter
 	logger          *zap.Logger
@@ -45,7 +45,7 @@ type Dispatcher struct {
 }
 
 func NewDispatcher(
-	db *pebble.DB,
+	db storage.DB,
 	hub *Hub,
 	deleter *Deleter,
 	interval time.Duration,
@@ -141,13 +141,10 @@ func (d *Dispatcher) doPass() int {
 	nowBucket := utils.CalculateBucket(nowMs, app.A.Config().Storage.TimeBucketSize)
 	upperBound := utils.BucketUpperBound(nowBucket)
 
-	// Use a Pebble snapshot for non-blocking, consistent iteration.
-	snap := d.db.NewSnapshot()
-	defer snap.Close()
-
-	iter, err := snap.NewIter(&pebble.IterOptions{
+	iter, err := d.db.NewIter(&storage.IterOptions{
 		UpperBound: upperBound,
 	})
+
 	if err != nil {
 		d.logger.Error("failed to create iterator", zap.Error(err))
 		return 0

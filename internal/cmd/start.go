@@ -71,9 +71,9 @@ func startRun(_ *cobra.Command, _ []string) {
 		}
 	}
 
-	deleter := dispatcher.NewDeleter(a.Pebble.DB, deleteInterval, proposeDelete, logger)
+	deleter := dispatcher.NewDeleter(a.DB, deleteInterval, proposeDelete, logger)
 	disp := dispatcher.NewDispatcher(
-		a.Pebble.DB, hub, deleter,
+		a.DB, hub, deleter,
 		dispatchInterval, inFlightTimeout,
 		wakeCh, logger,
 	)
@@ -96,7 +96,7 @@ func startRun(_ *cobra.Command, _ []string) {
 
 
 	// ── TTL Janitor ───────────────────────────────────────────────────────────
-	janitor := dispatcher.NewTTLJanitor(a.Pebble.DB, deleter, janitorInterval, logger)
+	janitor := dispatcher.NewTTLJanitor(a.DB, deleter, janitorInterval, logger)
 
 	// ── Gossip membership (cluster mode only) ─────────────────────────────────
 	var gossipManager *membership.Manager

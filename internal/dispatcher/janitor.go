@@ -4,12 +4,12 @@ import (
 	"context"
 	"time"
 
-	"github.com/cockroachdb/pebble/v2"
 	"go.uber.org/zap"
 	"google.golang.org/protobuf/proto"
 
-	storagepb "github.com/futureq-io/protocol/proto/go/storage"
+	"github.com/futureq-io/futureq/internal/storage"
 	"github.com/futureq-io/futureq/pkg/utils"
+	storagepb "github.com/futureq-io/protocol/proto/go/storage"
 )
 
 // TTLJanitor periodically performs a full Pebble scan and removes messages
@@ -20,7 +20,7 @@ import (
 // Expired keys are forwarded to the Deleter, which routes them through Raft
 // (or Pebble directly in single-node mode) as a batched DeleteBatchCmd.
 type TTLJanitor struct {
-	db       *pebble.DB
+	db       storage.DB
 	deleter  *Deleter
 	interval time.Duration
 	logger   *zap.Logger
@@ -29,7 +29,7 @@ type TTLJanitor struct {
 // NewTTLJanitor constructs a TTLJanitor. interval controls how often the full
 // scan runs (e.g., 60 seconds). Shorter intervals mean faster cleanup at the
 // cost of more I/O.
-func NewTTLJanitor(db *pebble.DB, deleter *Deleter, interval time.Duration, logger *zap.Logger) *TTLJanitor {
+func NewTTLJanitor(db storage.DB, deleter *Deleter, interval time.Duration, logger *zap.Logger) *TTLJanitor {
 	return &TTLJanitor{
 		db:       db,
 		deleter:  deleter,
@@ -56,10 +56,7 @@ func (j *TTLJanitor) Run(ctx context.Context) {
 
 // sweep performs one full scan of Pebble and collects expired message keys.
 func (j *TTLJanitor) sweep() {
-	snap := j.db.NewSnapshot()
-	defer snap.Close()
-
-	iter, err := snap.NewIter(nil) // no bounds — full scan
+	iter, err := j.db.NewIter(nil) // no bounds — full scan
 	if err != nil {
 		j.logger.Error("TTL janitor: failed to create iterator", zap.Error(err))
 		return

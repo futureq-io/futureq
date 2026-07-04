@@ -30,7 +30,7 @@ type Repositories struct {
 
 type App struct {
 	cfg      *config.Config
-	Pebble   *storage.Pebble
+	DB       storage.DB
 	NodeHost *dragonboat.NodeHost
 	Ctx      context.Context
 	// ShutCtx is the 10-second shutdown window context. It is populated by
@@ -59,7 +59,7 @@ func Init(cfg *config.Config, logger *zap.Logger) (*App, error) {
 		return nil, fmt.Errorf("failed to initialize pebble storage: %w", err)
 	}
 
-	a.Pebble = pebble
+	a.DB = pebble
 	A = a
 
 	return a, nil
@@ -106,7 +106,7 @@ func (a *App) StartRaft(onDeleteKeys func(keys [][]byte)) error {
 
 	// Pass the fully-initialised EventRepository so the state machine uses the
 	// same monotonic ID counter and key schema as the standalone write path.
-	factory := raft.NewEventStateMachineFactory(a.Pebble.DB, a.Repositories.Events, onDeleteKeys, a.Logger)
+	factory := raft.NewEventStateMachineFactory(a.DB, a.Repositories.Events, onDeleteKeys, a.Logger)
 	if err := nh.StartOnDiskReplica(members, false, factory, rc); err != nil {
 		return fmt.Errorf("failed to start raft cluster: %w", err)
 	}
@@ -172,14 +172,14 @@ func (a *App) WithGracefulShutdown() error {
 		a.Logger.Info("Dragonboat NodeHost closed successfully")
 	}
 
-	if err := a.Pebble.DB.Flush(); err != nil {
+	if err := a.DB.Flush(); err != nil {
 		a.Logger.Error("failed to flush pebble on shutdown", zap.Error(err))
 	}
 
 	// 4. Safely close Pebble DB.
-	if a.Pebble != nil && a.Pebble.DB != nil {
+	if a.DB != nil && a.DB != nil {
 		a.Logger.Info("closing Pebble DB...")
-		if err := a.Pebble.DB.Close(); err != nil {
+		if err := a.DB.Close(); err != nil {
 			a.Logger.Error("failed to close Pebble DB", zap.Error(err))
 		} else {
 			a.Logger.Info("Pebble DB closed successfully")
@@ -190,7 +190,7 @@ func (a *App) WithGracefulShutdown() error {
 }
 
 func (a *App) WithRepositories() error {
-	eventRepo, err := repository.NewEventRepository(a.Pebble.DB, a.Logger, a.cfg.Storage.TimeBucketSize)
+	eventRepo, err := repository.NewEventRepository(a.DB, a.Logger, a.cfg.Storage.TimeBucketSize)
 	if err != nil {
 		return fmt.Errorf("failed to init event repo: %w", err)
 	}

@@ -5,8 +5,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cockroachdb/pebble/v2"
 	"github.com/futureq-io/futureq/internal/raft"
+	"github.com/futureq-io/futureq/internal/storage"
 	"go.uber.org/zap"
 )
 
@@ -18,7 +18,7 @@ import (
 // messages atomically, preventing a new leader from re-dispatching a message
 // that was already acknowledged before a failover.
 type Deleter struct {
-	db       *pebble.DB
+	db       storage.DB
 	logger   *zap.Logger
 	interval time.Duration
 	pending  [][]byte
@@ -36,7 +36,7 @@ type Deleter struct {
 // NewDeleter constructs a Deleter.
 // propose should be set to a function that calls NodeHost.SyncPropose with a
 // DeleteBatchCmd payload. Pass nil for single-node (non-Raft) mode.
-func NewDeleter(db *pebble.DB, interval time.Duration, propose func(cmd []byte) error, logger *zap.Logger) *Deleter {
+func NewDeleter(db storage.DB, interval time.Duration, propose func(cmd []byte) error, logger *zap.Logger) *Deleter {
 	return &Deleter{
 		db:       db,
 		logger:   logger.Named("deleter"),
@@ -106,12 +106,12 @@ func (d *Deleter) flush() {
 		defer batch.Close()
 
 		for _, key := range keysToFlush {
-			if err := batch.Delete(key, nil); err != nil {
+			if err := batch.Delete(key); err != nil {
 				d.logger.Error("failed to mark key for deletion", zap.Error(err))
 			}
 		}
 
-		if err := batch.Commit(pebble.NoSync); err != nil {
+		if err := batch.Commit(storage.Sync); err != nil {
 			d.logger.Error("failed to commit delete batch", zap.Error(err))
 			return
 		}

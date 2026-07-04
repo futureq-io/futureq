@@ -12,10 +12,10 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	"github.com/cockroachdb/pebble/v2"
 	"github.com/futureq-io/futureq/internal/app"
 	"github.com/futureq-io/futureq/internal/metrics"
 	"github.com/futureq-io/futureq/internal/raft"
+	"github.com/futureq-io/futureq/internal/storage"
 	"github.com/futureq-io/futureq/pkg/utils"
 	pb "github.com/futureq-io/protocol/proto/go"
 	storagepb "github.com/futureq-io/protocol/proto/go/storage"
@@ -203,7 +203,7 @@ func (ph *ProducerHandler) processRaftBatch(
 
 // processStandaloneBatch writes the batch directly to Pebble (non-Raft mode).
 func (ph *ProducerHandler) processStandaloneBatch(batch *pb.PublishBatch, nowMs int64) error {
-	b := app.A.Pebble.DB.NewBatch()
+	b := app.A.DB.NewBatch()
 	defer func() { _ = b.Close() }()
 
 	if err := ph.marshalMessages(batch, nowMs, func(data *storagepb.StoredMessage) error {
@@ -213,7 +213,7 @@ func (ph *ProducerHandler) processStandaloneBatch(batch *pb.PublishBatch, nowMs 
 		return err
 	}
 
-	if err := b.Commit(pebble.Sync); err != nil {
+	if err := b.Commit(storage.Sync); err != nil {
 		ph.logger.Error("failed to commit standalone batch", zap.Error(err))
 		return errBatchSave
 	}

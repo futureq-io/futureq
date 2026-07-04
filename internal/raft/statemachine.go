@@ -8,6 +8,7 @@ import (
 
 	"github.com/cockroachdb/pebble/v2"
 	"github.com/futureq-io/futureq/internal/repository"
+	"github.com/futureq-io/futureq/internal/storage"
 	"github.com/lni/dragonboat/v4/statemachine"
 	"go.uber.org/zap"
 )
@@ -22,7 +23,7 @@ var appliedIndexKey = []byte("metadata/raft/applied-index")
 type EventStateMachine struct {
 	clusterID   uint64
 	nodeID      uint64
-	db          *pebble.DB
+	db          storage.DB
 	repo        *repository.EventRepository
 	lastApplied uint64
 	// OnDeleteKeys is called after a DeleteBatchCmd is applied, with copies
@@ -33,7 +34,7 @@ type EventStateMachine struct {
 
 // NewEventStateMachineFactory returns the factory function that Dragonboat
 // passes (clusterID, nodeID) to when it instantiates a new replica.
-func NewEventStateMachineFactory(db *pebble.DB, repo *repository.EventRepository, onDeleteKeys func(keys [][]byte), logger *zap.Logger) func(uint64, uint64) statemachine.IOnDiskStateMachine {
+func NewEventStateMachineFactory(db storage.DB, repo *repository.EventRepository, onDeleteKeys func(keys [][]byte), logger *zap.Logger) func(uint64, uint64) statemachine.IOnDiskStateMachine {
 	return func(clusterID uint64, nodeID uint64) statemachine.IOnDiskStateMachine {
 		_ = logger
 		return &EventStateMachine{
@@ -48,6 +49,9 @@ func NewEventStateMachineFactory(db *pebble.DB, repo *repository.EventRepository
 
 func (s *EventStateMachine) Open(stopc <-chan struct{}) (uint64, error) {
 	val, closer, err := s.db.Get(appliedIndexKey)
+
+	defer closer.Close()
+
 	if err != nil {
 		if errors.Is(err, pebble.ErrNotFound) {
 			s.lastApplied = 0
@@ -55,7 +59,7 @@ func (s *EventStateMachine) Open(stopc <-chan struct{}) (uint64, error) {
 		}
 		return 0, err
 	}
-	defer closer.Close()
+
 	s.lastApplied = binary.BigEndian.Uint64(val)
 	return s.lastApplied, nil
 }
@@ -67,7 +71,7 @@ func (s *EventStateMachine) Open(stopc <-chan struct{}) (uint64, error) {
 // EventRepository (same monotonic-ID counter used by standalone mode). The
 // serialised StoredMessage bytes from the command buffer are passed directly to
 // StoreWithBatch — no re-serialisation, no extra allocation.
-func (s *EventStateMachine) applyEntry(batch *pebble.Batch, cmd []byte) (statemachine.Result, [][]byte) {
+func (s *EventStateMachine) applyEntry(batch storage.Batch, cmd []byte) (statemachine.Result, [][]byte) {
 	if len(cmd) == 0 {
 		return statemachine.Result{Value: 0}, nil
 	}
@@ -84,7 +88,7 @@ func (s *EventStateMachine) applyEntry(batch *pebble.Batch, cmd []byte) (statema
 			// lets the repository assign the authoritative monotonic key.
 			// This is identical to the standalone write path — same ID counter,
 			// same key schema, no extra serialisation step.
-			if _, err := s.repo.StoreRawWithBatch(batch, it.Bucket, it.TopicHash, it.Indexes ,it.Msg); err != nil {
+			if _, err := s.repo.StoreRawWithBatch(batch, it.Bucket, it.TopicHash, it.Indexes, it.Msg); err != nil {
 				log.Printf("raft: StoreRawWithBatch failed: %v", err)
 				return statemachine.Result{Value: 0}, nil
 			}
@@ -101,7 +105,7 @@ func (s *EventStateMachine) applyEntry(batch *pebble.Batch, cmd []byte) (statema
 		for _, k := range keys {
 			kCopy := make([]byte, len(k))
 			copy(kCopy, k)
-			if err := batch.Delete(kCopy, nil); err != nil {
+			if err := batch.Delete(kCopy); err != nil {
 				log.Printf("raft: batch.Delete failed: %v", err)
 				continue
 			}
@@ -132,11 +136,11 @@ func (s *EventStateMachine) Update(entries []statemachine.Entry) ([]statemachine
 
 	idxBytes := make([]byte, 8)
 	binary.BigEndian.PutUint64(idxBytes, s.lastApplied)
-	if err := batch.Set(appliedIndexKey, idxBytes, nil); err != nil {
+	if err := batch.Set(appliedIndexKey, idxBytes); err != nil {
 		return nil, err
 	}
 
-	if err := batch.Commit(pebble.NoSync); err != nil {
+	if err := batch.Commit(storage.NoSync); err != nil {
 		return nil, err
 	}
 
@@ -160,10 +164,7 @@ func (s *EventStateMachine) PrepareSnapshot() (interface{}, error) {
 }
 
 func (s *EventStateMachine) SaveSnapshot(_ interface{}, w io.Writer, stopc <-chan struct{}) error {
-	snapshot := s.db.NewSnapshot()
-	defer snapshot.Close()
-
-	iter, err := snapshot.NewIter(nil)
+	iter, err := s.db.NewIter(nil)
 	if err != nil {
 		return err
 	}
@@ -235,12 +236,12 @@ func (s *EventStateMachine) RecoverFromSnapshot(r io.Reader, stopc <-chan struct
 			return err
 		}
 
-		if err := batch.Set(k, v, nil); err != nil {
+		if err := batch.Set(k, v); err != nil {
 			return err
 		}
 	}
 
-	if err := batch.Commit(pebble.Sync); err != nil {
+	if err := batch.Commit(storage.Sync); err != nil {
 		return err
 	}
 
@@ -273,7 +274,7 @@ func (s *EventStateMachine) clearDB(stopc <-chan struct{}) error {
 		}
 		k := make([]byte, len(iter.Key()))
 		copy(k, iter.Key())
-		if err := batch.Delete(k, nil); err != nil {
+		if err := batch.Delete(k); err != nil {
 			return err
 		}
 	}
@@ -281,7 +282,7 @@ func (s *EventStateMachine) clearDB(stopc <-chan struct{}) error {
 		return err
 	}
 
-	return batch.Commit(pebble.Sync)
+	return batch.Commit(storage.NoSync)
 }
 
 func (s *EventStateMachine) Close() error {

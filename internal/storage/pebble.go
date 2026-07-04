@@ -1,7 +1,7 @@
 package storage
 
 import (
-	"errors"
+	"io"
 
 	"github.com/cockroachdb/pebble/v2"
 	"github.com/cockroachdb/pebble/v2/vfs"
@@ -11,7 +11,7 @@ import (
 
 // Pebble holds an open pebble database and implements storage.DB.
 type Pebble struct {
-	DB     *pebble.DB
+	db     *pebble.DB
 	logger *zap.Logger
 }
 
@@ -51,34 +51,23 @@ func NewPebble(cfg config.Pebble, logger *zap.Logger) (*Pebble, error) {
 		return nil, err
 	}
 
-	return &Pebble{DB: db, logger: pebbleLogger}, nil
+	return &Pebble{db: db, logger: pebbleLogger}, nil
 }
 
 // ── storage.DB implementation ─────────────────────────────────────────────────
 
-func (p *Pebble) Get(key []byte) ([]byte, error) {
-	val, closer, err := p.DB.Get(key)
-	if err != nil {
-		if errors.Is(err, pebble.ErrNotFound) {
-			return nil, ErrNotFound
-		}
-
-		return nil, err
-	}
-	// pebble returns a slice valid only while the closer is open, so copy first.
-	out := make([]byte, len(val))
-	copy(out, val)
-	return out, closer.Close()
+func (p *Pebble) Get(key []byte) ([]byte, io.Closer, error) {
+	return p.db.Get(key)
 }
 
 func (p *Pebble) NewBatch() Batch {
-	return &pebbleBatch{b: p.DB.NewBatch()}
+	return &pebbleBatch{b: p.db.NewBatch()}
 }
 
 // NewIter opens a snapshot internally and returns an iterator scoped to it.
 // Close() on the returned iterator releases both the iterator and the snapshot.
 func (p *Pebble) NewIter(opts *IterOptions) (Iterator, error) {
-	snap := p.DB.NewSnapshot()
+	snap := p.db.NewSnapshot()
 
 	var po *pebble.IterOptions
 	if opts != nil {
@@ -97,8 +86,8 @@ func (p *Pebble) NewIter(opts *IterOptions) (Iterator, error) {
 	return &pebbleIterator{iter: iter, snap: snap}, nil
 }
 
-func (p *Pebble) Flush() error { return p.DB.Flush() }
-func (p *Pebble) Close() error { return p.DB.Close() }
+func (p *Pebble) Flush() error { return p.db.Flush() }
+func (p *Pebble) Close() error { return p.db.Close() }
 
 // ── pebbleBatch ───────────────────────────────────────────────────────────────
 
