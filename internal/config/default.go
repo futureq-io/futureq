@@ -18,6 +18,7 @@ var defaultConfig = Config{
 	},
 
 	Storage: Storage{
+		MinAckLevel:    Quorum,
 		Persist:        true,
 		TimeBucketSize: 1 * time.Millisecond,
 		Pebble: Pebble{

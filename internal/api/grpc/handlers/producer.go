@@ -13,6 +13,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/futureq-io/futureq/internal/app"
+	"github.com/futureq-io/futureq/internal/config"
 	"github.com/futureq-io/futureq/internal/metrics"
 	"github.com/futureq-io/futureq/internal/raft"
 	"github.com/futureq-io/futureq/internal/storage"
@@ -78,6 +79,10 @@ func (ph *ProducerHandler) processBatch(ctx context.Context, batch *pb.PublishBa
 	}
 
 	ackLevel := batch.GetAckLevel()
+
+	if app.A.Config().Storage.MinAckLevel == config.Quorum && ackLevel == pb.AckLevel_ACK_LEVEL_NO_ACK {
+		return &pb.PublishBatchAck{Success: false}, status.Error(codes.InvalidArgument, "NO_ACK level is not allowed when MinAckLevel is Quorum")
+	}
 
 	nowMs := time.Now().UnixMilli()
 

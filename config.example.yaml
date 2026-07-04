@@ -31,6 +31,8 @@ observability:
     level: info
 
 storage:
+  minAckLevel: Quorum
+
   # When set to false, the node runs entirely in-memory using a virtual filesystem.
   # All data will be destroyed when the process exits. Useful for testing or ephemeral workers.
   persist: true

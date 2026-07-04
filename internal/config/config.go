@@ -10,6 +10,13 @@ import (
 	"gopkg.in/yaml.v2"
 )
 
+type AckLevel = string
+
+const (
+	Quorum AckLevel = "Quorum"
+	NoAck  AckLevel = "NoAck"
+)
+
 type Config struct {
 	Server        Server        `mapstructure:"server" yaml:"server"`
 	Observability Observability `mapstructure:"observability" yaml:"observability"`
@@ -36,6 +43,7 @@ type Logger struct {
 }
 
 type Storage struct {
+	MinAckLevel    AckLevel      `mapstructure:"minAckLevel" yaml:"minAckLevel"`
 	Persist        bool          `mapstructure:"persist" yaml:"persist"`
 	TimeBucketSize time.Duration `mapstructure:"timeBucketSize" yaml:"timeBucketSize"`
 	Pebble         Pebble        `mapstructure:"pebble" yaml:"pebble"`
