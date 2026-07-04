@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 
+	"go.etcd.io/bbolt"
 	bolt "go.etcd.io/bbolt"
 )
 
@@ -113,6 +114,51 @@ func (b *boltDB) NewIter(opts *IterOptions) (Iterator, error) {
 		lower:  lower,
 		upper:  upper,
 	}, nil
+}
+
+// Scan iterates over the bbolt database and yields keys and values to the provided function.
+func (b *boltDB) Scan(opts *IterOptions, yield func(key, value []byte) bool) error {
+	// Open a read-only transaction.
+	// This provides the same consistency guarantees as Pebble's Snapshot.
+	return b.db.View(func(tx *bbolt.Tx) error {
+		// bbolt stores data in buckets. Grab the default bucket for your KV store.
+		bucket := tx.Bucket(b.bucket)
+		if bucket == nil {
+			// If the bucket doesn't exist, the database is effectively empty.
+			return nil
+		}
+
+		c := bucket.Cursor()
+		var k, v []byte
+
+		// 1. Handle LowerBound
+		if opts != nil && opts.LowerBound != nil {
+			// Seek moves the cursor to the first key that is >= LowerBound
+			k, v = c.Seek(opts.LowerBound)
+		} else {
+			// No LowerBound? Start at the very beginning of the database
+			k, v = c.First()
+		}
+
+		// 2. The hot loop
+		for k != nil {
+			// Handle UpperBound (LevelDB/Pebble standard is that UpperBound is exclusive)
+			// bytes.Compare returns >= 0 if k is equal to or greater than UpperBound
+			if opts != nil && opts.UpperBound != nil && bytes.Compare(k, opts.UpperBound) >= 0 {
+				break
+			}
+
+			// Yield to the caller. If they return false, break the loop early.
+			if !yield(k, v) {
+				break
+			}
+
+			// Move to the next key in the B+Tree
+			k, v = c.Next()
+		}
+
+		return nil
+	})
 }
 
 // Flush is a no-op for bbolt: every committed transaction is fsync'd by default.

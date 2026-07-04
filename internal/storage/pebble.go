@@ -86,6 +86,34 @@ func (p *Pebble) NewIter(opts *IterOptions) (Iterator, error) {
 	return &pebbleIterator{iter: iter, snap: snap}, nil
 }
 
+func (p *Pebble) Scan(opts *IterOptions, yield func(key, value []byte) bool) error {
+	snap := p.db.NewSnapshot()
+	defer snap.Close()
+
+	var po *pebble.IterOptions
+	if opts != nil {
+		po = &pebble.IterOptions{
+			LowerBound: opts.LowerBound,
+			UpperBound: opts.UpperBound,
+		}
+	}
+
+	iter, err := snap.NewIter(po)
+	if err != nil {
+		return err
+	}
+
+	defer iter.Close()
+
+	for iter.First(); iter.Valid(); iter.Next() {
+		if !yield(iter.Key(), iter.Value()) {
+			break
+		}
+	}
+
+	return iter.Error()
+}
+
 func (p *Pebble) Flush() error { return p.db.Flush() }
 func (p *Pebble) Close() error { return p.db.Close() }
 

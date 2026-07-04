@@ -110,6 +110,11 @@ type DB interface {
 	// underlying transaction or snapshot held by the iterator.
 	NewIter(opts *IterOptions) (Iterator, error)
 
+	// Scan iterates over the database and yields keys and values to the provided function.
+	// It processes one record at a time, meaning it never loads the full result set into memory.
+	// Return a false value to stop the Scan.
+	Scan(opts *IterOptions, yield func(key, value []byte) bool) error
+
 	// Flush forces any in-memory data to be written to durable storage.
 	Flush() error
 
