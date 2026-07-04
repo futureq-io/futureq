@@ -30,7 +30,7 @@ type IterOptions struct {
 	UpperBound []byte
 }
 
-// Iterator is a forward/backward cursor over a sorted key-value range.
+// Iterator is a forward cursor over a sorted key-value range.
 // Callers must call Close when done to release underlying resources.
 //
 // The byte slices returned by Key and Value are only valid until the next
@@ -64,20 +64,6 @@ type Iterator interface {
 	Close() error
 }
 
-// Snapshot is a point-in-time, consistent, read-only view of the database.
-// Reads performed against a snapshot will not see writes that occurred after
-// the snapshot was taken.
-// 
-// Callers must call Close when done.
-type Snapshot interface {
-	// NewIter returns a new Iterator scoped to this snapshot.
-	// opts may be nil for an unbounded iteration.
-	NewIter(opts *IterOptions) (Iterator, error)
-
-	// Close releases the snapshot.
-	Close() error
-}
-
 // Batch is a collection of mutations (Set and Delete) that are applied to the
 // database atomically on Commit. Batches are not safe for concurrent use.
 //
@@ -100,9 +86,8 @@ type Batch interface {
 
 // DB is the engine-agnostic storage interface.
 //
-// All callers in this codebase that previously held a *pebble.DB should depend
-// on this interface instead. Implementations are free to be backed by Pebble,
-// BoltDB, or any other ordered key-value engine.
+// Implementations are free to be backed by Pebble, BoltDB, or any other
+// ordered key-value engine.
 //
 // Key ordering guarantee: implementations MUST maintain keys in
 // lexicographic (byte-wise) order so that the dispatcher's range scan and the
@@ -110,20 +95,19 @@ type Batch interface {
 type DB interface {
 	// Get retrieves the value stored for key.
 	// Returns ErrNotFound if the key does not exist.
-	// The returned byte slice is valid only until the next call to any DB method.
-	// Copy the value if you need it to outlive the call.
 	Get(key []byte) (value []byte, err error)
 
 	// NewBatch returns a new empty Batch.
 	// The caller must call Batch.Close when done.
 	NewBatch() Batch
 
-	// NewSnapshot returns a point-in-time read-only view of the database.
-	// The caller must call Snapshot.Close when done.
-	NewSnapshot() Snapshot
+	// NewIter returns a consistent, point-in-time iterator over the database.
+	// opts may be nil for an unbounded scan.
+	// The caller must call Iterator.Close when done; this also releases any
+	// underlying transaction or snapshot held by the iterator.
+	NewIter(opts *IterOptions) (Iterator, error)
 
 	// Flush forces any in-memory data to be written to durable storage.
-	// Used during shutdown to ensure no in-flight writes are lost.
 	Flush() error
 
 	// Close shuts down the storage engine, flushing all pending writes.
