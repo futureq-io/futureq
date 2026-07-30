@@ -23,6 +23,10 @@ type Service struct {
 	// propose submits a command to the metadata Raft group.
 	propose func(ctx context.Context, cmd []byte) error
 
+	// getGrpcAddrs returns the current nodeID → gRPC address registry
+	// from the metadata state machine. Set via SetGrpcAddrsSource.
+	getGrpcAddrs func() map[uint64]string
+
 	mu     sync.Mutex
 	epoch  uint64
 	shards map[uint64]struct{} // tracks which shards we know about
@@ -34,10 +38,10 @@ type Service struct {
 // handles any events.
 func NewService(nh *dragonboat.NodeHost, propose func(ctx context.Context, cmd []byte) error, logger *zap.Logger) *Service {
 	return &Service{
-		nh:     nh,
+		nh:      nh,
 		propose: propose,
-		logger: logger.Named("metadata_svc"),
-		shards: make(map[uint64]struct{}),
+		logger:  logger.Named("metadata_svc"),
+		shards:  make(map[uint64]struct{}),
 	}
 }
 
@@ -47,6 +51,32 @@ func (s *Service) SetNodeHost(nh *dragonboat.NodeHost) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.nh = nh
+}
+
+// SetGrpcAddrsSource sets the function used to read the current gRPC
+// address registry. Called during publishTopology to merge registered
+// addresses into each shard's GrpcAddrs map.
+func (s *Service) SetGrpcAddrsSource(fn func() map[uint64]string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.getGrpcAddrs = fn
+}
+
+// RegisterNodeAddr proposes this node's gRPC address to the metadata group.
+// Call once at startup after the metadata group is running.
+func (s *Service) RegisterNodeAddr(ctx context.Context, nodeID uint64, grpcAddr string) error {
+	cmd, err := MarshalRegisterNodeAddrCmd(nodeID, grpcAddr)
+	if err != nil {
+		return err
+	}
+	if err := s.propose(ctx, cmd); err != nil {
+		return err
+	}
+	s.logger.Info("registered node gRPC address",
+		zap.Uint64("node_id", nodeID),
+		zap.String("grpc_addr", grpcAddr),
+	)
+	return nil
 }
 
 // ─── IRaftEventListener ──────────────────────────────────────────────────────
@@ -173,12 +203,21 @@ func (s *Service) publishTopology(shardID uint64) {
 		term = 0
 	}
 
-	// Resolve leader address.
+	// Merge the gRPC address registry (populated by RegisterNodeAddrCmd).
+	s.mu.Lock()
+	getAddrs := s.getGrpcAddrs
+	s.mu.Unlock()
+	grpcAddrs := make(map[uint64]string)
+	if getAddrs != nil {
+		for k, v := range getAddrs() {
+			grpcAddrs[k] = v
+		}
+	}
+
+	// Resolve leader gRPC address (what clients dial).
 	leaderAddr := ""
 	if leaderID > 0 {
-		if addr, ok := membership.Nodes[leaderID]; ok {
-			leaderAddr = addr
-		}
+		leaderAddr = grpcAddrs[leaderID]
 	}
 
 	s.mu.Lock()
@@ -196,6 +235,7 @@ func (s *Service) publishTopology(shardID uint64) {
 		Nodes:          membership.Nodes,
 		NonVotings:     membership.NonVotings,
 		Witnesses:      membership.Witnesses,
+		GrpcAddrs:      grpcAddrs,
 	}
 
 	cmd, err := MarshalUpdateTopologyCmd(topo)

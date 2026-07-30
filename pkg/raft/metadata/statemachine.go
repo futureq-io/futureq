@@ -10,11 +10,14 @@ import (
 
 // MetadataStateMachine implements statemachine.IStateMachine (in-memory).
 // It stores the cluster topology — per-shard leader info, membership, and roles.
+// It also keeps a global nodeID → gRPC address registry populated by
+// RegisterNodeAddrCmd; publishTopology merges this into each shard's GrpcAddrs.
 // State is fully transient: rebuilt from the Raft log on restart.
 type MetadataStateMachine struct {
-	mu       sync.RWMutex
-	topology *TopologySnapshot
-	logger   *zap.Logger
+	mu        sync.RWMutex
+	topology  *TopologySnapshot
+	grpcAddrs map[uint64]string // nodeID → client-facing gRPC address
+	logger    *zap.Logger
 }
 
 // NewMetadataStateMachineFactory returns the factory function that Dragonboat
@@ -25,7 +28,8 @@ func NewMetadataStateMachineFactory(logger *zap.Logger) func(uint64, uint64) sta
 			topology: &TopologySnapshot{
 				Shards: make(map[uint64]*ShardTopology),
 			},
-			logger: logger.Named("metadata_sm"),
+			grpcAddrs: make(map[uint64]string),
+			logger:    logger.Named("metadata_sm"),
 		}
 	}
 }
@@ -54,6 +58,22 @@ func (s *MetadataStateMachine) Update(entry statemachine.Entry) (statemachine.Re
 			zap.Uint64("shard_id", topo.ShardID),
 			zap.Uint64("leader_id", topo.LeaderID),
 			zap.Uint64("epoch", topo.Epoch),
+		)
+		return statemachine.Result{Value: 1}, nil
+
+	case RegisterNodeAddrCmd:
+		nodeID, grpcAddr, err := UnmarshalRegisterNodeAddrCmd(entry.Cmd)
+		if err != nil {
+			s.logger.Error("failed to unmarshal RegisterNodeAddrCmd", zap.Error(err))
+			return statemachine.Result{Value: 0}, nil
+		}
+		s.mu.Lock()
+		s.grpcAddrs[nodeID] = grpcAddr
+		s.mu.Unlock()
+
+		s.logger.Debug("registered node gRPC address",
+			zap.Uint64("node_id", nodeID),
+			zap.String("grpc_addr", grpcAddr),
 		)
 		return statemachine.Result{Value: 1}, nil
 
@@ -107,12 +127,41 @@ func (s *MetadataStateMachine) GetShardTopology(shardID uint64) *ShardTopology {
 	return nil
 }
 
+// GetGrpcAddrs returns a copy of the global nodeID → gRPC address registry.
+// Safe for concurrent use.
+func (s *MetadataStateMachine) GetGrpcAddrs() map[uint64]string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	cp := make(map[uint64]string, len(s.grpcAddrs))
+	for k, v := range s.grpcAddrs {
+		cp[k] = v
+	}
+	return cp
+}
+
 // SaveSnapshot serialises the in-memory state to the writer.
 // For an in-memory state machine, this is used by Dragonboat to
 // transfer state to new members joining the metadata group.
 func (s *MetadataStateMachine) SaveSnapshot(w io.Writer, _ statemachine.ISnapshotFileCollection, _ <-chan struct{}) error {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+
+	// Write the gRPC address registry first.
+	if err := writeUint32(w, uint32(len(s.grpcAddrs))); err != nil {
+		return err
+	}
+	for nodeID, addr := range s.grpcAddrs {
+		cmd, err := MarshalRegisterNodeAddrCmd(nodeID, addr)
+		if err != nil {
+			return err
+		}
+		if err := writeUint32(w, uint32(len(cmd))); err != nil {
+			return err
+		}
+		if _, err := w.Write(cmd); err != nil {
+			return err
+		}
+	}
 
 	// Write number of shards.
 	count := uint32(len(s.topology.Shards))
@@ -144,6 +193,28 @@ func (s *MetadataStateMachine) RecoverFromSnapshot(r io.Reader, _ []statemachine
 
 	s.topology = &TopologySnapshot{
 		Shards: make(map[uint64]*ShardTopology),
+	}
+	s.grpcAddrs = make(map[uint64]string)
+
+	// Read the gRPC address registry.
+	grpcCount, err := readUint32(r)
+	if err != nil {
+		return err
+	}
+	for i := uint32(0); i < grpcCount; i++ {
+		cmdLen, err := readUint32(r)
+		if err != nil {
+			return err
+		}
+		cmd := make([]byte, cmdLen)
+		if _, err := io.ReadFull(r, cmd); err != nil {
+			return err
+		}
+		nodeID, addr, err := UnmarshalRegisterNodeAddrCmd(cmd)
+		if err != nil {
+			return err
+		}
+		s.grpcAddrs[nodeID] = addr
 	}
 
 	count, err := readUint32(r)
@@ -202,6 +273,7 @@ func copyShardTopology(t *ShardTopology) *ShardTopology {
 		Nodes:          make(map[uint64]string, len(t.Nodes)),
 		NonVotings:     make(map[uint64]string, len(t.NonVotings)),
 		Witnesses:      make(map[uint64]string, len(t.Witnesses)),
+		GrpcAddrs:      make(map[uint64]string, len(t.GrpcAddrs)),
 	}
 	for k, v := range t.Nodes {
 		cp.Nodes[k] = v
@@ -211,6 +283,9 @@ func copyShardTopology(t *ShardTopology) *ShardTopology {
 	}
 	for k, v := range t.Witnesses {
 		cp.Witnesses[k] = v
+	}
+	for k, v := range t.GrpcAddrs {
+		cp.GrpcAddrs[k] = v
 	}
 	return cp
 }

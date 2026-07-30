@@ -17,18 +17,31 @@ const (
 	// UpdateTopologyCmd replaces the full topology snapshot for a shard.
 	// Sent when a leader changes or membership changes in any shard.
 	UpdateTopologyCmd CommandType = iota
+
+	// RegisterNodeAddrCmd registers a node's client-facing gRPC address.
+	// Each node proposes this once at startup with its own address.
+	// The address registry is global (not per-shard) and survives
+	// topology updates — publishTopology merges it into each shard's
+	// GrpcAddrs map before proposing.
+	RegisterNodeAddrCmd
 )
 
 // ShardTopology describes the current state of a single Raft shard.
+//
+// Nodes/NonVotings/Witnesses hold Raft addresses (from Dragonboat membership).
+// GrpcAddrs holds each node's client-facing gRPC address — this is what SDKs
+// use to connect to the leader.
 type ShardTopology struct {
-	ShardID      uint64
-	LeaderID     uint64
-	LeaderAddr   string
-	Term         uint64
-	Epoch        uint64 // incremented on every topology change
-	Nodes        map[uint64]string
-	NonVotings   map[uint64]string
-	Witnesses    map[uint64]string
+	ShardID  uint64
+	LeaderID uint64
+	// LeaderAddr is the leader's gRPC address (client-facing).
+	LeaderAddr     string
+	Term           uint64
+	Epoch          uint64 // incremented on every topology change
+	Nodes          map[uint64]string
+	NonVotings     map[uint64]string
+	Witnesses      map[uint64]string
+	GrpcAddrs      map[uint64]string // nodeID → gRPC address
 	ConfigChangeID uint64
 }
 
@@ -49,30 +62,25 @@ type TopologySnapshot struct {
 //	[25..32] Epoch         (uint64 big-endian)
 //	[33..40] ConfigChangeID (uint64 big-endian)
 //	[41..42] LeaderAddrLen (uint16 big-endian)
-//	[43..]   LeaderAddr    (variable)
+//	[43..]   LeaderAddr    (variable — gRPC address)
 //	[..+2]   NumNodes      (uint16 big-endian)
 //	for each node:
 //	  [n..n+7]   NodeID    (uint64 big-endian)
 //	  [n+8..n+9] AddrLen   (uint16 big-endian)
-//	  [n+10..]   Addr      (variable)
+//	  [n+10..]   Addr      (variable — Raft address)
 //	[..+2]   NumNonVotings (uint16 big-endian)
-//	for each non-voting:
-//	  same as node
+//	for each non-voting: same as node
 //	[..+2]   NumWitnesses  (uint16 big-endian)
-//	for each witness:
-//	  same as node
+//	for each witness: same as node
+//	[..+2]   NumGrpcAddrs  (uint16 big-endian)
+//	for each grpc addr: same as node (gRPC address)
 func MarshalUpdateTopologyCmd(t *ShardTopology) ([]byte, error) {
-	size := 1 + 8*5 + 2 + len(t.LeaderAddr) + 2 // header + leaderAddr + numNodes
-	for _, addr := range t.Nodes {
-		size += 8 + 2 + len(addr)
-	}
-	size += 2 // numNonVotings
-	for _, addr := range t.NonVotings {
-		size += 8 + 2 + len(addr)
-	}
-	size += 2 // numWitnesses
-	for _, addr := range t.Witnesses {
-		size += 8 + 2 + len(addr)
+	size := 1 + 8*5 + 2 + len(t.LeaderAddr)
+	for _, m := range []map[uint64]string{t.Nodes, t.NonVotings, t.Witnesses, t.GrpcAddrs} {
+		size += 2
+		for _, addr := range m {
+			size += 8 + 2 + len(addr)
+		}
 	}
 
 	out := make([]byte, size)
@@ -97,7 +105,8 @@ func MarshalUpdateTopologyCmd(t *ShardTopology) ([]byte, error) {
 
 	pos = marshalNodeMap(out, pos, t.Nodes)
 	pos = marshalNodeMap(out, pos, t.NonVotings)
-	_ = marshalNodeMap(out, pos, t.Witnesses)
+	pos = marshalNodeMap(out, pos, t.Witnesses)
+	_ = marshalNodeMap(out, pos, t.GrpcAddrs)
 
 	return out, nil
 }
@@ -134,17 +143,17 @@ func UnmarshalUpdateTopologyCmd(data []byte) (*ShardTopology, error) {
 	pos += addrLen
 
 	var err error
-	t.Nodes, pos, err = unmarshalNodeMap(data, pos)
-	if err != nil {
+	if t.Nodes, pos, err = unmarshalNodeMap(data, pos); err != nil {
 		return nil, fmt.Errorf("metadata: nodes: %w", err)
 	}
-	t.NonVotings, pos, err = unmarshalNodeMap(data, pos)
-	if err != nil {
+	if t.NonVotings, pos, err = unmarshalNodeMap(data, pos); err != nil {
 		return nil, fmt.Errorf("metadata: nonVotings: %w", err)
 	}
-	t.Witnesses, _, err = unmarshalNodeMap(data, pos)
-	if err != nil {
+	if t.Witnesses, pos, err = unmarshalNodeMap(data, pos); err != nil {
 		return nil, fmt.Errorf("metadata: witnesses: %w", err)
+	}
+	if t.GrpcAddrs, _, err = unmarshalNodeMap(data, pos); err != nil {
+		return nil, fmt.Errorf("metadata: grpcAddrs: %w", err)
 	}
 
 	return t, nil
@@ -187,4 +196,37 @@ func unmarshalNodeMap(data []byte, pos int) (map[uint64]string, int, error) {
 		pos += addrLen
 	}
 	return m, pos, nil
+}
+
+// MarshalRegisterNodeAddrCmd serialises a (nodeID, grpcAddr) registration.
+//
+// Wire format:
+//
+//	[0]      CommandType (1 byte = 1)
+//	[1..8]   NodeID      (uint64 big-endian)
+//	[9..10]  AddrLen     (uint16 big-endian)
+//	[11..]   Addr        (variable — gRPC address)
+func MarshalRegisterNodeAddrCmd(nodeID uint64, grpcAddr string) ([]byte, error) {
+	out := make([]byte, 1+8+2+len(grpcAddr))
+	out[0] = byte(RegisterNodeAddrCmd)
+	binary.BigEndian.PutUint64(out[1:], nodeID)
+	binary.BigEndian.PutUint16(out[9:], uint16(len(grpcAddr)))
+	copy(out[11:], grpcAddr)
+	return out, nil
+}
+
+// UnmarshalRegisterNodeAddrCmd deserialises a RegisterNodeAddrCmd payload.
+func UnmarshalRegisterNodeAddrCmd(data []byte) (nodeID uint64, grpcAddr string, err error) {
+	if len(data) < 1+8+2 {
+		return 0, "", fmt.Errorf("metadata: RegisterNodeAddrCmd too short: %d bytes", len(data))
+	}
+	if CommandType(data[0]) != RegisterNodeAddrCmd {
+		return 0, "", fmt.Errorf("metadata: expected RegisterNodeAddrCmd (1), got %d", data[0])
+	}
+	nodeID = binary.BigEndian.Uint64(data[1:])
+	addrLen := int(binary.BigEndian.Uint16(data[9:]))
+	if 11+addrLen > len(data) {
+		return 0, "", fmt.Errorf("metadata: RegisterNodeAddrCmd truncated at addr")
+	}
+	return nodeID, string(data[11 : 11+addrLen]), nil
 }

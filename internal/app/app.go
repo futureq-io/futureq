@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"os/signal"
 	"sync"
@@ -169,6 +170,10 @@ func (a *App) StartRaft(onDeleteKeys func(keys [][]byte)) error {
 
 	a.MetadataSM = capturedSM
 
+	// Wire the gRPC address registry into the metadata service so published
+	// topologies include client-facing addresses.
+	metadataSvc.SetGrpcAddrsSource(capturedSM.GetGrpcAddrs)
+
 	// ── Start the event Raft group ─────────────────────────────────────────────
 	eventRC := raftconfig.Config{
 		ReplicaID:          cfg.Raft.NodeID,
@@ -192,11 +197,42 @@ func (a *App) StartRaft(onDeleteKeys func(keys [][]byte)) error {
 		return fmt.Errorf("failed to start event raft group: %w", err)
 	}
 
+	// ── Announce our gRPC address to the cluster ──────────────────────────────
+	// Derive the advertise address from our Raft address (the identity the
+	// cluster knows us by) plus the gRPC port from Server.Listen. Both run
+	// in the same process, so the host is always the same.
+	grpcAdvertise, err := grpcAdvertiseAddr(nh.RaftAddress(), cfg.Server.Listen)
+	if err != nil {
+		return fmt.Errorf("failed to compute gRPC advertise address: %w", err)
+	}
+	{
+		ctx, cancel := context.WithTimeout(a.Ctx, 10*time.Second)
+		defer cancel()
+		if err := metadataSvc.RegisterNodeAddr(ctx, cfg.Raft.NodeID, grpcAdvertise); err != nil {
+			return fmt.Errorf("failed to register gRPC address: %w", err)
+		}
+	}
+
 	// Register the event shard with the metadata service so it publishes
 	// initial topology.
 	a.MetadataSvc.RegisterShard(cfg.Raft.ClusterID)
 
 	return nil
+}
+
+// grpcAdvertiseAddr computes the client-facing gRPC address for this node.
+// The host is taken from raftAddr (this node's identity as the cluster sees
+// it — always dialable by peers), and the port from grpcListen.
+func grpcAdvertiseAddr(raftAddr, grpcListen string) (string, error) {
+	host, _, err := net.SplitHostPort(raftAddr)
+	if err != nil {
+		return "", fmt.Errorf("invalid raft address %q: %w", raftAddr, err)
+	}
+	_, grpcPort, err := net.SplitHostPort(grpcListen)
+	if err != nil {
+		return "", fmt.Errorf("invalid grpc listen address %q: %w", grpcListen, err)
+	}
+	return net.JoinHostPort(host, grpcPort), nil
 }
 
 // Config returns the application configuration.

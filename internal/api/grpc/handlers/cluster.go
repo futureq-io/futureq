@@ -57,11 +57,17 @@ func (h *ClusterHandler) GetClusterInfo(ctx context.Context, _ *pb.ClusterInfoRe
 
 	resp := &pb.ClusterInfoResponse{
 		LeaderNodeId:  topo.LeaderID,
-		LeaderAddress: topo.LeaderAddr,
+		LeaderAddress: topo.LeaderAddr, // gRPC address of the leader
 		Nodes:         make([]*pb.NodeInfo, 0, len(topo.Nodes)+len(topo.NonVotings)),
 	}
 
-	for nodeID, addr := range topo.Nodes {
+	// Prefer gRPC addresses (client-facing); fall back to Raft addresses
+	// for nodes that haven't registered yet.
+	for nodeID := range topo.Nodes {
+		addr := topo.GrpcAddrs[nodeID]
+		if addr == "" {
+			addr = topo.Nodes[nodeID]
+		}
 		resp.Nodes = append(resp.Nodes, &pb.NodeInfo{
 			NodeId:   nodeID,
 			Address:  addr,
@@ -69,7 +75,11 @@ func (h *ClusterHandler) GetClusterInfo(ctx context.Context, _ *pb.ClusterInfoRe
 			IsAlive:  true,
 		})
 	}
-	for nodeID, addr := range topo.NonVotings {
+	for nodeID := range topo.NonVotings {
+		addr := topo.GrpcAddrs[nodeID]
+		if addr == "" {
+			addr = topo.NonVotings[nodeID]
+		}
 		resp.Nodes = append(resp.Nodes, &pb.NodeInfo{
 			NodeId:   nodeID,
 			Address:  addr,
