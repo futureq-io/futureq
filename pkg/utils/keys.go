@@ -37,17 +37,33 @@ func CalculateBucket(unixMs int64, bucketSize time.Duration) uint64 {
 //
 // Layout (big-endian, lexicographically sortable):
 //
-//	[0..7]   topicHash     uint64 — time bucket (enqueued_at_ms + delay_ms) / timeBucketSize
-//	[8..15]  bucket  	   uint64 — xxhash64(topic)
-//	[16..23] eventID       uint64 — monotonic counter from EventRepository
+//	[0..7]   topicHash uint64 — xxhash64(topic)
+//	[8..15]  bucket    uint64 — time bucket (enqueued_at_ms + delay_ms) / timeBucketSize
+//	[16..23] eventID   uint64 — monotonic counter from EventRepository
 //
-// Sorting by this key gives a time-ordered, topic-grouped layout that lets
-// the dispatcher scan all due messages in a single forward iterator pass.
+// Sorting by this key groups messages by topic first, then by time bucket
+// within each topic, enabling efficient per-topic range scans.
 func EventKey(bucket, topicHash, eventID uint64) []byte {
 	key := make([]byte, 24)
 	binary.BigEndian.PutUint64(key[0:8], topicHash)
 	binary.BigEndian.PutUint64(key[8:16], bucket)
 	binary.BigEndian.PutUint64(key[16:24], eventID)
+	return key
+}
+
+// TopicLowerBound returns the inclusive lower-bound key for scanning all
+// messages belonging to a specific topic.
+func TopicLowerBound(topicHash uint64) []byte {
+	key := make([]byte, 8)
+	binary.BigEndian.PutUint64(key, topicHash)
+	return key
+}
+
+// TopicUpperBound returns the exclusive upper-bound key for scanning all
+// messages belonging to a specific topic.
+func TopicUpperBound(topicHash uint64) []byte {
+	key := make([]byte, 8)
+	binary.BigEndian.PutUint64(key, topicHash+1)
 	return key
 }
 
@@ -60,13 +76,14 @@ func BucketUpperBound(maxBucket uint64) []byte {
 }
 
 // ParseEventKey extracts the three components of a 24-byte event key.
+// Returns (topicHash, bucket, eventID) matching the byte layout [topicHash][bucket][eventID].
 // Returns ok=false if the key length is not exactly 24 bytes.
-func ParseEventKey(key []byte) (bucket, topicHash, eventID uint64, err error) {
+func ParseEventKey(key []byte) (topicHash, bucket, eventID uint64, err error) {
 	if len(key) != 24 {
 		return 0, 0, 0, fmt.Errorf(errInvalidKeyLength, len(key))
 	}
-	bucket = binary.BigEndian.Uint64(key[0:8])
-	topicHash = binary.BigEndian.Uint64(key[8:16])
+	topicHash = binary.BigEndian.Uint64(key[0:8])
+	bucket = binary.BigEndian.Uint64(key[8:16])
 	eventID = binary.BigEndian.Uint64(key[16:24])
-	return bucket, topicHash, eventID, nil
+	return topicHash, bucket, eventID, nil
 }
