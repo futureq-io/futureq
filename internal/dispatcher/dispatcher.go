@@ -20,9 +20,7 @@ import (
 // not yet acknowledged.
 type inFlightEntry struct {
 	dispatchedAt time.Time
-	consumerID   string
 	topic        string
-	groupID      string
 }
 
 // Dispatcher scans the storage engine for messages that are due for delivery

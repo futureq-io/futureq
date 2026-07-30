@@ -97,7 +97,7 @@ func MarshalUpdateTopologyCmd(t *ShardTopology) ([]byte, error) {
 
 	pos = marshalNodeMap(out, pos, t.Nodes)
 	pos = marshalNodeMap(out, pos, t.NonVotings)
-	pos = marshalNodeMap(out, pos, t.Witnesses)
+	_ = marshalNodeMap(out, pos, t.Witnesses)
 
 	return out, nil
 }
