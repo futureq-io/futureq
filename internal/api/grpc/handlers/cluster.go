@@ -26,6 +26,61 @@ func NewClusterHandler(logger *zap.Logger) *ClusterHandler {
 	}
 }
 
+// ─── Cluster Info ─────────────────────────────────────────────────────────────
+
+// GetClusterInfo returns the current cluster topology from the metadata
+// state machine. Any node can respond — it does not need to be the leader.
+// In standalone (non-Raft) mode, returns info about this single node.
+func (h *ClusterHandler) GetClusterInfo(ctx context.Context, _ *pb.ClusterInfoRequest) (*pb.ClusterInfoResponse, error) {
+	// Standalone mode — no Raft, no metadata group.
+	if app.A.NodeHost == nil || app.A.MetadataSM == nil {
+		cfg := app.A.Config()
+		return &pb.ClusterInfoResponse{
+			LeaderNodeId:  cfg.Raft.NodeID,
+			LeaderAddress: cfg.Server.Listen,
+			Nodes: []*pb.NodeInfo{
+				{
+					NodeId:   cfg.Raft.NodeID,
+					Address:  cfg.Server.Listen,
+					IsLeader: true,
+					IsAlive:  true,
+				},
+			},
+		}, nil
+	}
+
+	shardID := app.A.Config().Raft.ClusterID
+	topo := app.A.MetadataSM.GetShardTopology(shardID)
+	if topo == nil {
+		return nil, status.Error(codes.Unavailable, "topology not yet available")
+	}
+
+	resp := &pb.ClusterInfoResponse{
+		LeaderNodeId:  topo.LeaderID,
+		LeaderAddress: topo.LeaderAddr,
+		Nodes:         make([]*pb.NodeInfo, 0, len(topo.Nodes)+len(topo.NonVotings)),
+	}
+
+	for nodeID, addr := range topo.Nodes {
+		resp.Nodes = append(resp.Nodes, &pb.NodeInfo{
+			NodeId:   nodeID,
+			Address:  addr,
+			IsLeader: nodeID == topo.LeaderID,
+			IsAlive:  true,
+		})
+	}
+	for nodeID, addr := range topo.NonVotings {
+		resp.Nodes = append(resp.Nodes, &pb.NodeInfo{
+			NodeId:   nodeID,
+			Address:  addr,
+			IsLeader: false,
+			IsAlive:  true,
+		})
+	}
+
+	return resp, nil
+}
+
 // ─── Cluster Membership (Event Shard) ────────────────────────────────────────
 
 // JoinCluster adds a new node to the event shard Raft group.
