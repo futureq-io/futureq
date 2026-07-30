@@ -39,14 +39,15 @@ func startRun(_ *cobra.Command, _ []string) {
 
 	// ── Dispatcher components ─────────────────────────────────────────────────
 	wakeCh := make(chan struct{}, 1)
-	hub := dispatcher.NewHub(logger, wakeCh)
+	strategy := dispatcher.NewRoundRobinStrategy()
+	hub := dispatcher.NewHub(strategy, logger, wakeCh)
 
 	inFlightTimeout := time.Duration(cfg.Consumer.InFlightTimeoutMs) * time.Millisecond
 	deleteInterval := time.Duration(cfg.Consumer.DeleteBatchIntervalMs) * time.Millisecond
 	dispatchInterval := time.Duration(cfg.Consumer.DispatchPollIntervalMs) * time.Millisecond
 	janitorInterval := time.Duration(cfg.Consumer.TTLJanitorIntervalMs) * time.Millisecond
 
-	// ── Initialise app: Pebble + repository ──────────────────────────────────
+	// ── Initialise app: storage + repository ───────────────────────────────────
 	a, err := app.Init(cfg, logger)
 	if err != nil {
 		logger.Fatal("failed to init app", zap.Error(err))
@@ -56,21 +57,24 @@ func startRun(_ *cobra.Command, _ []string) {
 		logger.Fatal("failed to init repositories", zap.Error(err))
 	}
 
-	// ── Build the Raft propose function for the Deleter ───────────────────────
+	// ── Build the delete backend ────────────────────────────────────────────────
 	// In Raft mode: route deletions through SyncPropose(DeleteBatchCmd).
-	// In standalone mode: nil → deleter writes directly to Pebble.
-	var proposeDelete func(cmd []byte) error
+	// In standalone mode: write deletions directly to the local storage engine.
+	var deleteBackend dispatcher.DeleteBackend
 	if cfg.Raft.Enabled {
-		proposeDelete = func(cmd []byte) error {
+		proposeDelete := func(cmd []byte) error {
 			ctx, cancel := context.WithTimeout(a.Ctx, 5*time.Second)
 			defer cancel()
 			session := a.NodeHost.GetNoOPSession(cfg.Raft.ClusterID)
 			_, err := a.NodeHost.SyncPropose(ctx, session, cmd)
 			return err
 		}
+		deleteBackend = dispatcher.NewRaftDeleteBackend(proposeDelete, logger)
+	} else {
+		deleteBackend = dispatcher.NewDirectDeleteBackend(a.DB, logger)
 	}
 
-	deleter := dispatcher.NewDeleter(a.DB, deleteInterval, proposeDelete, logger)
+	deleter := dispatcher.NewDeleter(deleteBackend, deleteInterval, logger)
 	disp := dispatcher.NewDispatcher(
 		a.DB, hub, deleter,
 		dispatchInterval, inFlightTimeout,
@@ -78,7 +82,7 @@ func startRun(_ *cobra.Command, _ []string) {
 	)
 
 	// Wire the OnDelete callback so the deleter notifies the dispatcher when
-	// a direct Pebble delete completes (single-node mode).
+	// a delete completes — removes the key from the in-flight tracker.
 	deleter.OnDelete = func(key []byte) {
 		disp.RemoveInFlight(key)
 	}

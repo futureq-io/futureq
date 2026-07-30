@@ -4,79 +4,206 @@ import (
 	"bytes"
 	"fmt"
 	"sync"
-	"sync/atomic"
 
 	pb "github.com/futureq-io/protocol/proto/go"
 	"go.uber.org/zap"
 )
 
-// ActiveTopic describes a (topic, group) pair that has at least one connected consumer.
-type ActiveTopic struct {
-	Topic     string
-	TopicHash uint64
-	GroupID   string
+// ─── Dispatch Strategy ───────────────────────────────────────────────────────
+
+// DispatchStrategy selects one consumer from a group to receive a message.
+// Implementations must be safe for concurrent use.
+type DispatchStrategy interface {
+	// Select returns the consumer that should receive the message, or nil if
+	// no consumer is available. The candidates slice is a snapshot — safe to
+	// read without holding locks.
+	Select(candidates []*ConsumerEntry, msg *pb.QueueMessage) *ConsumerEntry
 }
 
-// consumerEntry holds one consumer's state within a group.
-type consumerEntry struct {
-	id    string
-	topic string
-	group string
-	ch    chan *pb.QueueMessage
+// RoundRobinStrategy dispatches messages to consumers in rotating order.
+type RoundRobinStrategy struct {
+	mu     sync.Mutex
+	next   map[string]uint64 // groupKey → next index
 }
 
-// Hub manages consumer connections indexed by (topic, group_id).
-// Within each group, messages are delivered to exactly one consumer
-// (round-robin). Different groups on the same topic each get an
-// independent copy of every message (fan-out).
+// NewRoundRobinStrategy returns a RoundRobinStrategy.
+func NewRoundRobinStrategy() *RoundRobinStrategy {
+	return &RoundRobinStrategy{
+		next: make(map[string]uint64),
+	}
+}
+
+// Select picks the next consumer in round-robin order for the given group.
+func (s *RoundRobinStrategy) Select(candidates []*ConsumerEntry, _ *pb.QueueMessage) *ConsumerEntry {
+	if len(candidates) == 0 {
+		return nil
+	}
+
+	// Use the first candidate's group key for the round-robin counter.
+	groupKey := candidates[0].GroupKey()
+
+	s.mu.Lock()
+	idx := s.next[groupKey]
+	s.next[groupKey] = (idx + 1) % uint64(len(candidates))
+	s.mu.Unlock()
+
+	return candidates[idx%uint64(len(candidates))]
+}
+
+// ─── Consumer Entry ──────────────────────────────────────────────────────────
+
+// ConsumerEntry holds one consumer's state.
+type ConsumerEntry struct {
+	ID    string
+	Topic string
+	Group string
+	Ch    chan *pb.QueueMessage
+}
+
+// GroupKey returns a canonical key for the consumer's (topic, group) pair.
+// Universal consumers (empty group) each get their own unique key so they
+// never compete with each other.
+func (c *ConsumerEntry) GroupKey() string {
+	if c.Group == "" {
+		return fmt.Sprintf("%s|__universal__|%s", c.Topic, c.ID)
+	}
+	return fmt.Sprintf("%s|%s", c.Topic, c.Group)
+}
+
+// IsUniversal returns true if this consumer receives every message on the
+// topic (no group — fan-out).
+func (c *ConsumerEntry) IsUniversal() bool {
+	return c.Group == ""
+}
+
+// ─── Topic Subscription ─────────────────────────────────────────────────────
+
+// TopicSubscription tracks all consumers for a single topic, organised by
+// group. Universal consumers (empty group) are stored individually.
+type TopicSubscription struct {
+	// groups: groupID → []*ConsumerEntry (competing consumers)
+	groups map[string][]*ConsumerEntry
+
+	// universal: consumerID → *ConsumerEntry (fan-out consumers)
+	universal map[string]*ConsumerEntry
+}
+
+// newTopicSubscription returns an empty TopicSubscription.
+func newTopicSubscription() *TopicSubscription {
+	return &TopicSubscription{
+		groups:    make(map[string][]*ConsumerEntry),
+		universal: make(map[string]*ConsumerEntry),
+	}
+}
+
+// add inserts a consumer into the appropriate bucket.
+func (ts *TopicSubscription) add(c *ConsumerEntry) {
+	if c.IsUniversal() {
+		ts.universal[c.ID] = c
+		return
+	}
+	ts.groups[c.Group] = append(ts.groups[c.Group], c)
+}
+
+// remove deletes a consumer. Returns true if the subscription is now empty.
+func (ts *TopicSubscription) remove(c *ConsumerEntry) bool {
+	if c.IsUniversal() {
+		delete(ts.universal, c.ID)
+	} else {
+		group := ts.groups[c.Group]
+		for i, ce := range group {
+			if ce.ID == c.ID {
+				ts.groups[c.Group] = append(group[:i], group[i+1:]...)
+				break
+			}
+		}
+		if len(ts.groups[c.Group]) == 0 {
+			delete(ts.groups, c.Group)
+		}
+	}
+	return ts.isEmpty()
+}
+
+// isEmpty returns true if no consumers remain on this topic.
+func (ts *TopicSubscription) isEmpty() bool {
+	return len(ts.groups) == 0 && len(ts.universal) == 0
+}
+
+// groupSnapshot returns a snapshot of all groups (non-universal).
+func (ts *TopicSubscription) groupSnapshot() map[string][]*ConsumerEntry {
+	snap := make(map[string][]*ConsumerEntry, len(ts.groups))
+	for gid, consumers := range ts.groups {
+		cp := make([]*ConsumerEntry, len(consumers))
+		copy(cp, consumers)
+		snap[gid] = cp
+	}
+	return snap
+}
+
+// universalSnapshot returns a snapshot of all universal consumers.
+func (ts *TopicSubscription) universalSnapshot() []*ConsumerEntry {
+	snap := make([]*ConsumerEntry, 0, len(ts.universal))
+	for _, c := range ts.universal {
+		snap = append(snap, c)
+	}
+	return snap
+}
+
+// ─── Hub ─────────────────────────────────────────────────────────────────────
+
+// Hub manages consumer connections indexed by topic.
+//
+// Delivery semantics:
+//   - Universal consumers (empty group): each receives every message (fan-out).
+//   - Grouped consumers: within each group, exactly one consumer receives each
+//     message (competing consumers). Different groups each get an independent
+//     copy (fan-out across groups).
 type Hub struct {
 	mu sync.RWMutex
 
-	// groups: topic → groupID → []*consumerEntry
-	groups map[string]map[string][]*consumerEntry
+	// topics: topic → *TopicSubscription
+	topics map[string]*TopicSubscription
 
-	// rrIndex: "topic|group" → next round-robin index (atomic)
-	rrIndex sync.Map
+	// byID: consumerID → *ConsumerEntry (fast lookup for unregister)
+	byID map[string]*ConsumerEntry
 
-	// byID: consumerID → *consumerEntry (fast lookup for unregister)
-	byID map[string]*consumerEntry
-
-	// inFlightByConsumer: consumerID → [][]Byte (slice of keys) (keys in-flight to that consumer)
-	// Protected by inFlightMu; used for bulk cleanup on disconnect.
+	// inFlightByConsumer: consumerID → [][]byte (keys in-flight to that consumer)
 	inFlightByConsumer map[string][][]byte
 	inFlightMu         sync.Mutex
 
-	logger *zap.Logger
-	wakeCh chan struct{}
+	strategy DispatchStrategy
+	logger   *zap.Logger
+	wakeCh   chan struct{}
 }
 
 // NewHub constructs a Hub. wakeCh is signalled when a new consumer connects,
 // causing the dispatcher to immediately scan for due messages.
-func NewHub(logger *zap.Logger, wakeCh chan struct{}) *Hub {
+func NewHub(strategy DispatchStrategy, logger *zap.Logger, wakeCh chan struct{}) *Hub {
 	return &Hub{
-		groups:             make(map[string]map[string][]*consumerEntry),
-		byID:               make(map[string]*consumerEntry),
+		topics:             make(map[string]*TopicSubscription),
+		byID:               make(map[string]*ConsumerEntry),
 		inFlightByConsumer: make(map[string][][]byte),
+		strategy:           strategy,
 		logger:             logger.Named("hub"),
 		wakeCh:             wakeCh,
 	}
 }
 
 // Register adds a consumer to the Hub under the given topic and group.
+// An empty groupID registers a universal (fan-out) consumer.
 func (h *Hub) Register(id, topic, groupID string, ch chan *pb.QueueMessage) {
-	entry := &consumerEntry{
-		id:    id,
-		topic: topic,
-		group: groupID,
-		ch:    ch,
+	entry := &ConsumerEntry{
+		ID:    id,
+		Topic: topic,
+		Group: groupID,
+		Ch:    ch,
 	}
 
 	h.mu.Lock()
-	if h.groups[topic] == nil {
-		h.groups[topic] = make(map[string][]*consumerEntry)
+	if h.topics[topic] == nil {
+		h.topics[topic] = newTopicSubscription()
 	}
-
-	h.groups[topic][groupID] = append(h.groups[topic][groupID], entry)
+	h.topics[topic].add(entry)
 	h.byID[id] = entry
 	h.mu.Unlock()
 
@@ -84,6 +211,7 @@ func (h *Hub) Register(id, topic, groupID string, ch chan *pb.QueueMessage) {
 		zap.String("id", id),
 		zap.String("topic", topic),
 		zap.String("group", groupID),
+		zap.Bool("universal", entry.IsUniversal()),
 	)
 
 	// Wake the dispatcher loop immediately.
@@ -93,39 +221,27 @@ func (h *Hub) Register(id, topic, groupID string, ch chan *pb.QueueMessage) {
 	}
 }
 
-// Unregister removes a consumer from the Hub and deletes the in-flight messages related to it.
+// Unregister removes a consumer from the Hub and deletes its in-flight keys.
 func (h *Hub) Unregister(id string) {
 	h.mu.Lock()
-	e, ok := h.byID[id]
+	entry, ok := h.byID[id]
 	if !ok {
 		h.mu.Unlock()
 		return
 	}
 
-	// Remove from group list.
-	// TODO: we could have a set for consumers in the group for O(1) deletions
-	group := h.groups[e.topic][e.group]
-	for i, ce := range group {
-		if ce.id == id {
-			h.groups[e.topic][e.group] = append(group[:i], group[i+1:]...)
-			break
+	if sub, exists := h.topics[entry.Topic]; exists {
+		if sub.remove(entry) {
+			delete(h.topics, entry.Topic)
 		}
-	}
-
-	// Clean up empty maps.
-	if len(h.groups[e.topic][e.group]) == 0 {
-		delete(h.groups[e.topic], e.group)
-	}
-	if len(h.groups[e.topic]) == 0 {
-		delete(h.groups, e.topic)
 	}
 	delete(h.byID, id)
 	h.mu.Unlock()
 
 	h.logger.Info("consumer unregistered",
 		zap.String("id", id),
-		zap.String("topic", e.topic),
-		zap.String("group", e.group),
+		zap.String("topic", entry.Topic),
+		zap.String("group", entry.Group),
 	)
 
 	// Delete in-flight keys for this consumer.
@@ -134,61 +250,67 @@ func (h *Hub) Unregister(id string) {
 	h.inFlightMu.Unlock()
 }
 
-// DispatchToGroup sends msg to exactly one available consumer in (topic, groupID).
-// It uses round-robin selection among the group's consumers and skips full channels.
-// Returns the consumerID that received the message, or "" if no consumer was available.
-func (h *Hub) DispatchToGroup(topic, groupID string, msg *pb.QueueMessage, deliveryTag []byte) string {
+// DispatchToTopic sends a message to all eligible consumers on a topic.
+// For each group, the strategy selects one consumer. Universal consumers each
+// receive a copy. Returns the number of consumers that received the message.
+func (h *Hub) DispatchToTopic(topic string, msg *pb.QueueMessage, deliveryTag []byte) int {
 	h.mu.RLock()
-	groups, ok := h.groups[topic]
+	sub, ok := h.topics[topic]
 	if !ok {
 		h.mu.RUnlock()
-		return ""
+		return 0
 	}
-	consumers := groups[groupID]
-	if len(consumers) == 0 {
-		h.mu.RUnlock()
-		return ""
-	}
-	// Make a shallow copy to iterate safely after releasing the lock.
-	snap := make([]*consumerEntry, len(consumers))
-	copy(snap, consumers)
+
+	// Snapshot groups and universal consumers while holding the lock.
+	groups := sub.groupSnapshot()
+	universal := sub.universalSnapshot()
 	h.mu.RUnlock()
 
-	// Round-robin starting index.
-	rrKey := fmt.Sprintf("%s|%s", topic, groupID)
-	var idx uint64
-	if v, loaded := h.rrIndex.Load(rrKey); loaded {
-		idx = v.(uint64)
-	}
+	sent := 0
 
-	n := uint64(len(snap))
-	for i := uint64(0); i < n; i++ {
-		candidate := snap[(idx+i)%n]
-		select {
-		case candidate.ch <- msg:
-			// Advance round-robin counter.
-			h.rrIndex.Store(rrKey, (idx+i+1)%n)
-			// Track in-flight key for this consumer.
-			h.inFlightMu.Lock()
-			h.inFlightByConsumer[candidate.id] = append(h.inFlightByConsumer[candidate.id], deliveryTag)
-			h.inFlightMu.Unlock()
-			return candidate.id
-		default:
-			h.logger.Warn("consumer channel full, skipping",
-				zap.String("consumer_id", candidate.id),
-				zap.String("topic", topic),
-				zap.String("group", groupID),
-			)
+	// Dispatch to each group — strategy picks one consumer per group.
+	for _, consumers := range groups {
+		selected := h.strategy.Select(consumers, msg)
+		if selected == nil {
+			continue
+		}
+		if h.trySend(selected, msg, deliveryTag) {
+			sent++
 		}
 	}
 
-	return ""
+	// Dispatch to all universal consumers.
+	for _, c := range universal {
+		if h.trySend(c, msg, deliveryTag) {
+			sent++
+		}
+	}
+
+	return sent
+}
+
+// trySend attempts to deliver a message to a single consumer. Returns true on
+// success. Tracks the delivery tag as in-flight for the consumer.
+func (h *Hub) trySend(c *ConsumerEntry, msg *pb.QueueMessage, deliveryTag []byte) bool {
+	select {
+	case c.Ch <- msg:
+		h.inFlightMu.Lock()
+		h.inFlightByConsumer[c.ID] = append(h.inFlightByConsumer[c.ID], deliveryTag)
+		h.inFlightMu.Unlock()
+		return true
+	default:
+		h.logger.Warn("consumer channel full, skipping",
+			zap.String("consumer_id", c.ID),
+			zap.String("topic", c.Topic),
+			zap.String("group", c.Group),
+		)
+		return false
+	}
 }
 
 // RemoveInFlightForConsumer removes a specific key from a consumer's in-flight
 // tracking. Called when the consumer ACKs or NACKs a message.
 func (h *Hub) RemoveInFlightForConsumer(consumerID string, key []byte) {
-
 	h.inFlightMu.Lock()
 	defer h.inFlightMu.Unlock()
 	keys := h.inFlightByConsumer[consumerID]
@@ -200,25 +322,15 @@ func (h *Hub) RemoveInFlightForConsumer(consumerID string, key []byte) {
 	}
 }
 
-// ActiveTopics returns a snapshot of all (topic, topicHash, groupID) tuples
-// that currently have at least one connected consumer. The dispatcher uses
-// this to scope its Pebble scan.
-func (h *Hub) ActiveTopics() []ActiveTopic {
+// ActiveTopics returns a snapshot of all topics that currently have at least
+// one connected consumer.
+func (h *Hub) ActiveTopics() []string {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 
-	var result []ActiveTopic
-	for topic, groups := range h.groups {
-		for groupID, consumers := range groups {
-			if len(consumers) > 0 {
-				// Import xxhash at call site to avoid circular imports.
-				// TopicHash is computed by the caller via utils.TopicHash.
-				result = append(result, ActiveTopic{
-					Topic:   topic,
-					GroupID: groupID,
-				})
-			}
-		}
+	result := make([]string, 0, len(h.topics))
+	for topic := range h.topics {
+		result = append(result, topic)
 	}
 	return result
 }
@@ -231,22 +343,19 @@ func (h *Hub) HasConsumers() bool {
 }
 
 // GroupsForTopic returns a snapshot of all group IDs that have active consumers
-// for the given topic.
+// for the given topic. Does not include universal consumers.
 func (h *Hub) GroupsForTopic(topic string) []string {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
-	groups, ok := h.groups[topic]
+	sub, ok := h.topics[topic]
 	if !ok {
 		return nil
 	}
-	result := make([]string, 0, len(groups))
-	for gid, consumers := range groups {
+	result := make([]string, 0, len(sub.groups))
+	for gid, consumers := range sub.groups {
 		if len(consumers) > 0 {
 			result = append(result, gid)
 		}
 	}
 	return result
 }
-
-// atomicUint64 is a helper for atomic operations via sync/atomic.
-var _ = atomic.AddUint64

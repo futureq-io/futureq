@@ -39,52 +39,29 @@ func NewConsumerHandler(logger *zap.Logger, hub *dispatcher.Hub, deleter *dispat
 //
 // Protocol:
 //  1. The client must send a ConsumerFrame with a SubscribeInit as the first frame.
-//     This declares the topic and consumer group for this connection.
+//     This declares the topic and optional consumer group for this connection.
 //  2. All subsequent client frames must carry AckRequest.
 //  3. The server pushes QueueMessage frames as messages become eligible.
+//
+// Group semantics:
+//   - Empty group_id: universal consumer — receives every message on the topic.
+//   - Non-empty group_id: competing consumer — races with other consumers in
+//     the same group; only one receives each message.
 //
 // Delivery semantics: at-least-once.
 //   - On ACK (success=true): the key is queued for Raft-replicated deletion.
 //   - On NACK (success=false): the key is immediately removed from in-flight,
 //     making the message eligible for re-dispatch on the next dispatcher tick.
 func (h *ConsumerHandler) Subscribe(stream grpc.BidiStreamingServer[pb.ConsumerFrame, pb.QueueMessage]) error {
-	// ─── Read the mandatory SubscribeInit first frame ─────────────────────────
-	initFrame, err := stream.Recv()
+	// ─── Read and validate the SubscribeInit handshake ─────────────────────────
+	init, err := h.readInit(stream)
 	if err != nil {
-		if err == io.EOF {
-			return nil
-		}
-		return status.Errorf(codes.Internal, "failed to read init frame: %v", err)
+		return err
 	}
 
-	init := initFrame.GetInit()
-	if init == nil {
-		return status.Errorf(codes.InvalidArgument,
-			"first frame must be a SubscribeInit; got %T", initFrame.Body)
-	}
-	if init.Topic == "" {
-		return status.Errorf(codes.InvalidArgument, "SubscribeInit.topic must not be empty")
-	}
-
-	// TODO: allow empty consumer groups (fan out for these kinds of consumers)
-	// Maybe put them in a special group where they all get fan-out instead of compete.
-	if init.GroupId == "" {
-		return status.Errorf(codes.InvalidArgument, "SubscribeInit.group_id must not be empty")
-	}
-
-	if app.A.NodeHost != nil {
-		shardID := app.A.Config().Raft.ClusterID
-		leaderID, _, valid, errL := app.A.NodeHost.GetLeaderID(shardID)
-		isLeader := errL == nil && valid && leaderID == app.A.Config().Raft.NodeID
-
-		if !isLeader {
-			h.logger.Warn("rejecting consumer: not the leader",
-				zap.String("topic", init.Topic),
-				zap.String("group_id", init.GroupId),
-			)
-			return status.Errorf(codes.FailedPrecondition,
-				"node is not the cluster leader")
-		}
+	// ─── Verify leadership in Raft mode ────────────────────────────────────────
+	if err := h.checkLeadership(init); err != nil {
+		return err
 	}
 
 	// ─── Register consumer with the Hub ────────────────────────────────────────
@@ -94,7 +71,6 @@ func (h *ConsumerHandler) Subscribe(stream grpc.BidiStreamingServer[pb.ConsumerF
 
 	metrics.ActiveConsumers.WithLabelValues(init.Topic, init.GroupId).Inc()
 	defer func() {
-		// Unregister and reclaim in-flight keys so they can be re-dispatched.
 		h.hub.Unregister(consumerID)
 		metrics.ActiveConsumers.WithLabelValues(init.Topic, init.GroupId).Dec()
 		h.logger.Info("consumer disconnected",
@@ -108,6 +84,7 @@ func (h *ConsumerHandler) Subscribe(stream grpc.BidiStreamingServer[pb.ConsumerF
 		zap.String("id", consumerID),
 		zap.String("topic", init.Topic),
 		zap.String("group_id", init.GroupId),
+		zap.Bool("universal", init.GroupId == ""),
 	)
 
 	ctx, cancel := context.WithCancel(stream.Context())
@@ -116,59 +93,10 @@ func (h *ConsumerHandler) Subscribe(stream grpc.BidiStreamingServer[pb.ConsumerF
 	errCh := make(chan error, 2)
 
 	// ─── Sender goroutine: push messages to the consumer ─────────────────────
-	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				errCh <- ctx.Err()
-				return
-			case msg := <-ch:
-				if err := stream.Send(msg); err != nil {
-					errCh <- err
-					return
-				}
-			}
-		}
-	}()
+	go h.sender(ctx, stream, ch, errCh)
 
 	// ─── Receiver goroutine: process ACK/NACK frames ─────────────────────────
-	go func() {
-		for {
-			frame, err := stream.Recv()
-			if err != nil {
-				if err == io.EOF {
-					errCh <- nil
-				} else {
-					errCh <- err
-				}
-				return
-			}
-
-			ackReq := frame.GetAck()
-			if ackReq == nil {
-				// Received a SubscribeInit after the first frame — protocol error.
-				h.logger.Warn("received unexpected SubscribeInit after handshake",
-					zap.String("consumer_id", consumerID))
-				continue
-			}
-
-			success := ackReq.Success
-
-			metrics.ConsumerAckTotal.WithLabelValues(
-				init.Topic, init.GroupId, boolToStr(success),
-			).Inc()
-
-			h.hub.RemoveInFlightForConsumer(consumerID, ackReq.DeliveryTag)
-			if success {
-				// ACK: queue the key for Raft-replicated deletion.
-				h.deleter.MarkDeleted(ackReq.DeliveryTag)
-				metrics.MessagesInFlight.WithLabelValues(init.Topic, init.GroupId).Dec()
-			} else {
-				// The key remains in Pebble; the dispatcher will re-deliver it.
-				metrics.MessagesInFlight.WithLabelValues(init.Topic, init.GroupId).Dec()
-			}
-		}
-	}()
+	go h.receiver(stream, consumerID, init, errCh)
 
 	err = <-errCh
 	if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) && err != io.EOF {
@@ -182,6 +110,114 @@ func (h *ConsumerHandler) Subscribe(stream grpc.BidiStreamingServer[pb.ConsumerF
 	}
 
 	return nil
+}
+
+// readInit reads and validates the mandatory SubscribeInit first frame.
+func (h *ConsumerHandler) readInit(stream grpc.BidiStreamingServer[pb.ConsumerFrame, pb.QueueMessage]) (*pb.SubscribeInit, error) {
+	initFrame, err := stream.Recv()
+	if err != nil {
+		if err == io.EOF {
+			return nil, nil
+		}
+		return nil, status.Errorf(codes.Internal, "failed to read init frame: %v", err)
+	}
+
+	init := initFrame.GetInit()
+	if init == nil {
+		return nil, status.Errorf(codes.InvalidArgument,
+			"first frame must be a SubscribeInit; got %T", initFrame.Body)
+	}
+	if init.Topic == "" {
+		return nil, status.Errorf(codes.InvalidArgument, "SubscribeInit.topic must not be empty")
+	}
+
+	// group_id may be empty — that registers a universal (fan-out) consumer.
+
+	return init, nil
+}
+
+// checkLeadership verifies this node is the Raft leader (if Raft is enabled).
+func (h *ConsumerHandler) checkLeadership(init *pb.SubscribeInit) error {
+	if app.A.NodeHost == nil {
+		return nil
+	}
+
+	shardID := app.A.Config().Raft.ClusterID
+	leaderID, _, valid, err := app.A.NodeHost.GetLeaderID(shardID)
+	isLeader := err == nil && valid && leaderID == app.A.Config().Raft.NodeID
+
+	if !isLeader {
+		h.logger.Warn("rejecting consumer: not the leader",
+			zap.String("topic", init.Topic),
+			zap.String("group_id", init.GroupId),
+		)
+		return status.Errorf(codes.FailedPrecondition,
+			"node is not the cluster leader")
+	}
+
+	return nil
+}
+
+// sender pushes messages from the consumer's channel to the gRPC stream.
+func (h *ConsumerHandler) sender(
+	ctx context.Context,
+	stream grpc.BidiStreamingServer[pb.ConsumerFrame, pb.QueueMessage],
+	ch chan *pb.QueueMessage,
+	errCh chan error,
+) {
+	for {
+		select {
+		case <-ctx.Done():
+			errCh <- ctx.Err()
+			return
+		case msg := <-ch:
+			if err := stream.Send(msg); err != nil {
+				errCh <- err
+				return
+			}
+		}
+	}
+}
+
+// receiver processes incoming ACK/NACK frames from the consumer.
+func (h *ConsumerHandler) receiver(
+	stream grpc.BidiStreamingServer[pb.ConsumerFrame, pb.QueueMessage],
+	consumerID string,
+	init *pb.SubscribeInit,
+	errCh chan error,
+) {
+	for {
+		frame, err := stream.Recv()
+		if err != nil {
+			if err == io.EOF {
+				errCh <- nil
+			} else {
+				errCh <- err
+			}
+			return
+		}
+
+		ackReq := frame.GetAck()
+		if ackReq == nil {
+			h.logger.Warn("received unexpected SubscribeInit after handshake",
+				zap.String("consumer_id", consumerID))
+			continue
+		}
+
+		success := ackReq.Success
+
+		metrics.ConsumerAckTotal.WithLabelValues(
+			init.Topic, init.GroupId, boolToStr(success),
+		).Inc()
+
+		h.hub.RemoveInFlightForConsumer(consumerID, ackReq.DeliveryTag)
+		if success {
+			// ACK: queue the key for Raft-replicated deletion.
+			h.deleter.MarkDeleted(ackReq.DeliveryTag)
+		}
+		// NACK: the key remains in storage; the dispatcher will re-deliver it.
+		metrics.MessagesInFlight.WithLabelValues(init.Topic, init.GroupId).Dec()
+	}
 }
 
 func boolToStr(b bool) string {

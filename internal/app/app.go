@@ -12,10 +12,12 @@ import (
 
 	"github.com/lni/dragonboat/v4"
 	raftconfig "github.com/lni/dragonboat/v4/config"
+	"github.com/lni/dragonboat/v4/statemachine"
 	"go.uber.org/zap"
 
 	"github.com/futureq-io/futureq/internal/config"
 	raft "github.com/futureq-io/futureq/internal/raft/event"
+	"github.com/futureq-io/futureq/pkg/raft/metadata"
 	"github.com/futureq-io/futureq/internal/repository"
 	"github.com/futureq-io/futureq/internal/storage"
 )
@@ -41,6 +43,14 @@ type App struct {
 	cancel       context.CancelCauseFunc
 	Logger       *zap.Logger
 	wg           sync.WaitGroup
+
+	// MetadataSvc watches Dragonboat events and replicates topology changes
+	// through the metadata Raft group. Nil when Raft is disabled.
+	MetadataSvc *metadata.Service
+
+	// MetadataSM is the in-memory metadata state machine instance.
+	// Provides direct read access to cluster topology. Nil when Raft is disabled.
+	MetadataSM *metadata.MetadataStateMachine
 }
 
 // Init initialises the application: sets up Pebble storage and creates the App
@@ -81,26 +91,86 @@ func Init(cfg *config.Config, logger *zap.Logger) (*App, error) {
 // Must be called after WithRepositories() so the EventRepository is fully
 // initialised before the state machine factory captures it.
 //
+// Starts two Raft groups:
+//   1. Event shard (config.Raft.ClusterID) — replicates event data
+//   2. Metadata shard (metadata.MetadataShardID) — replicates cluster topology
+//
 // onDeleteKeys is called by the state machine after a DeleteBatchCmd is applied.
 // Wire this to Dispatcher.RemoveInFlightBatch in start.go.
 func (a *App) StartRaft(onDeleteKeys func(keys [][]byte)) error {
 	cfg := a.cfg
+
+	// Create the metadata service first — it needs to be registered as the
+	// event listener before NodeHost is created.
+	var metadataSvc *metadata.Service
 
 	nhc := raftconfig.NodeHostConfig{
 		WALDir:         cfg.Raft.DataPath,
 		NodeHostDir:    cfg.Raft.DataPath,
 		RTTMillisecond: cfg.Raft.RTTMillisecond,
 		RaftAddress:    cfg.Raft.ListenAddress,
+		// We'll set the listeners after creating the service below.
 	}
 
-	nh, err := dragonboat.NewNodeHost(nhc)
+	// We need the NodeHost reference to create the propose function, but
+	// Dragonboat needs the listeners at creation time. Use a forward reference:
+	// create the service with a lazy propose function that captures nh later.
+	var nh *dragonboat.NodeHost
+	proposeMetadata := func(ctx context.Context, cmd []byte) error {
+		session := nh.GetNoOPSession(metadata.MetadataShardID)
+		_, err := nh.SyncPropose(ctx, session, cmd)
+		return err
+	}
+
+	metadataSvc = metadata.NewService(nil, proposeMetadata, a.Logger)
+	nhc.RaftEventListener = metadataSvc
+	nhc.SystemEventListener = metadataSvc
+
+	var err error
+	nh, err = dragonboat.NewNodeHost(nhc)
 	if err != nil {
 		return fmt.Errorf("failed to create dragonboat nodehost: %w", err)
 	}
 
 	a.NodeHost = nh
+	a.MetadataSvc = metadataSvc
+	metadataSvc.SetNodeHost(nh)
 
-	rc := raftconfig.Config{
+	// ── Start the metadata Raft group ──────────────────────────────────────────
+	// Wrap the factory to capture the state machine instance for direct reads.
+	var capturedSM *metadata.MetadataStateMachine
+	baseFactory := metadata.NewMetadataStateMachineFactory(a.Logger)
+	metadataFactory := func(clusterID, nodeID uint64) statemachine.IStateMachine {
+		sm := baseFactory(clusterID, nodeID)
+		if msm, ok := sm.(*metadata.MetadataStateMachine); ok {
+			capturedSM = msm
+		}
+		return sm
+	}
+	metadataRC := raftconfig.Config{
+		ReplicaID:          cfg.Raft.NodeID,
+		ShardID:            metadata.MetadataShardID,
+		ElectionRTT:        10,
+		HeartbeatRTT:       1,
+		CheckQuorum:        true,
+		SnapshotEntries:    5,
+		CompactionOverhead: 5, // compact aggressively since state is small
+	}
+
+	// All initial members join the metadata group as voters.
+	metadataMembers := make(map[uint64]dragonboat.Target)
+	for k, v := range cfg.Raft.InitialMembers {
+		metadataMembers[k] = dragonboat.Target(v)
+	}
+
+	if err := nh.StartReplica(metadataMembers, false, metadataFactory, metadataRC); err != nil {
+		return fmt.Errorf("failed to start metadata raft group: %w", err)
+	}
+
+	a.MetadataSM = capturedSM
+
+	// ── Start the event Raft group ─────────────────────────────────────────────
+	eventRC := raftconfig.Config{
 		ReplicaID:          cfg.Raft.NodeID,
 		ShardID:            cfg.Raft.ClusterID,
 		ElectionRTT:        10,
@@ -110,17 +180,21 @@ func (a *App) StartRaft(onDeleteKeys func(keys [][]byte)) error {
 		CompactionOverhead: cfg.Raft.CompactionOverhead,
 	}
 
-	members := make(map[uint64]dragonboat.Target)
+	eventMembers := make(map[uint64]dragonboat.Target)
 	for k, v := range cfg.Raft.InitialMembers {
-		members[k] = dragonboat.Target(v)
+		eventMembers[k] = dragonboat.Target(v)
 	}
 
 	// Pass the fully-initialised EventRepository so the state machine uses the
 	// same monotonic ID counter and key schema as the standalone write path.
-	factory := raft.NewEventStateMachineFactory(a.DB, a.Repositories.Events, onDeleteKeys, a.Logger)
-	if err := nh.StartOnDiskReplica(members, false, factory, rc); err != nil {
-		return fmt.Errorf("failed to start raft cluster: %w", err)
+	eventFactory := raft.NewEventStateMachineFactory(a.DB, a.Repositories.Events, onDeleteKeys, a.Logger)
+	if err := nh.StartOnDiskReplica(eventMembers, false, eventFactory, eventRC); err != nil {
+		return fmt.Errorf("failed to start event raft group: %w", err)
 	}
+
+	// Register the event shard with the metadata service so it publishes
+	// initial topology.
+	a.MetadataSvc.RegisterShard(cfg.Raft.ClusterID)
 
 	return nil
 }

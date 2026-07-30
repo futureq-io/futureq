@@ -12,13 +12,14 @@ import (
 	storagepb "github.com/futureq-io/protocol/proto/go/storage"
 )
 
-// TTLJanitor periodically performs a full Pebble scan and removes messages
+// TTLJanitor periodically performs a full storage scan and removes messages
 // whose TTL has elapsed. Unlike the dispatcher (which only scans active-topic
 // ranges), the janitor sweeps all keys so expired messages are cleaned up even
 // when no consumer is connected.
 //
 // Expired keys are forwarded to the Deleter, which routes them through Raft
-// (or Pebble directly in single-node mode) as a batched DeleteBatchCmd.
+// (or the local storage engine directly in single-node mode) as a batched
+// DeleteBatchCmd.
 type TTLJanitor struct {
 	db       storage.DB
 	deleter  *Deleter
@@ -54,54 +55,43 @@ func (j *TTLJanitor) Run(ctx context.Context) {
 	}
 }
 
-// sweep performs one full scan of Pebble and collects expired message keys.
+// sweep performs one full scan of the storage engine and collects expired
+// message keys. Uses Scan for lower overhead — no manual iterator lifecycle.
 func (j *TTLJanitor) sweep() {
-	iter, err := j.db.NewIter(nil) // no bounds — full scan
-	if err != nil {
-		j.logger.Error("TTL janitor: failed to create iterator", zap.Error(err))
-		return
-	}
-
-	defer iter.Close() //nolint:errcheck
-
 	nowMs := time.Now().UnixMilli()
 	var expiredKeys [][]byte
 
-	for iter.First(); iter.Valid(); iter.Next() {
-		key := iter.Key()
-
+	err := j.db.Scan(nil, func(key, val []byte) error {
 		// Only consider 24-byte event keys.
 		if _, _, _, err := utils.ParseEventKey(key); err != nil {
-			j.logger.Error(
-				"failed to parse event key",
-				zap.ByteString("key", key),
-				zap.Error(err),
-			)
-			continue
+			// Not an event key (metadata, indexes, etc.) — skip silently.
+			return nil
 		}
 
-		val := iter.Value()
 		var msg storagepb.StoredMessage
 		if err := proto.Unmarshal(val, &msg); err != nil {
 			// Skip keys we can't parse.
-			continue
+			return nil
 		}
 
 		if msg.TtlMs <= 0 {
 			// No TTL set — message lives forever.
-			continue
+			return nil
 		}
 
-		expiresAt := msg.EnqueuedAtUnixMs + msg.TtlMs
-		if nowMs >= expiresAt {
+		if nowMs >= msg.EnqueuedAtUnixMs+msg.TtlMs {
+			// Must copy — key is only valid during yield.
 			keyCopy := make([]byte, len(key))
 			copy(keyCopy, key)
 			expiredKeys = append(expiredKeys, keyCopy)
 		}
-	}
 
-	if err := iter.Error(); err != nil {
-		j.logger.Error("TTL janitor: iterator error", zap.Error(err))
+		return nil
+	})
+
+	if err != nil {
+		j.logger.Error("TTL janitor: scan error", zap.Error(err))
+		return
 	}
 
 	if len(expiredKeys) == 0 {

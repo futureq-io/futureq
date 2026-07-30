@@ -55,6 +55,7 @@ func New(
 	// Register all service implementations.
 	pb.RegisterFutureQProducerServer(srv, handlers.NewProducerHandler(log))
 	pb.RegisterFutureQConsumerServer(srv, handlers.NewConsumerHandler(log, hub, deleter))
+	pb.RegisterFutureQClusterServer(srv, handlers.NewClusterHandler(log))
 
 	return &Server{
 		srv:    srv,
