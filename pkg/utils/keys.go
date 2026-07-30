@@ -33,21 +33,20 @@ func CalculateBucket(unixMs int64, bucketSize time.Duration) uint64 {
 	return uint64(unixMs) / uint64(bucketSize.Milliseconds())
 }
 
-
 // EventKey constructs the 24-byte Pebble key for a stored message.
 //
 // Layout (big-endian, lexicographically sortable):
 //
-//	[0..7]   bucket     uint64 — time bucket (enqueued_at_ms + delay_ms) / timeBucketSize
-//	[8..15]  topicHash  uint64 — xxhash64(topic)
-//	[16..23] eventID    uint64 — monotonic counter from EventRepository
+//	[0..7]   topicHash     uint64 — time bucket (enqueued_at_ms + delay_ms) / timeBucketSize
+//	[8..15]  bucket  	   uint64 — xxhash64(topic)
+//	[16..23] eventID       uint64 — monotonic counter from EventRepository
 //
 // Sorting by this key gives a time-ordered, topic-grouped layout that lets
 // the dispatcher scan all due messages in a single forward iterator pass.
 func EventKey(bucket, topicHash, eventID uint64) []byte {
 	key := make([]byte, 24)
-	binary.BigEndian.PutUint64(key[0:8], bucket)
-	binary.BigEndian.PutUint64(key[8:16], topicHash)
+	binary.BigEndian.PutUint64(key[0:8], topicHash)
+	binary.BigEndian.PutUint64(key[8:16], bucket)
 	binary.BigEndian.PutUint64(key[16:24], eventID)
 	return key
 }
