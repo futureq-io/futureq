@@ -91,46 +91,63 @@ func (h *ClusterHandler) GetClusterInfo(ctx context.Context, _ *pb.ClusterInfoRe
 	return resp, nil
 }
 
-// ─── Cluster Membership (Event Shard) ────────────────────────────────────────
+// ─── Cluster Membership ─────────────────────────────────────────────────────
 
-// JoinCluster adds a new node to the event shard Raft group.
-// The node is first added as a non-voting member to sync state, then promoted
-// to a full voting replica once it has caught up with the leader.
+// JoinCluster adds a new broker node to the cluster. The node is registered
+// on BOTH the event shard and the metadata group: first as a non-voting
+// member to sync state, then promoted to a full voting replica on both once
+// it has caught up with the leader.
 func (h *ClusterHandler) JoinCluster(ctx context.Context, req *pb.JoinRequest) (*pb.JoinResponse, error) {
 	if app.A.NodeHost == nil {
 		return nil, status.Error(codes.FailedPrecondition, "node is not running in raft mode")
 	}
 
-	shardID := app.A.Config().Raft.ClusterID
+	eventShard := app.A.Config().Raft.ClusterID
 
 	h.logger.Info("adding node as non-voting member",
 		zap.Uint64("node_id", req.NodeId),
 		zap.String("raft_address", req.RaftAddress),
-		zap.Uint64("shard_id", shardID),
+		zap.Uint64("event_shard", eventShard),
 	)
 
-	// Step 1: Add as non-voting member to sync without disrupting quorum.
-	if err := app.A.NodeHost.SyncRequestAddNonVoting(ctx, shardID, req.NodeId, req.RaftAddress, 0); err != nil {
-		h.logger.Error("failed to add non-voting member", zap.Error(err))
+	// Step 1: Add as non-voting member on both groups (parallel-safe order:
+	// metadata first since it's small and syncs fast).
+	if err := app.A.NodeHost.SyncRequestAddNonVoting(ctx, metadata.MetadataShardID, req.NodeId, req.RaftAddress, 0); err != nil {
+		h.logger.Error("failed to add non-voting member to metadata group", zap.Error(err))
+		return &pb.JoinResponse{Success: false, ErrorMessage: err.Error()}, nil
+	}
+	if err := app.A.NodeHost.SyncRequestAddNonVoting(ctx, eventShard, req.NodeId, req.RaftAddress, 0); err != nil {
+		h.logger.Error("failed to add non-voting member to event shard", zap.Error(err))
 		return &pb.JoinResponse{Success: false, ErrorMessage: err.Error()}, nil
 	}
 
-	// Step 2: Wait for the node to catch up with the leader.
-	if err := h.waitForCatchUp(ctx, shardID, req.NodeId); err != nil {
-		h.logger.Error("node failed to catch up",
+	// Step 2: Wait for the node to catch up on both groups.
+	if err := h.waitForCatchUp(ctx, eventShard, req.NodeId); err != nil {
+		h.logger.Error("node failed to catch up on event shard",
+			zap.Uint64("node_id", req.NodeId),
+			zap.Error(err),
+		)
+		return &pb.JoinResponse{Success: false, ErrorMessage: fmt.Sprintf("node did not catch up: %v", err)}, nil
+	}
+	if err := h.waitForCatchUp(ctx, metadata.MetadataShardID, req.NodeId); err != nil {
+		h.logger.Error("node failed to catch up on metadata group",
 			zap.Uint64("node_id", req.NodeId),
 			zap.Error(err),
 		)
 		return &pb.JoinResponse{Success: false, ErrorMessage: fmt.Sprintf("node did not catch up: %v", err)}, nil
 	}
 
-	h.logger.Info("promoting non-voting member to replica",
+	h.logger.Info("promoting non-voting member to voter on both groups",
 		zap.Uint64("node_id", req.NodeId),
 	)
 
-	// Step 3: Promote to voting member.
-	if err := app.A.NodeHost.SyncRequestAddReplica(ctx, shardID, req.NodeId, req.RaftAddress, 0); err != nil {
-		h.logger.Error("failed to promote non-voting member to replica", zap.Error(err))
+	// Step 3: Promote to voting member on both groups.
+	if err := app.A.NodeHost.SyncRequestAddReplica(ctx, metadata.MetadataShardID, req.NodeId, req.RaftAddress, 0); err != nil {
+		h.logger.Error("failed to promote to voter on metadata group", zap.Error(err))
+		return &pb.JoinResponse{Success: false, ErrorMessage: err.Error()}, nil
+	}
+	if err := app.A.NodeHost.SyncRequestAddReplica(ctx, eventShard, req.NodeId, req.RaftAddress, 0); err != nil {
+		h.logger.Error("failed to promote to voter on event shard", zap.Error(err))
 		return &pb.JoinResponse{Success: false, ErrorMessage: err.Error()}, nil
 	}
 
@@ -141,21 +158,25 @@ func (h *ClusterHandler) JoinCluster(ctx context.Context, req *pb.JoinRequest) (
 	return &pb.JoinResponse{Success: true}, nil
 }
 
-// LeaveCluster removes a node from the event shard Raft group.
+// LeaveCluster removes a node from both the event shard and the metadata group.
 func (h *ClusterHandler) LeaveCluster(ctx context.Context, req *pb.LeaveRequest) (*pb.LeaveResponse, error) {
 	if app.A.NodeHost == nil {
 		return nil, status.Error(codes.FailedPrecondition, "node is not running in raft mode")
 	}
 
-	shardID := app.A.Config().Raft.ClusterID
+	eventShard := app.A.Config().Raft.ClusterID
 
 	h.logger.Info("removing node from cluster",
 		zap.Uint64("node_id", req.NodeId),
-		zap.Uint64("shard_id", shardID),
+		zap.Uint64("event_shard", eventShard),
 	)
 
-	if err := app.A.NodeHost.SyncRequestDeleteReplica(ctx, shardID, req.NodeId, 0); err != nil {
-		h.logger.Error("failed to remove node from cluster", zap.Error(err))
+	if err := app.A.NodeHost.SyncRequestDeleteReplica(ctx, eventShard, req.NodeId, 0); err != nil {
+		h.logger.Error("failed to remove node from event shard", zap.Error(err))
+		return &pb.LeaveResponse{Success: false, ErrorMessage: err.Error()}, nil
+	}
+	if err := app.A.NodeHost.SyncRequestDeleteReplica(ctx, metadata.MetadataShardID, req.NodeId, 0); err != nil {
+		h.logger.Error("failed to remove node from metadata group", zap.Error(err))
 		return &pb.LeaveResponse{Success: false, ErrorMessage: err.Error()}, nil
 	}
 

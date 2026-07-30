@@ -87,7 +87,7 @@ func Init(cfg *config.Config, logger *zap.Logger) (*App, error) {
 	return a, nil
 }
 
-// StartRaft starts the Dragonboat NodeHost and the on-disk Raft replica.
+// StartRaft starts the Dragonboat NodeHost and both Raft groups.
 //
 // Must be called after WithRepositories() so the EventRepository is fully
 // initialised before the state machine factory captures it.
@@ -96,9 +96,15 @@ func Init(cfg *config.Config, logger *zap.Logger) (*App, error) {
 //   1. Event shard (config.Raft.ClusterID) — replicates event data
 //   2. Metadata shard (metadata.MetadataShardID) — replicates cluster topology
 //
+// join controls Dragonboot bootstrap semantics:
+//   - false: bootstrap a new cluster using config.Raft.InitialMembers, or
+//     restart from local data when members are empty.
+//   - true: join an existing cluster as an already-registered member
+//     (initialMembers must be empty; membership was registered via JoinCluster).
+//
 // onDeleteKeys is called by the state machine after a DeleteBatchCmd is applied.
 // Wire this to Dispatcher.RemoveInFlightBatch in start.go.
-func (a *App) StartRaft(onDeleteKeys func(keys [][]byte)) error {
+func (a *App) StartRaft(join bool, onDeleteKeys func(keys [][]byte)) error {
 	cfg := a.cfg
 
 	// Create the metadata service first — it needs to be registered as the
@@ -137,6 +143,18 @@ func (a *App) StartRaft(onDeleteKeys func(keys [][]byte)) error {
 	a.MetadataSvc = metadataSvc
 	metadataSvc.SetNodeHost(nh)
 
+	// Members are only passed when bootstrapping a brand-new cluster.
+	// Dragonboot semantics:
+	//   - Fresh bootstrap: join=false + initialMembers populated
+	//   - Fresh join:      join=true  + empty members (registered via JoinCluster)
+	//   - Restart:         join=false + empty members (local data exists)
+	members := make(map[uint64]dragonboat.Target)
+	if !join && !a.hasRaftData() {
+		for k, v := range cfg.Raft.InitialMembers {
+			members[k] = dragonboat.Target(v)
+		}
+	}
+
 	// ── Start the metadata Raft group ──────────────────────────────────────────
 	// Wrap the factory to capture the state machine instance for direct reads.
 	var capturedSM *metadata.MetadataStateMachine
@@ -158,13 +176,7 @@ func (a *App) StartRaft(onDeleteKeys func(keys [][]byte)) error {
 		CompactionOverhead: 5, // compact aggressively since state is small
 	}
 
-	// All initial members join the metadata group as voters.
-	metadataMembers := make(map[uint64]dragonboat.Target)
-	for k, v := range cfg.Raft.InitialMembers {
-		metadataMembers[k] = dragonboat.Target(v)
-	}
-
-	if err := nh.StartReplica(metadataMembers, false, metadataFactory, metadataRC); err != nil {
+	if err := nh.StartReplica(members, join, metadataFactory, metadataRC); err != nil {
 		return fmt.Errorf("failed to start metadata raft group: %w", err)
 	}
 
@@ -185,15 +197,10 @@ func (a *App) StartRaft(onDeleteKeys func(keys [][]byte)) error {
 		CompactionOverhead: cfg.Raft.CompactionOverhead,
 	}
 
-	eventMembers := make(map[uint64]dragonboat.Target)
-	for k, v := range cfg.Raft.InitialMembers {
-		eventMembers[k] = dragonboat.Target(v)
-	}
-
 	// Pass the fully-initialised EventRepository so the state machine uses the
 	// same monotonic ID counter and key schema as the standalone write path.
 	eventFactory := raft.NewEventStateMachineFactory(a.DB, a.Repositories.Events, onDeleteKeys, a.Logger)
-	if err := nh.StartOnDiskReplica(eventMembers, false, eventFactory, eventRC); err != nil {
+	if err := nh.StartOnDiskReplica(members, join, eventFactory, eventRC); err != nil {
 		return fmt.Errorf("failed to start event raft group: %w", err)
 	}
 
@@ -233,6 +240,22 @@ func grpcAdvertiseAddr(raftAddr, grpcListen string) (string, error) {
 		return "", fmt.Errorf("invalid grpc listen address %q: %w", grpcListen, err)
 	}
 	return net.JoinHostPort(host, grpcPort), nil
+}
+
+// HasRaftData reports whether local Raft data exists for this node.
+// Used by the start command to distinguish a restart from a fresh join.
+func (a *App) HasRaftData() bool {
+	return a.hasRaftData()
+}
+
+// hasRaftData returns true if the Raft data directory exists and is
+// non-empty — meaning this node has been part of a cluster before.
+func (a *App) hasRaftData() bool {
+	entries, err := os.ReadDir(a.cfg.Raft.DataPath)
+	if err != nil {
+		return false
+	}
+	return len(entries) > 0
 }
 
 // Config returns the application configuration.
