@@ -50,8 +50,6 @@ func NewEventStateMachineFactory(db storage.DB, repo *repository.EventRepository
 func (s *EventStateMachine) Open(stopc <-chan struct{}) (uint64, error) {
 	val, closer, err := s.db.Get(appliedIndexKey)
 
-	defer closer.Close() //nolint:errcheck
-
 	if err != nil {
 		if errors.Is(err, pebble.ErrNotFound) {
 			s.lastApplied = 0
@@ -59,6 +57,8 @@ func (s *EventStateMachine) Open(stopc <-chan struct{}) (uint64, error) {
 		}
 		return 0, err
 	}
+
+	defer closer.Close() //nolint:errcheck
 
 	s.lastApplied = binary.BigEndian.Uint64(val)
 	return s.lastApplied, nil
