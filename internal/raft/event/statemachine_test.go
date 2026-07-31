@@ -302,8 +302,6 @@ func (s *EventStateMachineSuite) TestSnapshot_RoundTrip() {
 	require.NoError(err)
 	require.NotZero(buf.Len(), "snapshot must not be empty")
 
-	// Sanity check: the snapshot payload must contain the actual key bytes
-	// (this was the original bug — k/v were zero-filled).
 	appliedKeyBytes := []byte("metadata/raft/applied-index")
 	require.True(bytes.Contains(buf.Bytes(), appliedKeyBytes),
 		"snapshot must faithfully serialize the applied-index key")
