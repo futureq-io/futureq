@@ -48,31 +48,14 @@ func (s *EventStateMachineSuite) newSM(onDelete func([][]byte)) *EventStateMachi
 
 // ─── Open ─────────────────────────────────────────────────────────────────────
 
-// TestOpen_FreshDB_ReturnsZero exercises the ErrNotFound branch.
-//
-// BUG NOTE: statemachine.go:53 places `defer closer.Close()` BEFORE the err
-// check. When pebble.Get returns ErrNotFound the closer is nil, so the
-// deferred call panics. We capture the panic here to document the bug —
-// once the underlying code is fixed this test should assert NoError.
 func (s *EventStateMachineSuite) TestOpen_FreshDB_ReturnsZero() {
 	require := s.Require()
 
 	sm := s.newSM(nil)
 
-	defer func() {
-		// Recover from the nil-closer panic — the function's return value is
-		// unreliable in that case. Document the buggy behaviour.
-		if r := recover(); r != nil {
-			s.T().Logf("latent bug: Open panics on fresh DB due to nil closer: %v", r)
-		}
-	}()
-
-	_, _ = sm.Open(nil)
-	// We deliberately do not assert return values here — the panic in the
-	// deferred closer runs after the named return values are set, so the
-	// caller may see either (0, nil) or a panic, depending on Go runtime
-	// scheduling of deferred calls.
-	require.True(true)
+	idx, err := sm.Open(nil)
+	require.NoError(err)
+	require.Equal(uint64(0), idx)
 }
 
 func (s *EventStateMachineSuite) TestOpen_RestoresAppliedIndex() {
@@ -298,22 +281,14 @@ func (s *EventStateMachineSuite) TestPrepareSnapshot_ReturnsLastApplied() {
 
 // ─── Snapshot round-trip ──────────────────────────────────────────────────────
 
-// TestSaveSnapshot_DocumentBug records a latent bug in SaveSnapshot.
-//
-// statemachine.go:175-176 allocates `k := make([]byte, len(key))` and
-// `v := make([]byte, len(value))` but never copies the actual key/value bytes
-// into them. The written snapshot data is therefore all zeros — a real
-// snapshot taken via SaveSnapshot cannot be faithfully recovered.
-//
-// We do NOT exercise Recover here because it would only succeed against
-// corrupted (all-zero) data anyway. Once the code is fixed, this test should
-// be replaced with a proper round-trip test.
-func (s *EventStateMachineSuite) TestSaveSnapshot_DocumentBug() {
+// TestSnapshot_RoundTrip verifies that SaveSnapshot + RecoverFromSnapshot
+// preserve both the data records and the applied-index metadata.
+func (s *EventStateMachineSuite) TestSnapshot_RoundTrip() {
 	require := s.Require()
 
 	sm := s.newSM(nil)
 
-	// Seed some data.
+	// Seed data: applies one StoreBatchCmd at raft index 5.
 	items := []StoreBatchItem{
 		{Bucket: 1, TopicHash: 7, Msg: []byte("snap-msg")},
 	}
@@ -321,19 +296,49 @@ func (s *EventStateMachineSuite) TestSaveSnapshot_DocumentBug() {
 	_, err := sm.Update([]statemachine.Entry{{Index: 5, Cmd: cmd}})
 	require.NoError(err)
 
+	// Save snapshot.
 	var buf bytes.Buffer
 	err = sm.SaveSnapshot(nil, &buf, nil)
 	require.NoError(err)
+	require.NotZero(buf.Len(), "snapshot must not be empty")
 
-	// Because k/v are allocated but never copied, the snapshot payload
-	// contains the correct length headers but zero-filled key/value bytes.
-	// Assert that the appliedIndexKey is NOT faithfully recoverable from the
-	// snapshot — this documents the bug.
-	snapshotBytes := buf.Bytes()
+	// Sanity check: the snapshot payload must contain the actual key bytes
+	// (this was the original bug — k/v were zero-filled).
 	appliedKeyBytes := []byte("metadata/raft/applied-index")
-	containsKey := bytes.Contains(snapshotBytes, appliedKeyBytes)
-	require.False(containsKey,
-		"SaveSnapshot should NOT contain the actual appliedIndexKey bytes (latent bug: keys are zero-filled)")
+	require.True(bytes.Contains(buf.Bytes(), appliedKeyBytes),
+		"snapshot must faithfully serialize the applied-index key")
+
+	// Recover into a fresh DB.
+	db2, err := storage.NewPebble(config.Pebble{DataPath: ""}, zap.NewNop())
+	require.NoError(err)
+	defer db2.Close()
+
+	repo2, err := repository.NewEventRepository(db2, zap.NewNop(), 1*time.Second)
+	require.NoError(err)
+
+	factory2 := NewEventStateMachineFactory(db2, repo2, nil, zap.NewNop())
+	sm2, _ := factory2(1, 1).(*EventStateMachine)
+
+	err = sm2.RecoverFromSnapshot(&buf, nil)
+	require.NoError(err)
+
+	// Applied index must be restored.
+	val, closer, err := db2.Get(appliedIndexKey)
+	require.NoError(err)
+	defer closer.Close()
+	require.Equal(uint64(5), binary.BigEndian.Uint64(val),
+		"recovered DB must contain the same applied index as was saved")
+
+	// The stored message bytes must also be recoverable.
+	var found []byte
+	require.NoError(db2.Scan(nil, func(k, v []byte) error {
+		if len(k) == 24 {
+			found = append([]byte(nil), v...)
+		}
+		return nil
+	}))
+	require.Equal([]byte("snap-msg"), found,
+		"recovered DB must contain the same message bytes as was saved")
 }
 
 // ─── Close ────────────────────────────────────────────────────────────────────

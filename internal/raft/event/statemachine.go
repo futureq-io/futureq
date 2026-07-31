@@ -172,19 +172,20 @@ func (s *EventStateMachine) SaveSnapshot(_ interface{}, w io.Writer, stopc <-cha
 		default:
 		}
 
-		k := make([]byte, len(key))
-		v := make([]byte, len(value))
+		// k := make([]byte, len(key))
+		// v := make([]byte, len(value))
+		// FIXME: no sure if I should copy the key/val or not
 
-		if err := binary.Write(w, binary.LittleEndian, uint32(len(k))); err != nil {
+		if err := binary.Write(w, binary.LittleEndian, uint32(len(key))); err != nil {
 			return err
 		}
-		if _, err := w.Write(k); err != nil {
+		if _, err := w.Write(key); err != nil {
 			return err
 		}
-		if err := binary.Write(w, binary.LittleEndian, uint32(len(v))); err != nil {
+		if err := binary.Write(w, binary.LittleEndian, uint32(len(value))); err != nil {
 			return err
 		}
-		if _, err := w.Write(v); err != nil {
+		if _, err := w.Write(value); err != nil {
 			return err
 		}
 
