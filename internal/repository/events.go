@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/pebble/v2"
-	"github.com/gogo/protobuf/proto"
+	"google.golang.org/protobuf/proto"
 	"go.uber.org/zap"
 
 	"github.com/futureq-io/futureq/internal/storage"

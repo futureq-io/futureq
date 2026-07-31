@@ -99,8 +99,6 @@ github.com/fogleman/gg v1.2.1-0.20190220221249-0403632d5b90/go.mod h1:R/bRT+9gY/
 github.com/fsnotify/fsnotify v1.4.7/go.mod h1:jwhsz4b93w/PPRr/qN1Yymfu8t87LnFCMoQvtojpjFo=
 github.com/fsnotify/fsnotify v1.4.9 h1:hsms1Qyu0jgnwNXIxa+/V/PDsU6CfLf6CNO8H7IWoS4=
 github.com/fsnotify/fsnotify v1.4.9/go.mod h1:znqG4EE+3YCdAaPaxE2ZRY/06pZUdp0tY4IgpuI1SZQ=
-github.com/futureq-io/protocol/proto/go v0.1.8 h1:OkXNUd5COrYKrT4LwVhPoAjxG6XMJNufpffEiwBDZ/U=
-github.com/futureq-io/protocol/proto/go v0.1.8/go.mod h1:VGAbKxcBAXSQIzqlrePjPXlomId4vUnVD8kgJ82xaGs=
 github.com/futureq-io/protocol/proto/go v0.1.9 h1:fMmZYi9xbbgxTHnBISChpasz2gOyDa3uEqXzfSZv+xc=
 github.com/futureq-io/protocol/proto/go v0.1.9/go.mod h1:VGAbKxcBAXSQIzqlrePjPXlomId4vUnVD8kgJ82xaGs=
 github.com/gavv/httpexpect v2.0.0+incompatible/go.mod h1:x+9tiU1YnrOvnB725RkpoLv1M62hOWzwo5OXotisrKc=
