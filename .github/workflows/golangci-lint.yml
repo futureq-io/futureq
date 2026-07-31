@@ -8,7 +8,6 @@ on:
 
 permissions:
   contents: read
-  # Optional: allow read access to pull request. Use with `only-new-issues` option.
   pull-requests: read
 
 jobs:
@@ -23,6 +22,4 @@ jobs:
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v9
         with:
-          args: --skip-files=".*_test\.go$"
-#        with:
-#          version: v1.64
+          version: latest

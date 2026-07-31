@@ -1,0 +1,45 @@
+version: "2"
+
+run:
+  timeout: 5m
+  tests: true
+
+linters:
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    rules:
+      - path: _test\.go
+        linters:
+          - errcheck
+          - govet
+          - staticcheck
+          - unused
+          - revive
+          - gocritic
+          - gocyclo
+          - dupl
+          - funlen
+          - goconst
+          - lll
+          - misspell
+          - unparam
+          - unconvert
+          - gosec
+          - gochecknoinits
+          - gochecknoglobals
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+
+output:
+  formats:
+    text:
+      path: stdout
+      print-linter-name: true
+      print-issued-lines: true
