@@ -32,21 +32,8 @@ func NewClusterHandler(logger *zap.Logger) *ClusterHandler {
 // state machine. Any node can respond — it does not need to be the leader.
 // In standalone (non-Raft) mode, returns info about this single node.
 func (h *ClusterHandler) GetClusterInfo(ctx context.Context, _ *pb.ClusterInfoRequest) (*pb.ClusterInfoResponse, error) {
-	// Standalone mode — no Raft, no metadata group.
 	if app.A.NodeHost == nil || app.A.MetadataSM == nil {
-		cfg := app.A.Config()
-		return &pb.ClusterInfoResponse{
-			LeaderNodeId:  cfg.Raft.NodeID,
-			LeaderAddress: cfg.Server.Listen,
-			Nodes: []*pb.NodeInfo{
-				{
-					NodeId:   cfg.Raft.NodeID,
-					Address:  cfg.Server.Listen,
-					IsLeader: true,
-					IsAlive:  true,
-				},
-			},
-		}, nil
+		return nil, status.Error(codes.NotFound, "attempt to get cluster info on single mode node")
 	}
 
 	shardID := app.A.Config().Raft.ClusterID
@@ -75,18 +62,19 @@ func (h *ClusterHandler) GetClusterInfo(ctx context.Context, _ *pb.ClusterInfoRe
 			IsAlive:  true,
 		})
 	}
-	for nodeID := range topo.NonVotings {
-		addr := topo.GrpcAddrs[nodeID]
-		if addr == "" {
-			addr = topo.NonVotings[nodeID]
-		}
-		resp.Nodes = append(resp.Nodes, &pb.NodeInfo{
-			NodeId:   nodeID,
-			Address:  addr,
-			IsLeader: false,
-			IsAlive:  true,
-		})
-	}
+
+	// for nodeID := range topo.NonVotings {
+	// 	addr := topo.GrpcAddrs[nodeID]
+	// 	if addr == "" {
+	// 		addr = topo.NonVotings[nodeID]
+	// 	}
+	// 	resp.Nodes = append(resp.Nodes, &pb.NodeInfo{
+	// 		NodeId:   nodeID,
+	// 		Address:  addr,
+	// 		IsLeader: false,
+	// 		IsAlive:  true,
+	// 	})
+	// }
 
 	return resp, nil
 }
