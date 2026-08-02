@@ -70,7 +70,7 @@ Delivery is **at-least-once** — consumers should be idempotent.
 ```bash
 git clone https://github.com/futureq-io/futureq.git
 cd futureq
-go build -o futureq ./internal/main.go
+go build -o futureq ./cmd/futureq
 
 cp config.example.yaml config.yaml   # adjust as needed
 ./futureq start -c config.yaml

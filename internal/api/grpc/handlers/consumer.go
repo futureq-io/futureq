@@ -60,6 +60,7 @@ func (h *ConsumerHandler) Subscribe(stream grpc.BidiStreamingServer[pb.ConsumerF
 	}
 
 	// ─── Verify leadership in Raft mode ────────────────────────────────────────
+	// TODO: WE SHALL ENABLE CONSUME ON REPLICAS
 	if err := h.checkLeadership(init); err != nil {
 		return err
 	}

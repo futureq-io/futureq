@@ -14,7 +14,7 @@ COPY vendor/ ./vendor/
 COPY . .
 
 # Build the binary using vendor dependencies
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -mod=vendor -ldflags="-w -s" -o /futureq ./internal/main.go
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -mod=vendor -ldflags="-w -s" -o /futureq ./cmd/futureq
 
 # Runtime stage
 FROM alpine:3.24
