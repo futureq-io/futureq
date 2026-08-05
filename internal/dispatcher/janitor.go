@@ -7,6 +7,7 @@ import (
 	"go.uber.org/zap"
 	"google.golang.org/protobuf/proto"
 
+	"github.com/futureq-io/futureq/internal/metrics"
 	"github.com/futureq-io/futureq/internal/storage"
 	"github.com/futureq-io/futureq/pkg/utils"
 	storagepb "github.com/futureq-io/protocol/proto/go/storage"
@@ -84,6 +85,7 @@ func (j *TTLJanitor) sweep() {
 			keyCopy := make([]byte, len(key))
 			copy(keyCopy, key)
 			expiredKeys = append(expiredKeys, keyCopy)
+			metrics.MessagesExpiredTotal.WithLabelValues(msg.Topic, "janitor").Inc()
 		}
 
 		return nil

@@ -118,7 +118,7 @@ func (s *HubSuite) TestDispatchToTopic_UnknownTopic_ReturnsZero() {
 	h := s.newHub(make(chan struct{}, 1))
 	msg := &pb.QueueMessage{Topic: "nothing"}
 
-	require.Equal(0, h.DispatchToTopic("nothing", msg, []byte("tag")))
+	require.Empty(h.DispatchToTopic("nothing", msg, []byte("tag")))
 }
 
 func (s *HubSuite) TestDispatchToTopic_GroupedConsumer_ExactlyOneReceives() {
@@ -133,7 +133,8 @@ func (s *HubSuite) TestDispatchToTopic_GroupedConsumer_ExactlyOneReceives() {
 
 	msg := &pb.QueueMessage{Topic: "orders", Payload: []byte("x")}
 	sent := h.DispatchToTopic("orders", msg, []byte("tag"))
-	require.Equal(1, sent, "only one consumer in the group should receive the message")
+	require.Len(sent, 1, "only one consumer in the group should receive the message")
+	require.Equal("g1", sent[0])
 
 	// Exactly one of ch1, ch2 should have the message.
 	got1 := len(ch1)
@@ -154,7 +155,7 @@ func (s *HubSuite) TestDispatchToTopic_UniversalConsumers_AllReceive() {
 
 	msg := &pb.QueueMessage{Topic: "orders", Payload: []byte("x")}
 	sent := h.DispatchToTopic("orders", msg, []byte("tag"))
-	require.Equal(2, sent, "each universal consumer should receive a copy")
+	require.Len(sent, 2, "each universal consumer should receive a copy")
 }
 
 func (s *HubSuite) TestDispatchToTopic_MultipleGroups_EachGroupReceivesOne() {
@@ -172,7 +173,9 @@ func (s *HubSuite) TestDispatchToTopic_MultipleGroups_EachGroupReceivesOne() {
 
 	msg := &pb.QueueMessage{Topic: "orders"}
 	sent := h.DispatchToTopic("orders", msg, []byte("tag"))
-	require.Equal(2, sent, "one consumer per group → 2 groups → 2 sends")
+	require.Len(sent, 2, "one consumer per group → 2 groups → 2 sends")
+	require.Contains(sent, "g1")
+	require.Contains(sent, "g2")
 }
 
 func (s *HubSuite) TestDispatchToTopic_FullChannel_Skipped() {
@@ -188,7 +191,7 @@ func (s *HubSuite) TestDispatchToTopic_FullChannel_Skipped() {
 
 	msg := &pb.QueueMessage{Topic: "orders"}
 	sent := h.DispatchToTopic("orders", msg, []byte("tag"))
-	require.Equal(0, sent, "full channel should be skipped without blocking")
+	require.Empty(sent, "full channel should be skipped without blocking")
 }
 
 // ─── RemoveInFlightForConsumer ──────────────────────────────────────────────
