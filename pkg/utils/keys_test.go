@@ -161,6 +161,47 @@ func (s *UtilsSuite) TestTopicBounds_Ordering() {
 	require.Less(string(lb), string(ub), "lower bound must be less than upper bound")
 }
 
+// ─── DueUpperBound ─────────────────────────────────────────────────────────
+
+func (s *UtilsSuite) TestDueUpperBound_Structure() {
+	require := s.Require()
+
+	ub := DueUpperBound(42, 17)
+	require.Len(ub, 16)
+	require.Equal(uint64(42), binary.BigEndian.Uint64(ub[0:8]))
+	require.Equal(uint64(18), binary.BigEndian.Uint64(ub[8:16]))
+}
+
+func (s *UtilsSuite) TestDueUpperBound_CoversDueKeys() {
+	require := s.Require()
+
+	topic := uint64(7)
+	maxBucket := uint64(10)
+	ub := DueUpperBound(topic, maxBucket)
+
+	// Keys with bucket ≤ maxBucket must sort BEFORE the upper bound (i.e. inside the range).
+	for _, b := range []uint64{0, 1, 5, 10} {
+		k := EventKey(b, topic, 999)
+		require.Less(string(k), string(ub), "due key bucket=%d must be inside range", b)
+	}
+
+	// Keys with bucket > maxBucket must sort AT OR AFTER the upper bound (i.e. outside).
+	for _, b := range []uint64{11, 12, 1000} {
+		k := EventKey(b, topic, 0)
+		require.GreaterOrEqual(string(k), string(ub), "future key bucket=%d must be outside range", b)
+	}
+}
+
+func (s *UtilsSuite) TestDueUpperBound_ExcludesOtherTopics() {
+	require := s.Require()
+
+	ub := DueUpperBound(7, 100)
+
+	// A key for a different topic must be outside the range.
+	other := EventKey(0, 8, 0) // different topicHash
+	require.GreaterOrEqual(string(other), string(ub))
+}
+
 // ─── BucketUpperBound ──────────────────────────────────────────────────────
 
 func (s *UtilsSuite) TestBucketUpperBound() {

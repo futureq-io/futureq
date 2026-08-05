@@ -9,6 +9,7 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	"github.com/futureq-io/futureq/internal/app"
+	"github.com/futureq-io/futureq/internal/metrics"
 	"github.com/futureq-io/futureq/internal/storage"
 
 	"github.com/futureq-io/futureq/pkg/utils"
@@ -127,13 +128,16 @@ func (d *Dispatcher) dispatchAll() int {
 		return 0
 	}
 
-	nowMs := time.Now().UnixMilli()
+	start := time.Now()
+	nowMs := start.UnixMilli()
 	totalDispatched := 0
 
 	for _, topic := range activeTopics {
 		dispatched := d.dispatchTopic(topic, nowMs)
 		totalDispatched += dispatched
 	}
+
+	metrics.DispatchPassDurationMs.Observe(float64(time.Since(start).Milliseconds()))
 
 	return totalDispatched
 }
@@ -154,6 +158,11 @@ func (d *Dispatcher) isLeader() bool {
 
 // dispatchTopic scans a single topic's key range and dispatches due messages.
 // Returns the number of messages dispatched for this topic.
+//
+// The scan is bounded to buckets ≤ nowBucket so future (not-yet-due) messages
+// are never iterated. The key layout is [topicHash][bucket][eventID], so the
+// exclusive upper bound [topicHash][nowBucket+1][0...] covers all and only
+// the due messages for this topic.
 func (d *Dispatcher) dispatchTopic(topic string, nowMs int64) int {
 	topicHash := utils.TopicHash(topic)
 	nowBucket := utils.CalculateBucket(nowMs, app.A.Config().Storage.TimeBucketSize)
@@ -161,29 +170,13 @@ func (d *Dispatcher) dispatchTopic(topic string, nowMs int64) int {
 	dispatched := 0
 	var expiredKeys [][]byte
 
-	// Per-topic range scan: [topicHash, topicHash+1).
+	// Per-topic range scan over due buckets only: [topicHash, topicHash | nowBucket+1).
 	// Scan manages the snapshot/iterator lifecycle internally — lower overhead
 	// than NewIter since there's no manual resource management.
 	err := d.db.Scan(&storage.IterOptions{
 		LowerBound: utils.TopicLowerBound(topicHash),
-		UpperBound: utils.TopicUpperBound(topicHash),
+		UpperBound: utils.DueUpperBound(topicHash, nowBucket),
 	}, func(key, val []byte) error {
-		// Parse the key to extract bucket for due-date check.
-		_, bucket, _, err := utils.ParseEventKey(key)
-		if err != nil {
-			d.logger.Error(
-				"failed to parse event key",
-				zap.ByteString("key", key),
-				zap.Error(err),
-			)
-			return nil // continue scanning
-		}
-
-		// Skip messages not yet due.
-		if bucket > nowBucket {
-			return nil
-		}
-
 		// Check in-flight status.
 		if d.isInFlight(key) {
 			return nil
@@ -201,6 +194,7 @@ func (d *Dispatcher) dispatchTopic(topic string, nowMs int64) int {
 			keyCopy := make([]byte, len(key))
 			copy(keyCopy, key)
 			expiredKeys = append(expiredKeys, keyCopy)
+			metrics.MessagesExpiredTotal.WithLabelValues(topic, "dispatcher").Inc()
 			return nil
 		}
 
@@ -217,14 +211,34 @@ func (d *Dispatcher) dispatchTopic(topic string, nowMs int64) int {
 		}
 
 		// Dispatch to all eligible consumers on this topic.
-		sentCount := d.hub.DispatchToTopic(topic, qMsg, keyCopy)
-		if sentCount > 0 {
+		sentTo := d.hub.DispatchToTopic(topic, qMsg, keyCopy)
+		if len(sentTo) > 0 {
 			// Track in-flight for timeout-based redelivery.
 			d.inFlight.Store(string(keyCopy), &inFlightEntry{
 				dispatchedAt: time.Now(),
 				topic:        topic,
 			})
 			dispatched++
+
+			// Delivery latency: total time from enqueue to dispatch.
+			latencyMs := float64(nowMs - msg.EnqueuedAtUnixMs)
+			if latencyMs < 0 {
+				latencyMs = 0 // clock skew guard
+			}
+			metrics.DeliveryLatencyMs.WithLabelValues(topic).Observe(latencyMs)
+
+			// Overhead: how late we are relative to the scheduled time.
+			scheduledMs := msg.EnqueuedAtUnixMs + msg.DelayMs
+			overheadMs := float64(nowMs - scheduledMs)
+			if overheadMs < 0 {
+				overheadMs = 0 // dispatched early (shouldn't happen, but guard)
+			}
+			metrics.DeliveryOverheadMs.WithLabelValues(topic).Observe(overheadMs)
+
+			for _, gid := range sentTo {
+				metrics.MessagesDispatchedTotal.WithLabelValues(topic, gid).Inc()
+				metrics.MessagesInFlight.WithLabelValues(topic, gid).Inc()
+			}
 		}
 
 		return nil

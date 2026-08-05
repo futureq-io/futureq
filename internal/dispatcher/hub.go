@@ -252,13 +252,14 @@ func (h *Hub) Unregister(id string) {
 
 // DispatchToTopic sends a message to all eligible consumers on a topic.
 // For each group, the strategy selects one consumer. Universal consumers each
-// receive a copy. Returns the number of consumers that received the message.
-func (h *Hub) DispatchToTopic(topic string, msg *pb.QueueMessage, deliveryTag []byte) int {
+// receive a copy. Returns the group IDs the message was successfully sent to
+// (universal consumers are reported with an empty group id).
+func (h *Hub) DispatchToTopic(topic string, msg *pb.QueueMessage, deliveryTag []byte) []string {
 	h.mu.RLock()
 	sub, ok := h.topics[topic]
 	if !ok {
 		h.mu.RUnlock()
-		return 0
+		return nil
 	}
 
 	// Snapshot groups and universal consumers while holding the lock.
@@ -266,27 +267,27 @@ func (h *Hub) DispatchToTopic(topic string, msg *pb.QueueMessage, deliveryTag []
 	universal := sub.universalSnapshot()
 	h.mu.RUnlock()
 
-	sent := 0
+	sentTo := make([]string, 0, len(groups)+len(universal))
 
 	// Dispatch to each group — strategy picks one consumer per group.
-	for _, consumers := range groups {
+	for gid, consumers := range groups {
 		selected := h.strategy.Select(consumers, msg)
 		if selected == nil {
 			continue
 		}
 		if h.trySend(selected, msg, deliveryTag) {
-			sent++
+			sentTo = append(sentTo, gid)
 		}
 	}
 
 	// Dispatch to all universal consumers.
 	for _, c := range universal {
 		if h.trySend(c, msg, deliveryTag) {
-			sent++
+			sentTo = append(sentTo, "")
 		}
 	}
 
-	return sent
+	return sentTo
 }
 
 // trySend attempts to deliver a message to a single consumer. Returns true on

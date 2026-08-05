@@ -67,6 +67,18 @@ func TopicUpperBound(topicHash uint64) []byte {
 	return key
 }
 
+// DueUpperBound returns the exclusive upper-bound key for scanning only the
+// due (already-scheduled) messages of a topic — those whose bucket is at most
+// maxBucket. The returned 16-byte prefix is [topicHash][maxBucket+1]; since
+// EventKey is [topicHash][bucket][eventID] with big-endian sortable fields,
+// this bound covers exactly the keys with bucket ≤ maxBucket.
+func DueUpperBound(topicHash, maxBucket uint64) []byte {
+	key := make([]byte, 16)
+	binary.BigEndian.PutUint64(key[0:8], topicHash)
+	binary.BigEndian.PutUint64(key[8:16], maxBucket+1)
+	return key
+}
+
 // BucketUpperBound returns the exclusive upper-bound key for an iterator that
 // should stop after processing all entries in buckets [0..maxBucket].
 func BucketUpperBound(maxBucket uint64) []byte {
