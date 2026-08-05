@@ -217,6 +217,7 @@ func (h *ConsumerHandler) receiver(
 			h.deleter.MarkDeleted(ackReq.DeliveryTag)
 		}
 		// NACK: the key remains in storage; the dispatcher will re-deliver it.
+		// In-flight gauge was incremented at dispatch time in the hub.
 		metrics.MessagesInFlight.WithLabelValues(init.Topic, init.GroupId).Dec()
 	}
 }

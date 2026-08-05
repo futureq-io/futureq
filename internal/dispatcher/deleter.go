@@ -5,6 +5,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/futureq-io/futureq/internal/metrics"
 	"github.com/futureq-io/futureq/internal/raft/event"
 	"github.com/futureq-io/futureq/internal/storage"
 	"go.uber.org/zap"
@@ -146,6 +147,7 @@ func (d *Deleter) flush() {
 			zap.Error(err),
 			zap.Int("count", len(keysToFlush)),
 		)
+		metrics.DeleteFailuresTotal.Inc()
 		// Re-enqueue failed keys for retry on next flush.
 		d.mu.Lock()
 		d.pending = append(keysToFlush, d.pending...)
@@ -153,6 +155,7 @@ func (d *Deleter) flush() {
 		return
 	}
 
+	metrics.DeleteBatchSize.Observe(float64(len(keysToFlush)))
 	d.logger.Debug("flushed delete batch", zap.Int("count", len(keysToFlush)))
 
 	if d.OnDelete != nil {
