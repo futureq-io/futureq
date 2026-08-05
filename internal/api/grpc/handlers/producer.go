@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -79,26 +80,53 @@ func (ph *ProducerHandler) processBatch(ctx context.Context, batch *pb.PublishBa
 	}
 
 	ackLevel := batch.GetAckLevel()
+	topicLabel := batchTopicLabel(batch)
+	start := time.Now()
 
 	if app.A.Config().Storage.MinAckLevel == config.Quorum && ackLevel == pb.AckLevel_ACK_LEVEL_NO_ACK {
+		metrics.PublishRequestsTotal.WithLabelValues(topicLabel, ackLevel.String(), "rejected").Inc()
 		return &pb.PublishBatchAck{Success: false}, status.Error(codes.InvalidArgument, "NO_ACK level is not allowed when MinAckLevel is Quorum")
 	}
 
 	nowMs := time.Now().UnixMilli()
 
+	var processErr error
 	if app.A.NodeHost != nil {
-		if err := ph.processRaftBatch(ctx, batch, nowMs, ackLevel); err != nil {
-			return &pb.PublishBatchAck{Success: false}, err
-		}
+		processErr = ph.processRaftBatch(ctx, batch, nowMs, ackLevel)
 	} else {
-		if err := ph.processStandaloneBatch(batch, nowMs); err != nil {
-			return &pb.PublishBatchAck{Success: false}, err
+		processErr = ph.processStandaloneBatch(batch, nowMs)
+	}
+
+	if processErr != nil {
+		metrics.PublishRequestsTotal.WithLabelValues(topicLabel, ackLevel.String(), "error").Inc()
+		return &pb.PublishBatchAck{Success: false}, processErr
+	}
+
+	msgCount := len(batch.Messages)
+	metrics.PublishRequestsTotal.WithLabelValues(topicLabel, ackLevel.String(), "success").Inc()
+	metrics.MessagesPublishedTotal.WithLabelValues(topicLabel, ackLevel.String()).Add(float64(msgCount))
+	metrics.PublishBatchSize.WithLabelValues(topicLabel).Observe(float64(msgCount))
+	metrics.PublishLatencyMs.WithLabelValues(topicLabel, ackLevel.String()).Observe(float64(time.Since(start).Milliseconds()))
+
+	return &pb.PublishBatchAck{Success: true}, nil
+}
+
+// TODO: this is shit. we need to know how many messagers are per topic
+func batchTopicLabel(batch *pb.PublishBatch) string {
+	if len(batch.Messages) == 0 {
+		return ""
+	}
+
+	result := bytes.Buffer{}
+	for i, m := range batch.Messages {
+		result.WriteString(m.String())
+
+		if i < len(batch.Messages)-1 {
+			result.WriteString(",")
 		}
 	}
 
-	metrics.PublishBatchSize.WithLabelValues("").Observe(float64(len(batch.Messages)))
-
-	return &pb.PublishBatchAck{Success: true}, nil
+	return result.String()
 }
 
 // marshalMessages is the single marshal loop shared by both write paths.
