@@ -11,3 +11,6 @@ go.work.sum
 vendor
 *.txt
 notes.md
+.claude
+AGENTS.md
+CLAUDE.md
