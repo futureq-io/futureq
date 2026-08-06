@@ -3,6 +3,8 @@ package config
 import (
 	"bytes"
 	"fmt"
+	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -136,6 +138,18 @@ func Load(path string) (*Config, error) {
 	err = v.Unmarshal(&c)
 	if err != nil {
 		return nil, fmt.Errorf("error unmarshalling config: %w", err)
+	}
+
+	// Explicit env overrides — Viper's AutomaticEnv+Unmarshal does not reliably
+	// override map values that are already present in the config file, so we
+	// handle the ones we care about explicitly here.
+	if nodeID := os.Getenv("FUTUREQ_RAFT_NODEID"); nodeID != "" {
+		if v, err := strconv.ParseUint(nodeID, 10, 64); err == nil {
+			c.Raft.NodeID = v
+		}
+	}
+	if raftAddr := os.Getenv("FUTUREQ_RAFT_LISTENADDRESS"); raftAddr != "" {
+		c.Raft.ListenAddress = raftAddr
 	}
 
 	if err := c.runPostLoadHooks(); err != nil {

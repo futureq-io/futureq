@@ -118,6 +118,16 @@ func startRun(_ *cobra.Command, _ []string) {
 		disp.RemoveInFlight(key)
 	}
 
+	// ── Prometheus metrics server ──────────────────────────────────────────────
+	// Start before Raft so the liveness/readiness probes have something to hit
+	// while the Raft cluster is still forming.
+	metricsSrv := metrics.NewServer(cfg.Observability.Metrics.Addr, logger)
+	a.RegisterComponentWithShutdown()
+	go func() {
+		defer a.ComponentShutdownDone()
+		metricsSrv.Run(a.Ctx)
+	}()
+
 	// ── Start Raft (must be after WithRepositories so the repo is ready) ──────
 	// onDeleteKeys is called by the state machine after each DeleteBatchCmd
 	// is committed. We wire it to the dispatcher so in-flight entries are
@@ -130,9 +140,6 @@ func startRun(_ *cobra.Command, _ []string) {
 
 	// ── TTL Janitor ───────────────────────────────────────────────────────────
 	janitor := dispatcher.NewTTLJanitor(a.DB, deleter, janitorInterval, logger)
-
-	// ── Prometheus metrics server ──────────────────────────────────────────────
-	metricsSrv := metrics.NewServer(cfg.Observability.Metrics.Addr, logger)
 
 	// ── Start background goroutines ───────────────────────────────────────────
 	a.RegisterComponentWithShutdown()
@@ -151,12 +158,6 @@ func startRun(_ *cobra.Command, _ []string) {
 	go func() {
 		defer a.ComponentShutdownDone()
 		janitor.Run(a.Ctx)
-	}()
-
-	a.RegisterComponentWithShutdown()
-	go func() {
-		defer a.ComponentShutdownDone()
-		metricsSrv.Run(a.Ctx)
 	}()
 
 	// ── gRPC server ───────────────────────────────────────────────────────────

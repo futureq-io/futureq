@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sync"
 	"syscall"
 	"time"
@@ -177,6 +178,17 @@ func (a *App) StartRaft(join bool, onDeleteKeys func(keys [][]byte)) error {
 	}
 
 	if err := nh.StartReplica(members, join, metadataFactory, metadataRC); err != nil {
+		// Dragonboat panics internally on ErrShardNotBootstrapped (the "restarted
+		// during a previous bootstrap attempt" case). The panic is recovered by
+		// dragonboat's own handler and returned here as an error. When we hit it,
+		// the LogDB is in a half-initialised state that hasRaftData() would treat
+		// as "existing cluster data" on the next restart, causing an infinite
+		// crash loop. Wipe the dir so the next start begins from a clean slate.
+		if errors.Is(err, dragonboat.ErrShardNotBootstrapped) {
+			a.Logger.Warn("raft bootstrap failed (shard not bootstrapped); wiping raft data dir to allow clean retry",
+				zap.String("path", cfg.Raft.DataPath))
+			_ = os.RemoveAll(cfg.Raft.DataPath)
+		}
 		return fmt.Errorf("failed to start metadata raft group: %w", err)
 	}
 
@@ -201,6 +213,11 @@ func (a *App) StartRaft(join bool, onDeleteKeys func(keys [][]byte)) error {
 	// same monotonic ID counter and key schema as the standalone write path.
 	eventFactory := raft.NewEventStateMachineFactory(a.DB, a.Repositories.Events, onDeleteKeys, a.Logger)
 	if err := nh.StartOnDiskReplica(members, join, eventFactory, eventRC); err != nil {
+		if errors.Is(err, dragonboat.ErrShardNotBootstrapped) {
+			a.Logger.Warn("event raft bootstrap failed (shard not bootstrapped); wiping raft data dir to allow clean retry",
+				zap.String("path", cfg.Raft.DataPath))
+			_ = os.RemoveAll(cfg.Raft.DataPath)
+		}
 		return fmt.Errorf("failed to start event raft group: %w", err)
 	}
 
@@ -212,11 +229,22 @@ func (a *App) StartRaft(join bool, onDeleteKeys func(keys [][]byte)) error {
 	if err != nil {
 		return fmt.Errorf("failed to compute gRPC advertise address: %w", err)
 	}
-	{
-		ctx, cancel := context.WithTimeout(a.Ctx, 10*time.Second)
-		defer cancel()
-		if err := metadataSvc.RegisterNodeAddr(ctx, cfg.Raft.NodeID, grpcAdvertise); err != nil {
+	// Retry until the metadata shard has a leader. During initial cluster
+	// bootstrap (OrderedReady), the first pod starts before peers exist, so
+	// the shard may not be ready yet. Keep retrying until it is.
+	for {
+		ctx, cancel := context.WithTimeout(a.Ctx, 5*time.Second)
+		err := metadataSvc.RegisterNodeAddr(ctx, cfg.Raft.NodeID, grpcAdvertise)
+		cancel()
+		if err == nil {
+			break
+		}
+		a.Logger.Warn("metadata shard not ready, retrying gRPC address registration",
+			zap.Error(err))
+		select {
+		case <-a.Ctx.Done():
 			return fmt.Errorf("failed to register gRPC address: %w", err)
+		case <-time.After(2 * time.Second):
 		}
 	}
 
@@ -248,14 +276,16 @@ func (a *App) HasRaftData() bool {
 	return a.hasRaftData()
 }
 
-// hasRaftData returns true if the Raft data directory exists and is
-// non-empty — meaning this node has been part of a cluster before.
+// hasRaftData returns true if the Raft data directory contains a previously
+// bootstrapped LogDB — meaning this node has been part of a cluster before.
+// A bare directory (created by a failed first bootstrap attempt) is NOT
+// treated as existing data; Dragonboat will retry the bootstrap from scratch.
 func (a *App) hasRaftData() bool {
-	entries, err := os.ReadDir(a.cfg.Raft.DataPath)
-	if err != nil {
-		return false
-	}
-	return len(entries) > 0
+	// Dragonboat's sharded-pebble LogDB stores each shard in a logdb-N
+	// subdirectory. The first shard writes a MANIFEST once initialised.
+	manifest := filepath.Join(a.cfg.Raft.DataPath, "logdb-0", "MANIFEST-000001")
+	_, err := os.Stat(manifest)
+	return err == nil
 }
 
 // Config returns the application configuration.
