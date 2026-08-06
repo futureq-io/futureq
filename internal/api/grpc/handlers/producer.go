@@ -119,7 +119,7 @@ func batchTopicLabel(batch *pb.PublishBatch) string {
 
 	result := bytes.Buffer{}
 	for i, m := range batch.Messages {
-		result.WriteString(m.String())
+		result.WriteString(m.Topic)
 
 		if i < len(batch.Messages)-1 {
 			result.WriteString(",")
