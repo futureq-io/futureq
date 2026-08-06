@@ -117,12 +117,16 @@ func batchTopicLabel(batch *pb.PublishBatch) string {
 		return ""
 	}
 
+	topicSet := make(map[string]struct{})
 	result := bytes.Buffer{}
 	for i, m := range batch.Messages {
-		result.WriteString(m.Topic)
+		if _, exists := topicSet[m.Topic]; !exists {
+			result.WriteString(m.Topic)
+			topicSet[m.Topic] = struct{}{}
 
-		if i < len(batch.Messages)-1 {
-			result.WriteString(",")
+			if i < len(batch.Messages)-1 {
+				result.WriteString("|")
+			}
 		}
 	}
 
