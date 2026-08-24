@@ -1,18 +1,131 @@
+# ==============================================================================
+# Futureq Default Configuration Reference
+# ==============================================================================
+# This file represents the exact default state of a Futureq node. If you run
+# the application without a config file, these are the values it will use.
+#
+# TO USE THIS FILE:
+# 1. Copy it and rename it to `config.yaml`.
+# 2. Adjust the values below to fit your deployment needs.
+# 3. Start the node (e.g., `./futureq --config config.yaml`).
+#
+# ENVIRONMENT VARIABLE OVERRIDES:
+# Every configuration value below can be overridden using environment variables
+# by using the `FUTUREQ_` prefix and replacing dots with underscores.
+# For example, to override the Pebble data path:
+# export FUTUREQ_STORAGE_PEBBLE_DATAPATH="/var/lib/futureq/data"
+# ==============================================================================
+
+server:
+  # Grpc listen address
+  listen: "0.0.0.0:8443"
+  maxConns: 10
+  timeout: 5s
+  maxRecvSizeKb: 100
+  maxSendSizeKb: 100
+
 observability:
-  logging:
+  logger:
+    # Controls the verbosity of the logs.
+    # Valid options: debug, info, warn, error, fatal
     level: info
+  metrics:
+    addr: "0.0.0.0:9090"
 
-persistence:
-  path: "./data"
+storage:
+  type: "pebble"
+  minAckLevel: Quorum
 
-rabbitmq:
-  rabbitmq_server:
-    host: "127.0.0.1"
-    port: 5672
-    username: guest
-    password: guest
-    virtual_host: ""
-  rabbitmq_data_exchange:
-    consume_queue_name: "consume-queue"
-    declare_queue: false
-    produce_queue_name: "produce-queue"
+  # When set to false, the node runs entirely in-memory using a virtual filesystem.
+  # All data will be destroyed when the process exits. Useful for testing or ephemeral workers.
+  persist: true
+
+  # The bucket size for storing events. Minimum amount must be 0ms. (less than 1 millisecond is not supported)
+  # Using large time buckets (e.g., 1s) reduces the number of keys in the DB
+  # and may improve performance, but it also means you will have less precision on deliveries.
+  timeBucketSize: 1ms
+
+  pebble:
+    # Disabling the Write-Ahead Log (WAL) increases write throughput but risks
+    # data loss of recently written keys in the event of a sudden crash.
+    disableWAL: false
+
+    # The absolute or relative path where the database files will be stored on disk.
+    # Note: This is strictly ignored if `storage.persist` is set to false.
+    dataPath: "./data"
+
+    # Size of the block cache in Megabytes.
+    # Increase this value to improve performance on read-heavy workloads.
+    cacheSizeMb: 16
+
+    # Size of the active in-memory table in Megabytes.
+    # Increase this value for write-heavy workloads. (Must be at least 1MB).
+    inMemoryTableSizeMb: 64
+  
+  bolt:
+    dataPath: "./data"
+    defaultBucket: "futureq"
+
+raft:
+  enabled: false
+  # Unique integer ID of the current node in the Raft cluster (e.g. 1, 2, 3).
+  # Use '0' (or omit the raft section entirely) to run the node in standalone
+  # mode without Raft replication (writing directly to Pebble).
+  nodeId: 1
+
+  # Unique integer ID of the Raft replication shard/cluster.
+  clusterId: 1
+
+  # The address the Raft engine (Dragonboat NodeHost) listens on for
+  # intra-cluster consensus messages (heartbeats, proposals, snapshots).
+  listenAddress: "0.0.0.0:50005"
+
+  # The directory where Raft WAL logs and cluster metadata are stored.
+  dataPath: "./raft-data"
+
+  # Map of all initial voting members of the cluster (Node ID -> Raft Address).
+  # This list must be identical across all cluster nodes on initial bootstrap.
+  initialMembers:
+    1: "0.0.0.0:50005"
+
+  # Average round-trip latency (RTT) between Raft peers in milliseconds.
+  # Dragonboat uses this to calibrate election timeouts (10 * RTT) and
+  # heartbeat intervals (1 * RTT).
+  #
+  # - For production WAN/cloud deploys: use 100-200.
+  # - For low-latency data centers or local test runs: set to 10-20 to trigger
+  #   faster leader failover and speed up the replication loop.
+  rttMillisecond: 200
+
+  # Number of committed Raft log entries to write before a new database
+  # snapshot is created and old log files are deleted (compacted) from disk.
+  #
+  # - Higher values (e.g. 100000) are recommended for high-throughput write
+  #   workloads to avoid frequent I/O spikes and write stalls.
+  # - Lower values (e.g. 10000) keep the disk usage of Raft logs smaller and
+  #   make node restarts faster.
+  snapShotEntries: 10000
+
+  # Number of log entries to retain after taking a snapshot. This acts as
+  # a buffer so that if a follower falls slightly behind, the leader can
+  # sync it using incremental log updates rather than a full snapshot stream.
+  compactionOverHead: 5000
+
+consumer:
+  # How long (in milliseconds) the dispatcher sleeps between Pebble scan passes
+  # when no ready messages are found. Lower values reduce delivery latency at
+  # the cost of slightly more Pebble iterator overhead.
+  dispatchPollIntervalMs: 50
+
+  # How often (in milliseconds) the batched deleter flushes acknowledged message
+  # keys to Pebble as a single batch. Batching amortises the LSM tombstone write
+  # cost; individual key deletions after every ACK would be far more expensive.
+  deleteBatchIntervalMs: 500
+
+  # How long (in milliseconds) a dispatched-but-unacknowledged message is
+  # considered abandoned and eligible for re-dispatch.
+  inFlightTimeoutMs: 5000
+
+  # How often (in milliseconds) the TTL janitor performs a full Pebble scan
+  # to remove expired messages that were never consumed.
+  ttlJanitorIntervalMs: 60000

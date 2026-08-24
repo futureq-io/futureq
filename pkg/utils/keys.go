@@ -1,0 +1,101 @@
+package utils
+
+import (
+	"encoding/binary"
+	"fmt"
+	"time"
+
+	"github.com/cespare/xxhash/v2"
+)
+
+var (
+	errInvalidKeyLength = "key length must be 24. got %d"
+)
+
+// TopicHash computes a stable 64-bit hash of a topic name using xxhash64.
+// This hash is embedded in Pebble keys to enable fast topic-based range scans
+// without deserializing message values.
+func TopicHash(topic string) uint64 {
+	return xxhash.Sum64String(topic)
+}
+
+// CalculateBucket maps a Unix-millisecond timestamp to its bucket index.
+// The bucket is the time divided by bucketSize. If bucketSize is zero,
+// the raw millisecond timestamp is used as the bucket (maximum precision).
+// Negative timestamps (invalid for scheduled messages) return bucket 0.
+func CalculateBucket(unixMs int64, bucketSize time.Duration) uint64 {
+	if unixMs <= 0 {
+		return 0
+	}
+	if bucketSize <= 0 {
+		return uint64(unixMs)
+	}
+	return uint64(unixMs) / uint64(bucketSize.Milliseconds())
+}
+
+// EventKey constructs the 24-byte Pebble key for a stored message.
+//
+// Layout (big-endian, lexicographically sortable):
+//
+//	[0..7]   topicHash uint64 — xxhash64(topic)
+//	[8..15]  bucket    uint64 — time bucket (enqueued_at_ms + delay_ms) / timeBucketSize
+//	[16..23] eventID   uint64 — monotonic counter from EventRepository
+//
+// Sorting by this key groups messages by topic first, then by time bucket
+// within each topic, enabling efficient per-topic range scans.
+func EventKey(bucket, topicHash, eventID uint64) []byte {
+	key := make([]byte, 24)
+	binary.BigEndian.PutUint64(key[0:8], topicHash)
+	binary.BigEndian.PutUint64(key[8:16], bucket)
+	binary.BigEndian.PutUint64(key[16:24], eventID)
+	return key
+}
+
+// TopicLowerBound returns the inclusive lower-bound key for scanning all
+// messages belonging to a specific topic.
+func TopicLowerBound(topicHash uint64) []byte {
+	key := make([]byte, 8)
+	binary.BigEndian.PutUint64(key, topicHash)
+	return key
+}
+
+// TopicUpperBound returns the exclusive upper-bound key for scanning all
+// messages belonging to a specific topic.
+func TopicUpperBound(topicHash uint64) []byte {
+	key := make([]byte, 8)
+	binary.BigEndian.PutUint64(key, topicHash+1)
+	return key
+}
+
+// DueUpperBound returns the exclusive upper-bound key for scanning only the
+// due (already-scheduled) messages of a topic — those whose bucket is at most
+// maxBucket. The returned 16-byte prefix is [topicHash][maxBucket+1]; since
+// EventKey is [topicHash][bucket][eventID] with big-endian sortable fields,
+// this bound covers exactly the keys with bucket ≤ maxBucket.
+func DueUpperBound(topicHash, maxBucket uint64) []byte {
+	key := make([]byte, 16)
+	binary.BigEndian.PutUint64(key[0:8], topicHash)
+	binary.BigEndian.PutUint64(key[8:16], maxBucket+1)
+	return key
+}
+
+// BucketUpperBound returns the exclusive upper-bound key for an iterator that
+// should stop after processing all entries in buckets [0..maxBucket].
+func BucketUpperBound(maxBucket uint64) []byte {
+	key := make([]byte, 8)
+	binary.BigEndian.PutUint64(key, maxBucket+1)
+	return key
+}
+
+// ParseEventKey extracts the three components of a 24-byte event key.
+// Returns (topicHash, bucket, eventID) matching the byte layout [topicHash][bucket][eventID].
+// Returns ok=false if the key length is not exactly 24 bytes.
+func ParseEventKey(key []byte) (topicHash, bucket, eventID uint64, err error) {
+	if len(key) != 24 {
+		return 0, 0, 0, fmt.Errorf(errInvalidKeyLength, len(key))
+	}
+	topicHash = binary.BigEndian.Uint64(key[0:8])
+	bucket = binary.BigEndian.Uint64(key[8:16])
+	eventID = binary.BigEndian.Uint64(key[16:24])
+	return topicHash, bucket, eventID, nil
+}

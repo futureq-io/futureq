@@ -1,3 +1,16 @@
 config.yaml
 config.yml
 !config.example.yaml
+dev-config.yaml
+*.pdf
+*.html
+e2e-tests*
+main
+go.work
+go.work.sum
+vendor
+*.txt
+notes.md
+.claude
+AGENTS.md
+CLAUDE.md
