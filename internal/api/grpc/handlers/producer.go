@@ -251,6 +251,20 @@ func (ph *ProducerHandler) processRaftBatch(
 		session := app.A.NodeHost.GetNoOPSession(shardID)
 		_, proposeErr = app.A.NodeHost.Propose(session, cmdBytes, proposeTimeout)
 	case pb.AckLevel_ACK_LEVEL_LEADER:
+		// Wait for the leader to durably write the entry to its own Raft log,
+		// without waiting for replication to a quorum. The signal comes from
+		// a LogDB decorator that observes SaveRaftState.
+		//
+		// Durability: if the leader crashes after ack but before replication,
+		// the batch may be lost. Stronger than NO_ACK, weaker than QUORUM.
+		if app.A.LeaderPersist == nil {
+			proposeErr = errors.New("leader-persist tracker is not initialised (raft disabled?)")
+			break
+		}
+
+		persistedCh, cancelWait := app.A.LeaderPersist.Register(app.A.LeaderPersist.Hash(cmdBytes))
+		defer cancelWait()
+
 		session := app.A.NodeHost.GetNoOPSession(shardID)
 		rs, err := app.A.NodeHost.Propose(session, cmdBytes, proposeTimeout)
 		if err != nil {
@@ -259,11 +273,23 @@ func (ph *ProducerHandler) processRaftBatch(
 		}
 		defer rs.Release()
 
+		// Also watch AppliedC for early-failure outcomes (dropped, rejected,
+		// timeout) so we don't sit on persistedCh until the deadline when
+		// Dragonboat already knows the proposal is dead.
+		waitCtx, cancelTimer := context.WithTimeout(ctx, proposeTimeout)
 		select {
+		case <-persistedCh:
+			// Leader has durably written the entry to its local Raft log.
 		case res := <-rs.AppliedC():
+			// Terminal state reached before the persist signal — almost
+			// always a failure (success would have been preceded by the
+			// persist signal firing first, since SaveRaftState happens
+			// before apply in the Dragonboat worker loop).
 			switch {
 			case res.Completed():
-				// Applied locally on the leader.
+				// Race: apply completed without the persist notification
+				// reaching us first. The entry is by definition persisted
+				// and committed — treat as success.
 			case res.Timeout():
 				proposeErr = errors.New("leader-ack propose timed out")
 			case res.Dropped():
@@ -277,11 +303,10 @@ func (ph *ProducerHandler) processRaftBatch(
 			default:
 				proposeErr = fmt.Errorf("leader-ack propose failed with unexpected result: %+v", res)
 			}
-		case <-ctx.Done():
-			// Client disconnected or was cancelled before local apply finished.
-			// The proposal may still apply server-side; surface the cancellation.
-			proposeErr = fmt.Errorf("leader-ack wait cancelled: %w", ctx.Err())
+		case <-waitCtx.Done():
+			proposeErr = fmt.Errorf("leader-ack wait cancelled: %w", waitCtx.Err())
 		}
+		cancelTimer()
 	default:
 		propCtx, cancel := context.WithTimeout(ctx, proposeTimeout)
 		session := app.A.NodeHost.GetNoOPSession(shardID)
