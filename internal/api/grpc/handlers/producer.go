@@ -8,7 +8,6 @@ import (
 	"io"
 	"time"
 
-	"github.com/lni/dragonboat/v4"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -26,27 +25,6 @@ import (
 )
 
 var errBatchSave = errors.New("failed to save batch")
-
-// requestResultLabel returns a short human-readable label for a Dragonboat
-// RequestResult terminal state. Used only for error messages.
-func requestResultLabel(res dragonboat.RequestResult) string {
-	switch {
-	case res.Completed():
-		return "completed"
-	case res.Timeout():
-		return "timeout"
-	case res.Dropped():
-		return "dropped"
-	case res.Rejected():
-		return "rejected"
-	case res.Terminated():
-		return "terminated"
-	case res.Aborted():
-		return "aborted"
-	default:
-		return "unknown"
-	}
-}
 
 // proposeTimeout bounds a single Raft propose call, regardless of ack level.
 // TODO: make configurable.
@@ -292,8 +270,9 @@ func (ph *ProducerHandler) processRaftBatch(
 		select {
 		case <-persistedCh:
 			ph.logger.Debug("leader has persisted and acked")
-		case res := <-rs.AppliedC():
-			proposeErr = fmt.Errorf("leader-ack propose failed before persist: %s", requestResultLabel(res))
+		// this is impossible
+		case <-rs.AppliedC():
+			proposeErr = fmt.Errorf("leader-ack propose failed before persist")
 		}
 	default:
 		propCtx, cancel := context.WithTimeout(ctx, proposeTimeout)
