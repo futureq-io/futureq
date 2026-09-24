@@ -15,17 +15,15 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-// LastIDKey stores the highest event ID ever applied, as a durable high-water
-// mark. It travels inside Raft snapshots (full DB scan), so snapshot recovery
-// restores it automatically.
+// LastIDKey persists the highest applied event ID. Snapshots include it
+// (full DB scan), so recovery restores it automatically.
 var LastIDKey = []byte("metadata/event-repo/last-id")
 
 // EventRepository builds event keys and stores events.
 //
-// Event IDs are assigned exclusively by the Raft leader (or the single node in
-// standalone mode) at propose time via NextID. The assigned ID travels inside
-// the Raft command, so every replica writes the identical key — no per-replica
-// ID generation exists, because per-replica counters make replicas diverge.
+// IDs are assigned only by the Raft leader (or the single node in standalone
+// mode) via NextID and travel inside the Raft command — replicas apply them
+// verbatim, so every replica writes identical keys.
 type EventRepository struct {
 	db         storage.DB
 	logger     *zap.Logger
@@ -40,8 +38,7 @@ func NewEventRepository(db storage.DB, logger *zap.Logger, bucketSize time.Durat
 		bucketSize: bucketSize,
 	}
 
-	// Restore the durable high-water mark so a restarted node never reuses IDs
-	// even before Raft log replay begins.
+	// Restore the durable last-id so a restarted node never reuses IDs.
 	val, closer, err := db.Get(LastIDKey)
 	if err != nil {
 		if !errors.Is(err, pebble.ErrNotFound) {
@@ -79,8 +76,7 @@ func (er *EventRepository) StoreWithBatch(b storage.Batch, id uint64, msg *stora
 		return nil, err
 	}
 
-	// Standalone path only (Raft path goes through StoreRawWithBatch +
-	// PersistLastID): keep the high-water mark durable across restarts.
+	// Standalone path only — the Raft path persists last-id per entry.
 	if err := er.PersistLastID(b, id); err != nil {
 		return nil, err
 	}
@@ -131,10 +127,8 @@ func (er *EventRepository) ObserveID(id uint64) {
 	}
 }
 
-// PersistLastID adds the durable high-water mark to an existing batch.
-// Called once per applied Raft entry — piggybacks on the entry's batch commit,
-// so durability costs no extra fsync. The key is included in snapshots, making
-// the high-water mark survive snapshot-based recovery.
+// PersistLastID adds the durable last-id to an existing batch, piggybacking
+// on its commit — no extra fsync.
 func (er *EventRepository) PersistLastID(b storage.Batch, id uint64) error {
 	idBytes := make([]byte, 8)
 	binary.BigEndian.PutUint64(idBytes, id)

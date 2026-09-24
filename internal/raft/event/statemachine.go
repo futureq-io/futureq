@@ -98,9 +98,7 @@ func (s *EventStateMachine) applyEntry(batch storage.Batch, cmd []byte) (statema
 				maxID = it.ID
 			}
 		}
-		// Advance the in-memory counter (a follower promoted to leader must
-		// never reuse IDs) and persist the high-water mark in the same batch —
-		// no extra fsync, and the key rides inside snapshots.
+		// Advance the in-memory counter and persist last-id in the same batch.
 		s.repo.ObserveID(maxID)
 		if err := s.repo.PersistLastID(batch, maxID); err != nil {
 			return statemachine.Result{}, nil, fmt.Errorf("raft: PersistLastID: %w", err)
@@ -140,8 +138,6 @@ func (s *EventStateMachine) Update(entries []statemachine.Entry) ([]statemachine
 	for i := range entries {
 		result, deletedKeys, err := s.applyEntry(batch, entries[i].Cmd)
 		if err != nil {
-			// Abort before commit: the deferred batch.Close discards every
-			// partial Set from this and earlier entries in the batch.
 			return nil, err
 		}
 		entries[i].Result = result
@@ -265,9 +261,8 @@ func (s *EventStateMachine) RecoverFromSnapshot(r io.Reader, stopc <-chan struct
 		return err
 	}
 
-	// The snapshot carries the durable high-water mark (full DB scan). The repo
-	// was constructed before recovery, so its startup load missed it — observe
-	// it now or a restarted leader would hand out colliding IDs.
+	// The snapshot carries last-id; the repo loaded before recovery, so
+	// observe it now.
 	lv, lCloser, err := s.db.Get(repository.LastIDKey)
 	if err == nil {
 		s.repo.ObserveID(binary.BigEndian.Uint64(lv))
