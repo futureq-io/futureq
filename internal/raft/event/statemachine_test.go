@@ -339,6 +339,11 @@ func (s *EventStateMachineSuite) TestSnapshot_RoundTrip() {
 	}))
 	require.Equal([]byte("snap-msg"), found,
 		"recovered DB must contain the same message bytes as was saved")
+
+	// The high-water mark must survive recovery: the repo attached to the
+	// recovered SM was constructed before recovery, so recovery itself must
+	// have observed the restored last-id. A new ID must not collide with 1.
+	require.Equal(uint64(2), repo2.NextID())
 }
 
 // ─── Close ────────────────────────────────────────────────────────────────────

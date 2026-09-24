@@ -82,14 +82,23 @@ func (s *EventStateMachine) applyEntry(batch storage.Batch, cmd []byte) (statema
 			log.Printf("raft: failed to unmarshal StoreBatchCmd: %v", err)
 			return statemachine.Result{Value: 0}, nil
 		}
+		var maxID uint64
 		for _, it := range items {
 			if _, err := s.repo.StoreRawWithBatch(batch, it.ID, it.Bucket, it.TopicHash, it.Indexes, it.Msg); err != nil {
 				log.Printf("raft: StoreRawWithBatch failed: %v", err)
 				return statemachine.Result{Value: 0}, nil
 			}
-			// Track the highest applied ID so a follower promoted to leader
-			// never reuses an ID.
-			s.repo.ObserveID(it.ID)
+			if it.ID > maxID {
+				maxID = it.ID
+			}
+		}
+		// Advance the in-memory counter (a follower promoted to leader must
+		// never reuse IDs) and persist the high-water mark in the same batch —
+		// no extra fsync, and the key rides inside snapshots.
+		s.repo.ObserveID(maxID)
+		if err := s.repo.PersistLastID(batch, maxID); err != nil {
+			log.Printf("raft: PersistLastID failed: %v", err)
+			return statemachine.Result{Value: 0}, nil
 		}
 		return statemachine.Result{Value: uint64(len(items))}, nil
 
@@ -243,6 +252,17 @@ func (s *EventStateMachine) RecoverFromSnapshot(r io.Reader, stopc <-chan struct
 	if err == nil {
 		s.lastApplied = binary.BigEndian.Uint64(val)
 		defer closer.Close() //nolint:errcheck
+	} else if !errors.Is(err, pebble.ErrNotFound) {
+		return err
+	}
+
+	// The snapshot carries the durable high-water mark (full DB scan). The repo
+	// was constructed before recovery, so its startup load missed it — observe
+	// it now or a restarted leader would hand out colliding IDs.
+	lv, lCloser, err := s.db.Get(repository.LastIDKey)
+	if err == nil {
+		s.repo.ObserveID(binary.BigEndian.Uint64(lv))
+		lCloser.Close() //nolint:errcheck
 	} else if !errors.Is(err, pebble.ErrNotFound) {
 		return err
 	}
