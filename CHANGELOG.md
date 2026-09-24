@@ -1,5 +1,6 @@
 # Changelog
 
-# UNRELEASED
+### UNRELEASED
 
-- fix event id storage (@hertzcodes)
+- add leader acks (@hertzcodes, #38)
+- fix event id storage (@hertzcodes, #37)
