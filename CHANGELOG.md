@@ -2,5 +2,5 @@
 
 ### UNRELEASED
 
-- add leader acks (@hertzcodes, #38)
+- add leader acks (@hertzcodes, #46)
 - fix event id storage (@hertzcodes, #37)
