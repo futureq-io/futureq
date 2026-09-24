@@ -83,8 +83,8 @@ func (s *EventStateMachineSuite) TestUpdate_StoreBatch_AppliesItems() {
 	sm := s.newSM(nil)
 
 	items := []StoreBatchItem{
-		{Bucket: 1, TopicHash: 100, Msg: []byte("msg-a")},
-		{Bucket: 2, TopicHash: 100, Msg: []byte("msg-b")},
+		{ID: 1, Bucket: 1, TopicHash: 100, Msg: []byte("msg-a")},
+		{ID: 2, Bucket: 2, TopicHash: 100, Msg: []byte("msg-b")},
 	}
 	cmd, err := MarshalStoreBatchCmd(items)
 	require.NoError(err)
@@ -95,19 +95,21 @@ func (s *EventStateMachineSuite) TestUpdate_StoreBatch_AppliesItems() {
 	require.Len(results, 1)
 	require.Equal(uint64(2), results[0].Result.Value, "should report 2 items applied")
 
-	// Verify items are in storage via the repo's last-ID counter.
-	// Two items stored → repo's lastID should be 2.
-	// We verify indirectly by storing one more and checking its key's eventID.
-	b := s.db.NewBatch()
-	key, err := s.repo.StoreRawWithBatch(b, 1, 100, nil, []byte("third"))
+	// Keys must use the leader-assigned IDs from the command verbatim.
+	var foundIDs []uint64
+	err = s.db.Scan(nil, func(k, v []byte) error {
+		if len(k) == 24 {
+			_, _, id, err := parseKeyEventID(k)
+			require.NoError(err)
+			foundIDs = append(foundIDs, id)
+		}
+		return nil
+	})
 	require.NoError(err)
-	require.NoError(b.Commit(storage.Sync))
-	require.NoError(b.Close())
+	require.ElementsMatch([]uint64{1, 2}, foundIDs)
 
-	// The 3rd store should have eventID=3 (since 1,2 were used).
-	_, _, id, err := parseKeyEventID(key)
-	require.NoError(err)
-	require.Equal(uint64(3), id)
+	// Applied IDs must be observed: next reserved ID must be past them.
+	require.Equal(uint64(3), s.repo.NextID())
 }
 
 // Helper to parse eventID from a key — small local helper to avoid circular import.
@@ -152,7 +154,7 @@ func (s *EventStateMachineSuite) TestUpdate_DeleteBatch_RemovesKeys() {
 	sm := s.newSM(nil)
 
 	// First store a message.
-	items := []StoreBatchItem{{Bucket: 1, TopicHash: 5, Msg: []byte("to-delete")}}
+	items := []StoreBatchItem{{ID: 1, Bucket: 1, TopicHash: 5, Msg: []byte("to-delete")}}
 	storeCmd, _ := MarshalStoreBatchCmd(items)
 	_, err := sm.Update([]statemachine.Entry{{Index: 1, Cmd: storeCmd}})
 	require.NoError(err)
@@ -217,7 +219,7 @@ func (s *EventStateMachineSuite) TestUpdate_PersistsAppliedIndex() {
 
 	sm := s.newSM(nil)
 
-	items := []StoreBatchItem{{Bucket: 1, TopicHash: 1, Msg: []byte("m")}}
+	items := []StoreBatchItem{{ID: 1, Bucket: 1, TopicHash: 1, Msg: []byte("m")}}
 	cmd, _ := MarshalStoreBatchCmd(items)
 
 	_, err := sm.Update([]statemachine.Entry{{Index: 42, Cmd: cmd}})
@@ -235,7 +237,7 @@ func (s *EventStateMachineSuite) TestUpdate_MultipleEntries_AdvancesAppliedIndex
 
 	sm := s.newSM(nil)
 
-	items := []StoreBatchItem{{Bucket: 1, TopicHash: 1, Msg: []byte("m")}}
+	items := []StoreBatchItem{{ID: 1, Bucket: 1, TopicHash: 1, Msg: []byte("m")}}
 	cmd, _ := MarshalStoreBatchCmd(items)
 
 	entries := []statemachine.Entry{
@@ -290,7 +292,7 @@ func (s *EventStateMachineSuite) TestSnapshot_RoundTrip() {
 
 	// Seed data: applies one StoreBatchCmd at raft index 5.
 	items := []StoreBatchItem{
-		{Bucket: 1, TopicHash: 7, Msg: []byte("snap-msg")},
+		{ID: 1, Bucket: 1, TopicHash: 7, Msg: []byte("snap-msg")},
 	}
 	cmd, _ := MarshalStoreBatchCmd(items)
 	_, err := sm.Update([]statemachine.Entry{{Index: 5, Cmd: cmd}})
@@ -337,6 +339,11 @@ func (s *EventStateMachineSuite) TestSnapshot_RoundTrip() {
 	}))
 	require.Equal([]byte("snap-msg"), found,
 		"recovered DB must contain the same message bytes as was saved")
+
+	// The high-water mark must survive recovery: the repo attached to the
+	// recovered SM was constructed before recovery, so recovery itself must
+	// have observed the restored last-id. A new ID must not collide with 1.
+	require.Equal(uint64(2), repo2.NextID())
 }
 
 // ─── Close ────────────────────────────────────────────────────────────────────

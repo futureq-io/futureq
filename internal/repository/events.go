@@ -8,21 +8,26 @@ import (
 	"time"
 
 	"github.com/cockroachdb/pebble/v2"
-	"google.golang.org/protobuf/proto"
-	"go.uber.org/zap"
-
 	"github.com/futureq-io/futureq/internal/storage"
 	"github.com/futureq-io/futureq/pkg/utils"
 	storagepb "github.com/futureq-io/protocol/proto/go/storage"
+	"go.uber.org/zap"
+	"google.golang.org/protobuf/proto"
 )
 
-var eventsLastIDKey = []byte("metadata/event-repo/last-id")
+// LastIDKey persists the highest applied event ID. Snapshots include it
+// (full DB scan), so recovery restores it automatically.
+var LastIDKey = []byte("metadata/event-repo/last-id")
 
-// EventRepository manages the monotonic event ID counter stored in Pebble.
+// EventRepository builds event keys and stores events.
+//
+// IDs are assigned only by the Raft leader (or the single node in standalone
+// mode) via NextID and travel inside the Raft command — replicas apply them
+// verbatim, so every replica writes identical keys.
 type EventRepository struct {
 	db         storage.DB
 	logger     *zap.Logger
-	lastID     uint64
+	nextID     atomic.Uint64
 	bucketSize time.Duration
 }
 
@@ -33,37 +38,34 @@ func NewEventRepository(db storage.DB, logger *zap.Logger, bucketSize time.Durat
 		bucketSize: bucketSize,
 	}
 
-	val, closer, err := db.Get(eventsLastIDKey)
+	// Restore the durable last-id so a restarted node never reuses IDs.
+	val, closer, err := db.Get(LastIDKey)
 	if err != nil {
-		if errors.Is(err, pebble.ErrNotFound) {
-			repo.lastID = 0
-		} else {
+		if !errors.Is(err, pebble.ErrNotFound) {
 			return nil, err
 		}
 	} else {
-		repo.lastID = binary.BigEndian.Uint64(val)
-
-		defer closer.Close() //nolint:errcheck
+		repo.nextID.Store(binary.BigEndian.Uint64(val))
+		closer.Close() //nolint:errcheck
 	}
 
 	return repo, nil
 }
 
-// StoreWithBatch marshals msg and adds it to an existing Pebble batch.
-// It returns the generated 24-byte Pebble key for the caller to use as a delivery_tag.
-func (er *EventRepository) StoreWithBatch(b storage.Batch, msg *storagepb.StoredMessage) ([]byte, error) {
-	nextID := atomic.AddUint64(&er.lastID, 1)
+// NextID reserves a new monotonic event ID. Must only be called on the Raft
+// leader (or the single node in standalone mode) while building a batch.
+// IDs are monotonic, not contiguous: failed proposals simply skip IDs.
+func (er *EventRepository) NextID() uint64 {
+	return er.nextID.Add(1)
+}
 
+// StoreWithBatch marshals msg and adds it to an existing Pebble batch using
+// the caller-supplied leader-assigned ID. It returns the 24-byte Pebble key.
+func (er *EventRepository) StoreWithBatch(b storage.Batch, id uint64, msg *storagepb.StoredMessage) ([]byte, error) {
 	fireAtMs := msg.EnqueuedAtUnixMs + msg.DelayMs
 	bucket := utils.CalculateBucket(fireAtMs, er.bucketSize)
 	topicHash := utils.TopicHash(msg.Topic)
-	key := utils.EventKey(bucket, topicHash, nextID)
-
-	idBytes := make([]byte, 8)
-	binary.BigEndian.PutUint64(idBytes, nextID)
-	if err := b.Set(eventsLastIDKey, idBytes); err != nil {
-		return nil, err
-	}
+	key := utils.EventKey(bucket, topicHash, id)
 
 	data, err := proto.Marshal(msg)
 	if err != nil {
@@ -71,6 +73,11 @@ func (er *EventRepository) StoreWithBatch(b storage.Batch, msg *storagepb.Stored
 	}
 
 	if err := b.Set(key, data); err != nil {
+		return nil, err
+	}
+
+	// Standalone path only — the Raft path persists last-id per entry.
+	if err := er.PersistLastID(b, id); err != nil {
 		return nil, err
 	}
 
@@ -88,19 +95,12 @@ func (er *EventRepository) StoreWithBatch(b storage.Batch, msg *storagepb.Stored
 	return key, nil
 }
 
-// StoreWithBatch stores the raw msg value in bytes.
-// This is used in Raft's write paths.
-// It returns the generated 24-byte Pebble key for the caller to use as a delivery_tag.
-func (er *EventRepository) StoreRawWithBatch(b storage.Batch, bucket uint64, topicHash uint64, indexes [][]byte, msg []byte) ([]byte, error) {
-	nextID := atomic.AddUint64(&er.lastID, 1)
-
-	key := utils.EventKey(bucket, topicHash, nextID)
-
-	idBytes := make([]byte, 8)
-	binary.BigEndian.PutUint64(idBytes, nextID)
-	if err := b.Set(eventsLastIDKey, idBytes); err != nil {
-		return nil, err
-	}
+// StoreRawWithBatch stores the raw msg value bytes under the leader-assigned
+// ID from the Raft command. It never generates IDs itself — replicas apply the
+// command verbatim, so all replicas converge on identical keys.
+// It returns the 24-byte Pebble key for the caller to use as a delivery_tag.
+func (er *EventRepository) StoreRawWithBatch(b storage.Batch, id uint64, bucket uint64, topicHash uint64, indexes [][]byte, msg []byte) ([]byte, error) {
+	key := utils.EventKey(bucket, topicHash, id)
 
 	if err := b.Set(key, msg); err != nil {
 		return nil, err
@@ -115,94 +115,26 @@ func (er *EventRepository) StoreRawWithBatch(b storage.Batch, bucket uint64, top
 	return key, nil
 }
 
+// ObserveID advances the local reservation counter past id. Replicas call this
+// when applying commands (or after snapshot recovery) so that a follower
+// promoted to leader never reuses IDs.
+func (er *EventRepository) ObserveID(id uint64) {
+	for {
+		cur := er.nextID.Load()
+		if id <= cur || er.nextID.CompareAndSwap(cur, id) {
+			return
+		}
+	}
+}
+
+// PersistLastID adds the durable last-id to an existing batch, piggybacking
+// on its commit — no extra fsync.
+func (er *EventRepository) PersistLastID(b storage.Batch, id uint64) error {
+	idBytes := make([]byte, 8)
+	binary.BigEndian.PutUint64(idBytes, id)
+	return b.Set(LastIDKey, idBytes)
+}
+
 func (er *EventRepository) DeleteWithBatch(b storage.Batch, key []byte) error {
 	return b.Delete(key)
-}
-
-type EventBatch struct {
-	b    storage.Batch
-	repo *EventRepository
-}
-
-func (er *EventRepository) NewBatch() *EventBatch {
-	return &EventBatch{
-		b:    er.db.NewBatch(),
-		repo: er,
-	}
-}
-
-func (eb *EventBatch) Store(msg *storagepb.StoredMessage) ([]byte, error) {
-	nextID := atomic.AddUint64(&eb.repo.lastID, 1)
-
-	fireAtMs := msg.EnqueuedAtUnixMs + msg.DelayMs
-	bucket := utils.CalculateBucket(fireAtMs, eb.repo.bucketSize)
-	topicHash := utils.TopicHash(msg.Topic)
-	key := utils.EventKey(bucket, topicHash, nextID)
-
-	idBytes := make([]byte, 8)
-	binary.BigEndian.PutUint64(idBytes, nextID)
-	if err := eb.b.Set(eventsLastIDKey, idBytes); err != nil {
-		return nil, err
-	}
-
-	data, err := proto.Marshal(msg)
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal message for topic %q: %w", msg.Topic, err)
-	}
-
-	if err := eb.b.Set(key, data); err != nil {
-		return nil, err
-	}
-
-	for _, idx := range msg.GetIndexes() {
-		idxBytes, err := proto.Marshal(idx)
-		if err != nil {
-			return nil, fmt.Errorf("failed to marshal index to bytes: %w", err)
-		}
-
-		if err := eb.b.Set(idxBytes, key); err != nil {
-			return nil, err
-		}
-	}
-
-	return key, nil
-}
-
-// StoreWithBatch stores the raw msg value in bytes.
-// This is used in Raft's write paths.
-// It returns the generated 24-byte Pebble key for the caller to use as a delivery_tag.
-func (eb *EventBatch) StoreRaw(bucket uint64, topicHash uint64, indexes [][]byte, msg []byte) ([]byte, error) {
-	nextID := atomic.AddUint64(&eb.repo.lastID, 1)
-
-	key := utils.EventKey(bucket, topicHash, nextID)
-
-	idBytes := make([]byte, 8)
-	binary.BigEndian.PutUint64(idBytes, nextID)
-	if err := eb.b.Set(eventsLastIDKey, idBytes); err != nil {
-		return nil, err
-	}
-
-	if err := eb.b.Set(key, msg); err != nil {
-		return nil, err
-	}
-
-	for _, idx := range indexes {
-		if err := eb.b.Set(idx, key); err != nil {
-			return nil, err
-		}
-	}
-
-	return key, nil
-}
-
-func (eb *EventBatch) Delete(key []byte) error {
-	return eb.b.Delete(key)
-}
-
-func (eb *EventBatch) Commit(mode storage.SyncMode) error {
-	return eb.b.Commit(mode)
-}
-
-func (eb *EventBatch) Close() error {
-	return eb.b.Close()
 }

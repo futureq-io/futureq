@@ -3,6 +3,7 @@ package raft
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 
@@ -67,55 +68,63 @@ func (s *EventStateMachine) Open(stopc <-chan struct{}) (uint64, error) {
 // applyEntry applies a single Raft log entry to the batch and returns the result
 // and any keys that were deleted (for DeleteBatchCmd).
 //
-// For StoreBatchCmd: the state machine delegates key generation to the shared
-// EventRepository (same monotonic-ID counter used by standalone mode). The
-// serialised StoredMessage bytes from the command buffer are passed directly to
-// StoreWithBatch — no re-serialisation, no extra allocation.
-func (s *EventStateMachine) applyEntry(batch storage.Batch, cmd []byte) (statemachine.Result, [][]byte) {
+// For StoreBatchCmd: every item carries the leader-assigned event ID. Replicas
+// apply it verbatim — the state machine never generates IDs — so all replicas
+// converge on identical keys.
+//
+// Any storage error aborts the entire Update: the batch is only committed at
+// the end of Update, so returning an error means nothing partial is written.
+// A replica that cannot write must stop (Dragonboat halts it on Update error)
+// rather than silently diverge with a watermark lagging its stored keys.
+func (s *EventStateMachine) applyEntry(batch storage.Batch, cmd []byte) (statemachine.Result, [][]byte, error) {
 	if len(cmd) == 0 {
-		return statemachine.Result{Value: 0}, nil
+		return statemachine.Result{Value: 0}, nil, nil
 	}
 
 	switch CommandType(cmd[0]) {
 	case StoreBatchCmd:
 		items, err := UnmarshalStoreBatchCmd(cmd)
 		if err != nil {
+			// Corrupt command: deterministic across replicas, safe to skip.
 			log.Printf("raft: failed to unmarshal StoreBatchCmd: %v", err)
-			return statemachine.Result{Value: 0}, nil
+			return statemachine.Result{Value: 0}, nil, nil
 		}
+		var maxID uint64
 		for _, it := range items {
-			// StoreRawWithBatch takes the already-serialised value bytes and
-			// lets the repository assign the authoritative monotonic key.
-			// This is identical to the standalone write path — same ID counter,
-			// same key schema, no extra serialisation step.
-			if _, err := s.repo.StoreRawWithBatch(batch, it.Bucket, it.TopicHash, it.Indexes, it.Msg); err != nil {
-				log.Printf("raft: StoreRawWithBatch failed: %v", err)
-				return statemachine.Result{Value: 0}, nil
+			if _, err := s.repo.StoreRawWithBatch(batch, it.ID, it.Bucket, it.TopicHash, it.Indexes, it.Msg); err != nil {
+				return statemachine.Result{}, nil, fmt.Errorf("raft: StoreRawWithBatch: %w", err)
+			}
+			if it.ID > maxID {
+				maxID = it.ID
 			}
 		}
-		return statemachine.Result{Value: uint64(len(items))}, nil
+		// Advance the in-memory counter and persist last-id in the same batch.
+		s.repo.ObserveID(maxID)
+		if err := s.repo.PersistLastID(batch, maxID); err != nil {
+			return statemachine.Result{}, nil, fmt.Errorf("raft: PersistLastID: %w", err)
+		}
+		return statemachine.Result{Value: uint64(len(items))}, nil, nil
 
 	case DeleteBatchCmd:
 		keys, err := UnmarshalDeleteBatchCmd(cmd)
 		if err != nil {
 			log.Printf("raft: failed to unmarshal DeleteBatchCmd: %v", err)
-			return statemachine.Result{Value: 0}, nil
+			return statemachine.Result{Value: 0}, nil, nil
 		}
 		deleted := make([][]byte, 0, len(keys))
 		for _, k := range keys {
 			kCopy := make([]byte, len(k))
 			copy(kCopy, k)
 			if err := batch.Delete(kCopy); err != nil {
-				log.Printf("raft: batch.Delete failed: %v", err)
-				continue
+				return statemachine.Result{}, nil, fmt.Errorf("raft: batch.Delete: %w", err)
 			}
 			deleted = append(deleted, kCopy)
 		}
-		return statemachine.Result{Value: uint64(len(deleted))}, deleted
+		return statemachine.Result{Value: uint64(len(deleted))}, deleted, nil
 
 	default:
 		log.Printf("raft: unknown command type: %d", cmd[0])
-		return statemachine.Result{Value: 0}, nil
+		return statemachine.Result{Value: 0}, nil, nil
 	}
 }
 
@@ -127,7 +136,10 @@ func (s *EventStateMachine) Update(entries []statemachine.Entry) ([]statemachine
 	var allDeletedKeys [][]byte
 
 	for i := range entries {
-		result, deletedKeys := s.applyEntry(batch, entries[i].Cmd)
+		result, deletedKeys, err := s.applyEntry(batch, entries[i].Cmd)
+		if err != nil {
+			return nil, err
+		}
 		entries[i].Result = result
 		if len(deletedKeys) > 0 {
 			allDeletedKeys = append(allDeletedKeys, deletedKeys...)
@@ -245,6 +257,16 @@ func (s *EventStateMachine) RecoverFromSnapshot(r io.Reader, stopc <-chan struct
 	if err == nil {
 		s.lastApplied = binary.BigEndian.Uint64(val)
 		defer closer.Close() //nolint:errcheck
+	} else if !errors.Is(err, pebble.ErrNotFound) {
+		return err
+	}
+
+	// The snapshot carries last-id; the repo loaded before recovery, so
+	// observe it now.
+	lv, lCloser, err := s.db.Get(repository.LastIDKey)
+	if err == nil {
+		s.repo.ObserveID(binary.BigEndian.Uint64(lv))
+		lCloser.Close() //nolint:errcheck
 	} else if !errors.Is(err, pebble.ErrNotFound) {
 		return err
 	}
