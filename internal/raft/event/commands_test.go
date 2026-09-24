@@ -181,3 +181,22 @@ func (s *CommandsSuite) TestDeleteBatchCmd_TruncatedKeyData_Fails() {
 	_, err := UnmarshalDeleteBatchCmd(cmd[:len(cmd)-10])
 	require.Error(err)
 }
+
+// TestStoreBatchCmd_DifferentIDsProduceDifferentBytes locks the invariant
+// the leader-persist tracker relies on: two otherwise identical batches
+// must produce different cmd bytes because each embeds a unique monotonic
+// ID. If this ever fails, hash-based correlation in leaderpersist.Tracker
+// would confuse two in-flight proposals with each other.
+func (s *CommandsSuite) TestStoreBatchCmd_DifferentIDsProduceDifferentBytes() {
+	require := s.Require()
+
+	msg := []byte("same-payload")
+
+	cmd1, err := MarshalStoreBatchCmd([]StoreBatchItem{{ID: 1, Bucket: 100, TopicHash: 42, Msg: msg}})
+	require.NoError(err)
+
+	cmd2, err := MarshalStoreBatchCmd([]StoreBatchItem{{ID: 2, Bucket: 100, TopicHash: 42, Msg: msg}})
+	require.NoError(err)
+
+	require.NotEqual(cmd1, cmd2)
+}
