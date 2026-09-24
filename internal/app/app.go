@@ -20,9 +20,9 @@ import (
 	"github.com/futureq-io/futureq/internal/config"
 	raft "github.com/futureq-io/futureq/internal/raft/event"
 	"github.com/futureq-io/futureq/internal/raft/leaderpersist"
-	"github.com/futureq-io/futureq/pkg/raft/metadata"
 	"github.com/futureq-io/futureq/internal/repository"
 	"github.com/futureq-io/futureq/internal/storage"
+	"github.com/futureq-io/futureq/pkg/raft/metadata"
 )
 
 const gracefulShutdownTimeout = 10 * time.Second
@@ -55,10 +55,10 @@ type App struct {
 	// Provides direct read access to cluster topology. Nil when Raft is disabled.
 	MetadataSM *metadata.MetadataStateMachine
 
-	// LeaderPersist tracks in-flight LEADER-ack proposals and fires when the
+	// LeaderTracker tracks in-flight LEADER-ack proposals and fires when the
 	// leader's local Raft log has durably written them. Nil when Raft is
 	// disabled.
-	LeaderPersist *leaderpersist.Tracker
+	LeaderTracker *leaderpersist.Tracker
 }
 
 // Init initialises the application: sets up Pebble storage and creates the App
@@ -100,8 +100,8 @@ func Init(cfg *config.Config, logger *zap.Logger) (*App, error) {
 // initialised before the state machine factory captures it.
 //
 // Starts two Raft groups:
-//   1. Event shard (config.Raft.ClusterID) — replicates event data
-//   2. Metadata shard (metadata.MetadataShardID) — replicates cluster topology
+//  1. Event shard (config.Raft.ClusterID) — replicates event data
+//  2. Metadata shard (metadata.MetadataShardID) — replicates cluster topology
 //
 // join controls Dragonboot bootstrap semantics:
 //   - false: bootstrap a new cluster using config.Raft.InitialMembers, or
@@ -154,7 +154,7 @@ func (a *App) StartRaft(join bool, onDeleteKeys func(keys [][]byte)) error {
 
 	a.NodeHost = nh
 	a.MetadataSvc = metadataSvc
-	a.LeaderPersist = tracker
+	a.LeaderTracker = tracker
 	metadataSvc.SetNodeHost(nh)
 
 	// Members are only passed when bootstrapping a brand-new cluster.

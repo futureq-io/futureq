@@ -251,12 +251,12 @@ func (ph *ProducerHandler) processRaftBatch(
 		session := app.A.NodeHost.GetNoOPSession(shardID)
 		_, proposeErr = app.A.NodeHost.Propose(session, cmdBytes, proposeTimeout)
 	case pb.AckLevel_ACK_LEVEL_LEADER:
-		if app.A.LeaderPersist == nil {
+		if app.A.LeaderTracker == nil {
 			proposeErr = errors.New("leader-persist tracker is not initialised (raft disabled?)")
 			break
 		}
 
-		persistedCh, cancelWait := app.A.LeaderPersist.Register(app.A.LeaderPersist.Hash(cmdBytes))
+		persistedCh, cancelWait := app.A.LeaderTracker.Register(app.A.LeaderTracker.Hash(cmdBytes))
 		defer cancelWait()
 
 		session := app.A.NodeHost.GetNoOPSession(shardID)
