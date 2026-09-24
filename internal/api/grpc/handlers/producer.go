@@ -267,12 +267,16 @@ func (ph *ProducerHandler) processRaftBatch(
 		}
 		defer rs.Release()
 
+		propCtx, cancel := context.WithTimeout(ctx, proposeTimeout)
+		defer cancel()
+
 		select {
 		case <-persistedCh:
 			ph.logger.Debug("leader has persisted and acked")
-		// this is impossible
 		case <-rs.AppliedC():
 			proposeErr = fmt.Errorf("leader-ack propose failed before persist")
+		case <-propCtx.Done():
+			proposeErr = fmt.Errorf("leader-ack wait cancelled: %w", propCtx.Err())
 		}
 	default:
 		propCtx, cancel := context.WithTimeout(ctx, proposeTimeout)
