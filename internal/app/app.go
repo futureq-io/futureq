@@ -19,9 +19,10 @@ import (
 
 	"github.com/futureq-io/futureq/internal/config"
 	raft "github.com/futureq-io/futureq/internal/raft/event"
-	"github.com/futureq-io/futureq/pkg/raft/metadata"
+	"github.com/futureq-io/futureq/internal/raft/leaderpersist"
 	"github.com/futureq-io/futureq/internal/repository"
 	"github.com/futureq-io/futureq/internal/storage"
+	"github.com/futureq-io/futureq/pkg/raft/metadata"
 )
 
 const gracefulShutdownTimeout = 10 * time.Second
@@ -53,6 +54,11 @@ type App struct {
 	// MetadataSM is the in-memory metadata state machine instance.
 	// Provides direct read access to cluster topology. Nil when Raft is disabled.
 	MetadataSM *metadata.MetadataStateMachine
+
+	// LeaderTracker tracks in-flight LEADER-ack proposals and fires when the
+	// leader's local Raft log has durably written them. Nil when Raft is
+	// disabled.
+	LeaderTracker *leaderpersist.Tracker
 }
 
 // Init initialises the application: sets up Pebble storage and creates the App
@@ -94,8 +100,8 @@ func Init(cfg *config.Config, logger *zap.Logger) (*App, error) {
 // initialised before the state machine factory captures it.
 //
 // Starts two Raft groups:
-//   1. Event shard (config.Raft.ClusterID) — replicates event data
-//   2. Metadata shard (metadata.MetadataShardID) — replicates cluster topology
+//  1. Event shard (config.Raft.ClusterID) — replicates event data
+//  2. Metadata shard (metadata.MetadataShardID) — replicates cluster topology
 //
 // join controls Dragonboot bootstrap semantics:
 //   - false: bootstrap a new cluster using config.Raft.InitialMembers, or
@@ -112,6 +118,11 @@ func (a *App) StartRaft(join bool, onDeleteKeys func(keys [][]byte)) error {
 	// event listener before NodeHost is created.
 	var metadataSvc *metadata.Service
 
+	// LeaderPersist tracks proposals that should be acked as soon as the
+	// leader has durably written them to its own Raft log. The LogDB
+	// decorator is what actually fires the notifications.
+	tracker := leaderpersist.NewTracker()
+
 	nhc := raftconfig.NodeHostConfig{
 		WALDir:         cfg.Raft.DataPath,
 		NodeHostDir:    cfg.Raft.DataPath,
@@ -119,6 +130,7 @@ func (a *App) StartRaft(join bool, onDeleteKeys func(keys [][]byte)) error {
 		RaftAddress:    cfg.Raft.ListenAddress,
 		// We'll set the listeners after creating the service below.
 	}
+	nhc.Expert.LogDBFactory = leaderpersist.NewFactory(tracker)
 
 	// We need the NodeHost reference to create the propose function, but
 	// Dragonboat needs the listeners at creation time. Use a forward reference:
@@ -142,6 +154,7 @@ func (a *App) StartRaft(join bool, onDeleteKeys func(keys [][]byte)) error {
 
 	a.NodeHost = nh
 	a.MetadataSvc = metadataSvc
+	a.LeaderTracker = tracker
 	metadataSvc.SetNodeHost(nh)
 
 	// Members are only passed when bootstrapping a brand-new cluster.
