@@ -67,10 +67,9 @@ func (s *EventStateMachine) Open(stopc <-chan struct{}) (uint64, error) {
 // applyEntry applies a single Raft log entry to the batch and returns the result
 // and any keys that were deleted (for DeleteBatchCmd).
 //
-// For StoreBatchCmd: the state machine delegates key generation to the shared
-// EventRepository (same monotonic-ID counter used by standalone mode). The
-// serialised StoredMessage bytes from the command buffer are passed directly to
-// StoreWithBatch — no re-serialisation, no extra allocation.
+// For StoreBatchCmd: every item carries the leader-assigned event ID. Replicas
+// apply it verbatim — the state machine never generates IDs — so all replicas
+// converge on identical keys.
 func (s *EventStateMachine) applyEntry(batch storage.Batch, cmd []byte) (statemachine.Result, [][]byte) {
 	if len(cmd) == 0 {
 		return statemachine.Result{Value: 0}, nil
@@ -84,14 +83,13 @@ func (s *EventStateMachine) applyEntry(batch storage.Batch, cmd []byte) (statema
 			return statemachine.Result{Value: 0}, nil
 		}
 		for _, it := range items {
-			// StoreRawWithBatch takes the already-serialised value bytes and
-			// lets the repository assign the authoritative monotonic key.
-			// This is identical to the standalone write path — same ID counter,
-			// same key schema, no extra serialisation step.
-			if _, err := s.repo.StoreRawWithBatch(batch, it.Bucket, it.TopicHash, it.Indexes, it.Msg); err != nil {
+			if _, err := s.repo.StoreRawWithBatch(batch, it.ID, it.Bucket, it.TopicHash, it.Indexes, it.Msg); err != nil {
 				log.Printf("raft: StoreRawWithBatch failed: %v", err)
 				return statemachine.Result{Value: 0}, nil
 			}
+			// Track the highest applied ID so a follower promoted to leader
+			// never reuses an ID.
+			s.repo.ObserveID(it.ID)
 		}
 		return statemachine.Result{Value: uint64(len(items))}, nil
 

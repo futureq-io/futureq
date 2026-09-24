@@ -196,6 +196,7 @@ func (ph *ProducerHandler) processRaftBatch(
 		}
 
 		raftItem := raft.StoreBatchItem{
+			ID:        app.A.Repositories.Events.NextID(),
 			Bucket:    utils.CalculateBucket(data.EnqueuedAtUnixMs+data.DelayMs, app.A.Config().Storage.TimeBucketSize),
 			TopicHash: utils.TopicHash(data.Topic),
 			Msg:       dataBytes,
@@ -252,7 +253,7 @@ func (ph *ProducerHandler) processStandaloneBatch(batch *pb.PublishBatch, nowMs 
 	defer func() { _ = b.Close() }()
 
 	if err := ph.marshalMessages(batch, nowMs, func(data *storagepb.StoredMessage) error {
-		_, err := app.A.Repositories.Events.StoreWithBatch(b, data)
+		_, err := app.A.Repositories.Events.StoreWithBatch(b, app.A.Repositories.Events.NextID(), data)
 		return err
 	}); err != nil {
 		return err

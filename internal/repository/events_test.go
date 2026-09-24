@@ -1,7 +1,6 @@
 package repository
 
 import (
-	"encoding/binary"
 	"sync"
 	"testing"
 	"time"
@@ -11,9 +10,9 @@ import (
 	"github.com/futureq-io/futureq/pkg/utils"
 	pb "github.com/futureq-io/protocol/proto/go"
 	storagepb "github.com/futureq-io/protocol/proto/go/storage"
-	"google.golang.org/protobuf/proto"
 	"github.com/stretchr/testify/suite"
 	"go.uber.org/zap"
+	"google.golang.org/protobuf/proto"
 )
 
 type EventRepositorySuite struct {
@@ -44,33 +43,73 @@ func (s *EventRepositorySuite) newRepo(bucketSize time.Duration) *EventRepositor
 	return repo
 }
 
-// ─── Constructor ────────────────────────────────────────────────────────────
+// ─── NextID / ObserveID ─────────────────────────────────────────────────────
 
-func (s *EventRepositorySuite) TestNewEventRepository_FreshDB_StartsAtZero() {
+func (s *EventRepositorySuite) TestNextID_IsMonotonic() {
 	require := s.Require()
 
 	repo := s.newRepo(1 * time.Second)
-	require.Equal(uint64(0), repo.lastID)
+	require.Equal(uint64(1), repo.NextID())
+	require.Equal(uint64(2), repo.NextID())
+	require.Equal(uint64(3), repo.NextID())
 }
 
-func (s *EventRepositorySuite) TestNewEventRepository_RestoresLastID() {
+func (s *EventRepositorySuite) TestNextID_Concurrent_Unique() {
 	require := s.Require()
 
-	// Seed last-id directly into the DB.
-	b := s.db.NewBatch()
-	idBytes := make([]byte, 8)
-	binary.BigEndian.PutUint64(idBytes, 42)
-	require.NoError(b.Set(eventsLastIDKey, idBytes))
-	require.NoError(b.Commit(storage.Sync))
-	require.NoError(b.Close())
+	repo := s.newRepo(1 * time.Second)
+
+	const goroutines = 10
+	const perGoroutine = 100
+
+	ids := make([]uint64, 0, goroutines*perGoroutine)
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+
+	for g := 0; g < goroutines; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < perGoroutine; i++ {
+				id := repo.NextID()
+				mu.Lock()
+				ids = append(ids, id)
+				mu.Unlock()
+			}
+		}()
+	}
+	wg.Wait()
+
+	seen := make(map[uint64]struct{}, len(ids))
+	for _, id := range ids {
+		_, dup := seen[id]
+		require.False(dup, "duplicate id %d", id)
+		seen[id] = struct{}{}
+	}
+	require.Len(seen, goroutines*perGoroutine)
+}
+
+func (s *EventRepositorySuite) TestObserveID_AdvancesCounter() {
+	require := s.Require()
 
 	repo := s.newRepo(1 * time.Second)
-	require.Equal(uint64(42), repo.lastID)
+	repo.ObserveID(41)
+	require.Equal(uint64(42), repo.NextID())
+}
+
+func (s *EventRepositorySuite) TestObserveID_LowerID_NoRegression() {
+	require := s.Require()
+
+	repo := s.newRepo(1 * time.Second)
+	require.Equal(uint64(1), repo.NextID())
+	repo.ObserveID(100)
+	repo.ObserveID(50) // lower than current — must not move the counter backwards
+	require.Equal(uint64(101), repo.NextID())
 }
 
 // ─── StoreWithBatch ─────────────────────────────────────────────────────────
 
-func (s *EventRepositorySuite) TestStoreWithBatch_AssignsMonotonicIDs() {
+func (s *EventRepositorySuite) TestStoreWithBatch_UsesSuppliedID() {
 	require := s.Require()
 
 	repo := s.newRepo(1 * time.Second)
@@ -82,21 +121,20 @@ func (s *EventRepositorySuite) TestStoreWithBatch_AssignsMonotonicIDs() {
 	}
 
 	b := s.db.NewBatch()
-	key1, err := repo.StoreWithBatch(b, msg)
+	key1, err := repo.StoreWithBatch(b, 7, msg)
 	require.NoError(err)
-	key2, err := repo.StoreWithBatch(b, msg)
+	key2, err := repo.StoreWithBatch(b, 8, msg)
 	require.NoError(err)
 	require.NoError(b.Commit(storage.Sync))
 	require.NoError(b.Close())
 
-	// Parse IDs from keys — must be 1 and 2.
 	_, _, id1, err := utils.ParseEventKey(key1)
 	require.NoError(err)
 	_, _, id2, err := utils.ParseEventKey(key2)
 	require.NoError(err)
 
-	require.Equal(uint64(1), id1)
-	require.Equal(uint64(2), id2)
+	require.Equal(uint64(7), id1)
+	require.Equal(uint64(8), id2)
 }
 
 func (s *EventRepositorySuite) TestStoreWithBatch_KeyLayout() {
@@ -113,7 +151,7 @@ func (s *EventRepositorySuite) TestStoreWithBatch_KeyLayout() {
 	}
 
 	b := s.db.NewBatch()
-	key, err := repo.StoreWithBatch(b, msg)
+	key, err := repo.StoreWithBatch(b, 1, msg)
 	require.NoError(err)
 	require.NoError(b.Commit(storage.Sync))
 	require.NoError(b.Close())
@@ -137,7 +175,7 @@ func (s *EventRepositorySuite) TestStoreWithBatch_StoredValueIsMarshalledMessage
 	}
 
 	b := s.db.NewBatch()
-	key, err := repo.StoreWithBatch(b, msg)
+	key, err := repo.StoreWithBatch(b, 1, msg)
 	require.NoError(err)
 	require.NoError(b.Commit(storage.Sync))
 	require.NoError(b.Close())
@@ -155,27 +193,6 @@ func (s *EventRepositorySuite) TestStoreWithBatch_StoredValueIsMarshalledMessage
 	require.Equal(msg.TtlMs, decoded.TtlMs)
 }
 
-func (s *EventRepositorySuite) TestStoreWithBatch_LastIDPersistedInBatch() {
-	require := s.Require()
-
-	repo := s.newRepo(1 * time.Second)
-
-	b := s.db.NewBatch()
-	_, err := repo.StoreWithBatch(b, &storagepb.StoredMessage{
-		Topic:            "t",
-		EnqueuedAtUnixMs: 1000,
-	})
-	require.NoError(err)
-	require.NoError(b.Commit(storage.Sync))
-	require.NoError(b.Close())
-
-	val, closer, err := s.db.Get(eventsLastIDKey)
-	require.NoError(err)
-	defer closer.Close()
-
-	require.Equal(uint64(1), binary.BigEndian.Uint64(val))
-}
-
 func (s *EventRepositorySuite) TestStoreWithBatch_IndexesAreStored() {
 	require := s.Require()
 
@@ -187,7 +204,7 @@ func (s *EventRepositorySuite) TestStoreWithBatch_IndexesAreStored() {
 	}
 
 	b := s.db.NewBatch()
-	key, err := repo.StoreWithBatch(b, msg)
+	key, err := repo.StoreWithBatch(b, 1, msg)
 	require.NoError(err)
 	require.NoError(b.Commit(storage.Sync))
 	require.NoError(b.Close())
@@ -210,17 +227,17 @@ func (s *EventRepositorySuite) TestStoreRawWithBatch_StoresRawBytes() {
 	indexes := [][]byte{[]byte("idx-key-1")}
 
 	b := s.db.NewBatch()
-	key, err := repo.StoreRawWithBatch(b, 42, 12345, indexes, rawMsg)
+	key, err := repo.StoreRawWithBatch(b, 9, 42, 12345, indexes, rawMsg)
 	require.NoError(err)
 	require.NoError(b.Commit(storage.Sync))
 	require.NoError(b.Close())
 
-	// Key layout must match supplied bucket and topicHash.
+	// Key layout must match supplied id, bucket and topicHash.
 	th, bucket, id, err := utils.ParseEventKey(key)
 	require.NoError(err)
 	require.Equal(uint64(12345), th)
 	require.Equal(uint64(42), bucket)
-	require.Equal(uint64(1), id)
+	require.Equal(uint64(9), id)
 
 	// Value must be the exact raw bytes — no re-serialisation.
 	val, closer, err := s.db.Get(key)
@@ -246,7 +263,7 @@ func (s *EventRepositorySuite) TestStoreRawWithBatch_MultipleIndexes() {
 	}
 
 	b := s.db.NewBatch()
-	key, err := repo.StoreRawWithBatch(b, 1, 2, indexes, []byte("v"))
+	key, err := repo.StoreRawWithBatch(b, 1, 1, 2, indexes, []byte("v"))
 	require.NoError(err)
 	require.NoError(b.Commit(storage.Sync))
 	require.NoError(b.Close())
@@ -259,23 +276,6 @@ func (s *EventRepositorySuite) TestStoreRawWithBatch_MultipleIndexes() {
 	}
 }
 
-func (s *EventRepositorySuite) TestStoreRawWithBatch_UpdatesLastID() {
-	require := s.Require()
-
-	repo := s.newRepo(1 * time.Second)
-
-	b := s.db.NewBatch()
-	_, err := repo.StoreRawWithBatch(b, 1, 1, nil, []byte("x"))
-	require.NoError(err)
-	require.NoError(b.Commit(storage.Sync))
-	require.NoError(b.Close())
-
-	val, closer, err := s.db.Get(eventsLastIDKey)
-	require.NoError(err)
-	defer closer.Close()
-	require.Equal(uint64(1), binary.BigEndian.Uint64(val))
-}
-
 // ─── DeleteWithBatch ────────────────────────────────────────────────────────
 
 func (s *EventRepositorySuite) TestDeleteWithBatch_RemovesKey() {
@@ -285,7 +285,7 @@ func (s *EventRepositorySuite) TestDeleteWithBatch_RemovesKey() {
 
 	// Store first.
 	b1 := s.db.NewBatch()
-	key, err := repo.StoreWithBatch(b1, &storagepb.StoredMessage{
+	key, err := repo.StoreWithBatch(b1, 1, &storagepb.StoredMessage{
 		Topic:            "del-topic",
 		EnqueuedAtUnixMs: 5000,
 	})
@@ -301,143 +301,4 @@ func (s *EventRepositorySuite) TestDeleteWithBatch_RemovesKey() {
 
 	_, _, err = s.db.Get(key)
 	require.Error(err, "expected key to be deleted")
-}
-
-// ─── EventBatch ─────────────────────────────────────────────────────────────
-
-func (s *EventRepositorySuite) TestEventBatch_Store_And_Commit() {
-	require := s.Require()
-
-	repo := s.newRepo(1 * time.Second)
-
-	eb := repo.NewBatch()
-	key, err := eb.Store(&storagepb.StoredMessage{
-		Topic:            "batch-topic",
-		Payload:          []byte("batched"),
-		EnqueuedAtUnixMs: 9000,
-	})
-	require.NoError(err)
-	require.NoError(eb.Commit(storage.Sync))
-	require.NoError(eb.Close())
-
-	val, closer, err := s.db.Get(key)
-	require.NoError(err)
-	defer closer.Close()
-
-	var decoded storagepb.StoredMessage
-	require.NoError(proto.Unmarshal(val, &decoded))
-	require.Equal("batch-topic", decoded.Topic)
-}
-
-func (s *EventRepositorySuite) TestEventBatch_Store_IsMonotonicWithinBatch() {
-	require := s.Require()
-
-	repo := s.newRepo(1 * time.Second)
-
-	eb := repo.NewBatch()
-	key1, err := eb.Store(&storagepb.StoredMessage{Topic: "t", EnqueuedAtUnixMs: 1000})
-	require.NoError(err)
-	key2, err := eb.Store(&storagepb.StoredMessage{Topic: "t", EnqueuedAtUnixMs: 1000})
-	require.NoError(err)
-	require.NoError(eb.Commit(storage.Sync))
-	require.NoError(eb.Close())
-
-	_, _, id1, _ := utils.ParseEventKey(key1)
-	_, _, id2, _ := utils.ParseEventKey(key2)
-	require.Less(id1, id2)
-}
-
-func (s *EventRepositorySuite) TestEventBatch_StoreRaw() {
-	require := s.Require()
-
-	repo := s.newRepo(1 * time.Second)
-
-	eb := repo.NewBatch()
-	key, err := eb.StoreRaw(7, 99, nil, []byte("raw"))
-	require.NoError(err)
-	require.NoError(eb.Commit(storage.Sync))
-	require.NoError(eb.Close())
-
-	th, bucket, _, err := utils.ParseEventKey(key)
-	require.NoError(err)
-	require.Equal(uint64(99), th)
-	require.Equal(uint64(7), bucket)
-}
-
-func (s *EventRepositorySuite) TestEventBatch_Delete() {
-	require := s.Require()
-
-	repo := s.newRepo(1 * time.Second)
-
-	// Seed a key directly.
-	b := s.db.NewBatch()
-	require.NoError(b.Set([]byte("to-delete"), []byte("v")))
-	require.NoError(b.Commit(storage.Sync))
-	require.NoError(b.Close())
-
-	eb := repo.NewBatch()
-	require.NoError(eb.Delete([]byte("to-delete")))
-	require.NoError(eb.Commit(storage.Sync))
-	require.NoError(eb.Close())
-
-	_, _, err := s.db.Get([]byte("to-delete"))
-	require.Error(err)
-}
-
-// ─── Concurrency ────────────────────────────────────────────────────────────
-
-func (s *EventRepositorySuite) TestStoreWithBatch_Concurrent_IDsAreUnique() {
-	require := s.Require()
-
-	repo := s.newRepo(1 * time.Second)
-
-	const goroutines = 10
-	const perGoroutine = 20
-
-	batches := make([]storage.Batch, goroutines)
-	for i := range batches {
-		batches[i] = s.db.NewBatch()
-	}
-
-	var wg sync.WaitGroup
-	keys := make([][]byte, goroutines*perGoroutine)
-	errs := make([]error, goroutines*perGoroutine)
-
-	for g := 0; g < goroutines; g++ {
-		wg.Add(1)
-		go func(g int) {
-			defer wg.Done()
-			for i := 0; i < perGoroutine; i++ {
-				k, err := repo.StoreWithBatch(batches[g], &storagepb.StoredMessage{
-					Topic:            "concurrent",
-					EnqueuedAtUnixMs: 1000,
-				})
-				keys[g*perGoroutine+i] = k
-				errs[g*perGoroutine+i] = err
-			}
-		}(g)
-	}
-	wg.Wait()
-
-	for _, err := range errs {
-		require.NoError(err)
-	}
-
-	// Commit all batches.
-	for _, b := range batches {
-		require.NoError(b.Commit(storage.Sync))
-		require.NoError(b.Close())
-	}
-
-	// All event IDs must be unique.
-	seen := make(map[uint64]struct{})
-	for _, k := range keys {
-		_, _, id, err := utils.ParseEventKey(k)
-		require.NoError(err)
-		_, exists := seen[id]
-		require.False(exists, "duplicate event ID %d", id)
-		seen[id] = struct{}{}
-	}
-
-	require.Len(seen, goroutines*perGoroutine)
 }

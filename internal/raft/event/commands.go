@@ -24,6 +24,10 @@ const (
 // occurs in the state machine. The state machine calls EventRepository to assign
 // the monotonic event ID and construct the full 24-byte key.
 type StoreBatchItem struct {
+	// ID is the leader-assigned monotonic event ID. All replicas apply it
+	// verbatim — only the leader generates IDs, ensuring identical keys on
+	// every replica.
+	ID uint64
 	// Bucket is the pre-computed time bucket (fire_at_ms / timeBucketSize).
 	Bucket uint64
 	// TopicHash is xxhash64(topic).
@@ -41,9 +45,10 @@ type StoreBatchItem struct {
 //	[0]      CommandType   (1 byte = 0)
 //	[1..8]   count         (uint64 big-endian)
 //	for each item:
-//	  [n..n+7]   bucket      (uint64 big-endian)
-//	  [n+8..n+15] topicHash  (uint64 big-endian)
-//	  [n+16..n+17] numIdx    (uint16 big-endian)
+//	  [n..n+7]   id          (uint64 big-endian)
+//	  [n+8..n+15] bucket     (uint64 big-endian)
+//	  [n+16..n+23] topicHash (uint64 big-endian)
+//	  [n+24..n+25] numIdx    (uint16 big-endian)
 //	  for each index:
 //	    [m..m+1]   idxLen    (uint16 big-endian)
 //	    [m+2..]    idxData   (idxLen bytes)
@@ -55,7 +60,7 @@ func MarshalStoreBatchCmd(items []StoreBatchItem) ([]byte, error) {
 	// Pre-calculate total size to do a single allocation.
 	size := 1 + 8 // cmdType + count
 	for _, it := range items {
-		size += 8 + 8 + 2 // bucket + topicHash + numIdx
+		size += 8 + 8 + 8 + 2 // id + bucket + topicHash + numIdx
 		for _, idx := range it.Indexes {
 			size += 2 + len(idx) // idxLen + data
 		}
@@ -68,11 +73,13 @@ func MarshalStoreBatchCmd(items []StoreBatchItem) ([]byte, error) {
 
 	pos := 9
 	for _, it := range items {
+		binary.BigEndian.PutUint64(out[pos:pos+8], it.ID)
+		pos += 8
 		binary.BigEndian.PutUint64(out[pos:pos+8], it.Bucket)
 		pos += 8
 		binary.BigEndian.PutUint64(out[pos:pos+8], it.TopicHash)
 		pos += 8
-		
+
 		binary.BigEndian.PutUint16(out[pos:pos+2], uint16(len(it.Indexes)))
 		pos += 2
 		for _, idx := range it.Indexes {
@@ -107,14 +114,16 @@ func UnmarshalStoreBatchCmd(data []byte) ([]StoreBatchItem, error) {
 
 	pos := 9
 	for i := uint64(0); i < count; i++ {
-		if pos+8+8+2 > len(data) {
+		if pos+8+8+8+2 > len(data) {
 			return nil, fmt.Errorf("raft: StoreBatchCmd truncated at item %d header", i)
 		}
+		id := binary.BigEndian.Uint64(data[pos : pos+8])
+		pos += 8
 		bucket := binary.BigEndian.Uint64(data[pos : pos+8])
 		pos += 8
 		topicHash := binary.BigEndian.Uint64(data[pos : pos+8])
 		pos += 8
-		
+
 		numIdx := int(binary.BigEndian.Uint16(data[pos : pos+2]))
 		pos += 2
 		
@@ -147,6 +156,7 @@ func UnmarshalStoreBatchCmd(data []byte) ([]StoreBatchItem, error) {
 		pos += valLen
 
 		items = append(items, StoreBatchItem{
+			ID:        id,
 			Bucket:    bucket,
 			TopicHash: topicHash,
 			Indexes:   indexes,

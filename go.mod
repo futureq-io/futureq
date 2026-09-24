@@ -1,6 +1,6 @@
 module github.com/futureq-io/futureq
 
-go 1.26.2
+go 1.26.5
 
 // replace github.com/lni/dragonboat/v4 => github.com/hertzcodes/dragonboat v4.0.0
 
