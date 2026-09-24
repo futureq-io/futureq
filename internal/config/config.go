@@ -16,6 +16,7 @@ type AckLevel = string
 
 const (
 	Quorum AckLevel = "Quorum"
+	Leader AckLevel = "Leader"
 	NoAck  AckLevel = "NoAck"
 )
 
@@ -208,6 +209,13 @@ func (c *Config) validateStorage() error {
 
 	if c.Storage.Type != "pebble" && c.Storage.Type != "bolt" {
 		return fmt.Errorf("storage type can only be in (pebble, bolt)")
+	}
+
+	switch c.Storage.MinAckLevel {
+	case Quorum, Leader, NoAck:
+	default:
+		return fmt.Errorf("storage minAckLevel must be one of (%s, %s, %s), got %q",
+			Quorum, Leader, NoAck, c.Storage.MinAckLevel)
 	}
 
 	return nil

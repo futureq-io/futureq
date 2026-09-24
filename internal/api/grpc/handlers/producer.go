@@ -26,6 +26,26 @@ import (
 
 var errBatchSave = errors.New("failed to save batch")
 
+// proposeTimeout bounds a single Raft propose call, regardless of ack level.
+// TODO: make configurable.
+const proposeTimeout = 5 * time.Second
+
+// minProtoAckLevel maps the configured Storage.MinAckLevel string to the
+// corresponding proto enum value. Proto values increase as durability weakens
+// (QUORUM=0 < LEADER=1 < NO_ACK=2), so a batch ack level weaker than the
+// configured minimum can be rejected with `ackLevel > minProtoAckLevel`.
+// Unknown values fall back to the strictest level (QUORUM).
+func minProtoAckLevel(min config.AckLevel) pb.AckLevel {
+	switch min {
+	case config.Leader:
+		return pb.AckLevel_ACK_LEVEL_LEADER
+	case config.NoAck:
+		return pb.AckLevel_ACK_LEVEL_NO_ACK
+	default:
+		return pb.AckLevel_ACK_LEVEL_QUORUM
+	}
+}
+
 // ProducerHandler implements pb.FutureQProducerServer.
 type ProducerHandler struct {
 	pb.UnimplementedFutureQProducerServer
@@ -83,9 +103,10 @@ func (ph *ProducerHandler) processBatch(ctx context.Context, batch *pb.PublishBa
 	topicLabel := batchTopicLabel(batch)
 	start := time.Now()
 
-	if app.A.Config().Storage.MinAckLevel == config.Quorum && ackLevel == pb.AckLevel_ACK_LEVEL_NO_ACK {
+	if minLevel := minProtoAckLevel(app.A.Config().Storage.MinAckLevel); ackLevel > minLevel {
 		metrics.PublishRequestsTotal.WithLabelValues(topicLabel, ackLevel.String(), "rejected").Inc()
-		return &pb.PublishBatchAck{Success: false}, status.Error(codes.InvalidArgument, "NO_ACK level is not allowed when MinAckLevel is Quorum")
+		return &pb.PublishBatchAck{Success: false}, status.Errorf(codes.InvalidArgument,
+			"ack level %s is below the broker minimum %s", ackLevel, app.A.Config().Storage.MinAckLevel)
 	}
 
 	nowMs := time.Now().UnixMilli()
@@ -228,9 +249,41 @@ func (ph *ProducerHandler) processRaftBatch(
 	switch ackLevel {
 	case pb.AckLevel_ACK_LEVEL_NO_ACK:
 		session := app.A.NodeHost.GetNoOPSession(shardID)
-		_, proposeErr = app.A.NodeHost.Propose(session, cmdBytes, 5*time.Second)
+		_, proposeErr = app.A.NodeHost.Propose(session, cmdBytes, proposeTimeout)
+	case pb.AckLevel_ACK_LEVEL_LEADER:
+		session := app.A.NodeHost.GetNoOPSession(shardID)
+		rs, err := app.A.NodeHost.Propose(session, cmdBytes, proposeTimeout)
+		if err != nil {
+			proposeErr = err
+			break
+		}
+		defer rs.Release()
+
+		select {
+		case res := <-rs.AppliedC():
+			switch {
+			case res.Completed():
+				// Applied locally on the leader.
+			case res.Timeout():
+				proposeErr = errors.New("leader-ack propose timed out")
+			case res.Dropped():
+				proposeErr = errors.New("leader-ack propose dropped")
+			case res.Rejected():
+				proposeErr = errors.New("leader-ack propose rejected")
+			case res.Terminated():
+				proposeErr = errors.New("leader-ack propose terminated")
+			case res.Aborted():
+				proposeErr = errors.New("leader-ack propose aborted")
+			default:
+				proposeErr = fmt.Errorf("leader-ack propose failed with unexpected result: %+v", res)
+			}
+		case <-ctx.Done():
+			// Client disconnected or was cancelled before local apply finished.
+			// The proposal may still apply server-side; surface the cancellation.
+			proposeErr = fmt.Errorf("leader-ack wait cancelled: %w", ctx.Err())
+		}
 	default:
-		propCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		propCtx, cancel := context.WithTimeout(ctx, proposeTimeout)
 		session := app.A.NodeHost.GetNoOPSession(shardID)
 		_, proposeErr = app.A.NodeHost.SyncPropose(propCtx, session, cmdBytes)
 		cancel()

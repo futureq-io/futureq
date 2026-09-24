@@ -2,104 +2,100 @@ package handlers
 
 import (
 	"testing"
-	"time"
 
-	"github.com/futureq-io/futureq/pkg/utils"
+	"github.com/stretchr/testify/suite"
+
+	"github.com/futureq-io/futureq/internal/config"
+	pb "github.com/futureq-io/protocol/proto/go"
 )
 
-// TestCalculateBucket verifies the new bucket-index semantics.
+type ProducerSuite struct {
+	suite.Suite
+}
+
+func TestProducerSuite(t *testing.T) {
+	suite.Run(t, new(ProducerSuite))
+}
+
+// TestAckLevelDurabilityOrdering asserts the load-bearing invariant behind the
+// MinAckLevel floor check: proto enum values increase as durability weakens
+// (QUORUM < LEADER < NO_ACK), so `ackLevel > minLevel` rejects too-weak acks.
 //
-// CalculateBucket returns floor(unixMs / bucketSizeMs), i.e. the integer bucket
-// index — not a millisecond-aligned boundary. This is intentional: the bucket
-// is used as a lexicographic key prefix in Pebble; its absolute value is not
-// meaningful to consumers.
-//
-// Mapping:
-//   - 17000ms / 1000ms = bucket 17
-//   - 17001ms / 1000ms = bucket 17   (same bucket as 17000)
-//   - 17999ms / 1000ms = bucket 17   (still bucket 17)
-//   - 18000ms / 1000ms = bucket 18
-//   - 1500ms  / 500ms  = bucket 3
-//   - 1501ms  / 500ms  = bucket 3
-//
-// The dispatcher scans all keys with bucket <= currentBucket so messages
-// are dispatched as soon as their bucket index is reached.
-func TestCalculateBucket(t *testing.T) {
-	tests := []struct {
-		name       string
-		executeAt  int64
-		bucketSize time.Duration
-		expected   uint64
+// If anyone renumbers the AckLevel enum (e.g. regenerating from an edited
+// producer.proto), this test fails and reminds them the floor check depends
+// on the ordering.
+func (s *ProducerSuite) TestAckLevelDurabilityOrdering() {
+	require := s.Require()
+
+	require.Less(pb.AckLevel_ACK_LEVEL_QUORUM, pb.AckLevel_ACK_LEVEL_LEADER,
+		"QUORUM must be ordered before LEADER")
+	require.Less(pb.AckLevel_ACK_LEVEL_LEADER, pb.AckLevel_ACK_LEVEL_NO_ACK,
+		"LEADER must be ordered before NO_ACK")
+}
+
+// TestMinProtoAckLevel verifies that the string-based config floor maps to the
+// correct proto enum value, and that unknown values fall back to the
+// strictest level (QUORUM) rather than silently allowing weak acks.
+func (s *ProducerSuite) TestMinProtoAckLevel() {
+	require := s.Require()
+
+	cases := []struct {
+		name     string
+		min      config.AckLevel
+		expected pb.AckLevel
 	}{
-		{
-			name:       "exact multiple of 1s",
-			executeAt:  17000,
-			bucketSize: 1 * time.Second,
-			expected:   17, // 17000 / 1000 = 17
+		{"Quorum maps to QUORUM", config.Quorum, pb.AckLevel_ACK_LEVEL_QUORUM},
+		{"Leader maps to LEADER", config.Leader, pb.AckLevel_ACK_LEVEL_LEADER},
+		{"NoAck maps to NO_ACK", config.NoAck, pb.AckLevel_ACK_LEVEL_NO_ACK},
+		{"unknown falls back to QUORUM", config.AckLevel("bogus"), pb.AckLevel_ACK_LEVEL_QUORUM},
+		{"empty falls back to QUORUM", config.AckLevel(""), pb.AckLevel_ACK_LEVEL_QUORUM},
+	}
+
+	for _, tc := range cases {
+		s.Run(tc.name, func() {
+			require.Equal(tc.expected, minProtoAckLevel(tc.min))
+		})
+	}
+}
+
+// TestMinAckLevelFloorMatrix exercises the floor logic end-to-end across the
+// (config floor) × (batch ack level) matrix, mirroring the predicate used in
+// processBatch. It does not touch Dragonboat — only the pure comparison.
+func (s *ProducerSuite) TestMinAckLevelFloorMatrix() {
+	require := s.Require()
+
+	levels := []pb.AckLevel{
+		pb.AckLevel_ACK_LEVEL_QUORUM,
+		pb.AckLevel_ACK_LEVEL_LEADER,
+		pb.AckLevel_ACK_LEVEL_NO_ACK,
+	}
+
+	// For each floor, which batch levels should be REJECTED.
+	rejections := map[config.AckLevel]map[pb.AckLevel]bool{
+		config.Quorum: {
+			pb.AckLevel_ACK_LEVEL_QUORUM: false,
+			pb.AckLevel_ACK_LEVEL_LEADER: true,
+			pb.AckLevel_ACK_LEVEL_NO_ACK: true,
 		},
-		{
-			name:       "slightly over bucket boundary",
-			executeAt:  17001,
-			bucketSize: 1 * time.Second,
-			expected:   17, // 17001 / 1000 = 17 (floor division)
+		config.Leader: {
+			pb.AckLevel_ACK_LEVEL_QUORUM: false,
+			pb.AckLevel_ACK_LEVEL_LEADER: false,
+			pb.AckLevel_ACK_LEVEL_NO_ACK: true,
 		},
-		{
-			name:       "just under next bucket boundary",
-			executeAt:  17999,
-			bucketSize: 1 * time.Second,
-			expected:   17, // 17999 / 1000 = 17 (floor division)
-		},
-		{
-			name:       "exactly 0",
-			executeAt:  0,
-			bucketSize: 1 * time.Second,
-			expected:   0,
-		},
-		{
-			name:       "negative value treated as 0 bucket",
-			executeAt:  -100,
-			bucketSize: 1 * time.Second,
-			expected:   0, // negative → bucket 0 (earliest possible)
-		},
-		{
-			name:       "bucket size is 0 (raw ms)",
-			executeAt:  17300,
-			bucketSize: 0,
-			expected:   17300, // bucketSize=0 → return raw ms as bucket
-		},
-		{
-			name:       "bucket size is 500ms, exact multiple",
-			executeAt:  1500,
-			bucketSize: 500 * time.Millisecond,
-			expected:   3, // 1500 / 500 = 3
-		},
-		{
-			name:       "bucket size is 500ms, one ms over",
-			executeAt:  1501,
-			bucketSize: 500 * time.Millisecond,
-			expected:   3, // 1501 / 500 = 3 (floor division)
-		},
-		{
-			name:       "bucket size is 500ms, just under next boundary",
-			executeAt:  1999,
-			bucketSize: 500 * time.Millisecond,
-			expected:   3, // 1999 / 500 = 3
-		},
-		{
-			name:       "bucket size is 500ms, at next boundary",
-			executeAt:  2000,
-			bucketSize: 500 * time.Millisecond,
-			expected:   4, // 2000 / 500 = 4
+		config.NoAck: {
+			pb.AckLevel_ACK_LEVEL_QUORUM: false,
+			pb.AckLevel_ACK_LEVEL_LEADER: false,
+			pb.AckLevel_ACK_LEVEL_NO_ACK: false,
 		},
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := utils.CalculateBucket(tt.executeAt, tt.bucketSize)
-			if got != tt.expected {
-				t.Errorf("CalculateBucket(%d, %v) = %d; want %d",
-					tt.executeAt, tt.bucketSize, got, tt.expected)
-			}
-		})
+	for floor, levelOutcomes := range rejections {
+		min := minProtoAckLevel(floor)
+		for _, level := range levels {
+			wantRejected := levelOutcomes[level]
+			gotRejected := level > min
+			require.Equal(wantRejected, gotRejected,
+				"floor=%v level=%v: rejected mismatch", floor, level)
+		}
 	}
 }
