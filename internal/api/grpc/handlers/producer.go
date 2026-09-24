@@ -8,6 +8,7 @@ import (
 	"io"
 	"time"
 
+	"github.com/lni/dragonboat/v4"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -25,6 +26,27 @@ import (
 )
 
 var errBatchSave = errors.New("failed to save batch")
+
+// requestResultLabel returns a short human-readable label for a Dragonboat
+// RequestResult terminal state. Used only for error messages.
+func requestResultLabel(res dragonboat.RequestResult) string {
+	switch {
+	case res.Completed():
+		return "completed"
+	case res.Timeout():
+		return "timeout"
+	case res.Dropped():
+		return "dropped"
+	case res.Rejected():
+		return "rejected"
+	case res.Terminated():
+		return "terminated"
+	case res.Aborted():
+		return "aborted"
+	default:
+		return "unknown"
+	}
+}
 
 // proposeTimeout bounds a single Raft propose call, regardless of ack level.
 // TODO: make configurable.
@@ -251,12 +273,6 @@ func (ph *ProducerHandler) processRaftBatch(
 		session := app.A.NodeHost.GetNoOPSession(shardID)
 		_, proposeErr = app.A.NodeHost.Propose(session, cmdBytes, proposeTimeout)
 	case pb.AckLevel_ACK_LEVEL_LEADER:
-		// Wait for the leader to durably write the entry to its own Raft log,
-		// without waiting for replication to a quorum. The signal comes from
-		// a LogDB decorator that observes SaveRaftState.
-		//
-		// Durability: if the leader crashes after ack but before replication,
-		// the batch may be lost. Stronger than NO_ACK, weaker than QUORUM.
 		if app.A.LeaderPersist == nil {
 			proposeErr = errors.New("leader-persist tracker is not initialised (raft disabled?)")
 			break
@@ -273,40 +289,17 @@ func (ph *ProducerHandler) processRaftBatch(
 		}
 		defer rs.Release()
 
-		// Also watch AppliedC for early-failure outcomes (dropped, rejected,
-		// timeout) so we don't sit on persistedCh until the deadline when
-		// Dragonboat already knows the proposal is dead.
 		waitCtx, cancelTimer := context.WithTimeout(ctx, proposeTimeout)
+		defer cancelTimer()
+
 		select {
 		case <-persistedCh:
-			// Leader has durably written the entry to its local Raft log.
+			ph.logger.Debug("leader has persisted and acked")
 		case res := <-rs.AppliedC():
-			// Terminal state reached before the persist signal — almost
-			// always a failure (success would have been preceded by the
-			// persist signal firing first, since SaveRaftState happens
-			// before apply in the Dragonboat worker loop).
-			switch {
-			case res.Completed():
-				// Race: apply completed without the persist notification
-				// reaching us first. The entry is by definition persisted
-				// and committed — treat as success.
-			case res.Timeout():
-				proposeErr = errors.New("leader-ack propose timed out")
-			case res.Dropped():
-				proposeErr = errors.New("leader-ack propose dropped")
-			case res.Rejected():
-				proposeErr = errors.New("leader-ack propose rejected")
-			case res.Terminated():
-				proposeErr = errors.New("leader-ack propose terminated")
-			case res.Aborted():
-				proposeErr = errors.New("leader-ack propose aborted")
-			default:
-				proposeErr = fmt.Errorf("leader-ack propose failed with unexpected result: %+v", res)
-			}
+			proposeErr = fmt.Errorf("leader-ack propose failed before persist: %s", requestResultLabel(res))
 		case <-waitCtx.Done():
-			proposeErr = fmt.Errorf("leader-ack wait cancelled: %w", waitCtx.Err())
+			proposeErr = fmt.Errorf("leader-ack timed out: %w", waitCtx.Err())
 		}
-		cancelTimer()
 	default:
 		propCtx, cancel := context.WithTimeout(ctx, proposeTimeout)
 		session := app.A.NodeHost.GetNoOPSession(shardID)
