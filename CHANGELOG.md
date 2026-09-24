@@ -1,6 +1,6 @@
 # Changelog
 
-# v0.0.1
+# UNRELEASED
 
 - fix event id storage (@hertzcodes)
 
