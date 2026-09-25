@@ -22,8 +22,8 @@ type DispatchStrategy interface {
 
 // RoundRobinStrategy dispatches messages to consumers in rotating order.
 type RoundRobinStrategy struct {
-	mu     sync.Mutex
-	next   map[string]uint64 // groupKey → next index
+	mu   sync.Mutex
+	next map[string]uint64 // groupKey → next index
 }
 
 // NewRoundRobinStrategy returns a RoundRobinStrategy.
