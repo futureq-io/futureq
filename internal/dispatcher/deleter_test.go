@@ -26,7 +26,7 @@ func TestDeleterSuite(t *testing.T) {
 func (s *DeleterSuite) TestDirectDeleteBackend_RemovesKeys() {
 	require := s.Require()
 
-	db, err := storage.NewPebble(config.Pebble{DataPath: ""}, zap.NewNop())
+	db, err := storage.NewPebble(config.Pebble{Mode: "memory"}, zap.NewNop())
 	require.NoError(err)
 	defer db.Close()
 
@@ -51,7 +51,7 @@ func (s *DeleterSuite) TestDirectDeleteBackend_RemovesKeys() {
 func (s *DeleterSuite) TestDirectDeleteBackend_MultipleKeys() {
 	require := s.Require()
 
-	db, err := storage.NewPebble(config.Pebble{DataPath: ""}, zap.NewNop())
+	db, err := storage.NewPebble(config.Pebble{Mode: "memory"}, zap.NewNop())
 	require.NoError(err)
 	defer db.Close()
 
@@ -76,7 +76,7 @@ func (s *DeleterSuite) TestDirectDeleteBackend_MultipleKeys() {
 func (s *DeleterSuite) TestDirectDeleteBackend_EmptyList_Succeeds() {
 	require := s.Require()
 
-	db, err := storage.NewPebble(config.Pebble{DataPath: ""}, zap.NewNop())
+	db, err := storage.NewPebble(config.Pebble{Mode: "memory"}, zap.NewNop())
 	require.NoError(err)
 	defer db.Close()
 

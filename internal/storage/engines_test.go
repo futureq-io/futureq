@@ -12,7 +12,7 @@ import (
 // newPebbleEngine returns an in-memory Pebble instance for contract testing.
 func newPebbleEngine(t *testing.T) DB {
 	t.Helper()
-	db, err := NewPebble(config.Pebble{DataPath: ""}, zap.NewNop())
+	db, err := NewPebble(config.Pebble{Mode: "memory"}, zap.NewNop())
 	if err != nil {
 		t.Fatalf("pebble factory: %v", err)
 	}
@@ -23,7 +23,7 @@ func newPebbleEngine(t *testing.T) DB {
 func newBoltEngine(t *testing.T) DB {
 	t.Helper()
 	db, err := NewBoltDB(config.Bolt{
-		DataPath: filepath.Join(t.TempDir(), "contract.db"),
+		File: filepath.Join(t.TempDir(), "nested", "contract.db"),
 	})
 	if err != nil {
 		t.Fatalf("bolt factory: %v", err)

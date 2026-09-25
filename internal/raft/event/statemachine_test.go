@@ -28,7 +28,7 @@ func TestEventStateMachineSuite(t *testing.T) {
 }
 
 func (s *EventStateMachineSuite) SetupTest() {
-	db, err := storage.NewPebble(config.Pebble{DataPath: ""}, zap.NewNop())
+	db, err := storage.NewPebble(config.Pebble{Mode: "memory"}, zap.NewNop())
 	s.Require().NoError(err)
 	s.db = db
 
@@ -422,7 +422,7 @@ func (s *EventStateMachineSuite) TestSnapshot_RoundTrip() {
 		"snapshot must faithfully serialize the applied-index key")
 
 	// Recover into a fresh DB.
-	db2, err := storage.NewPebble(config.Pebble{DataPath: ""}, zap.NewNop())
+	db2, err := storage.NewPebble(config.Pebble{Mode: "memory"}, zap.NewNop())
 	require.NoError(err)
 	defer db2.Close()
 
@@ -465,13 +465,13 @@ func TestSnapshot_PrepareFreezesAppliedState(t *testing.T) {
 			newDB := func() storage.DB {
 				t.Helper()
 				if engine == "bolt" {
-					db, err := storage.NewBoltDB(config.Bolt{DataPath: filepath.Join(t.TempDir(), "events.db")})
+					db, err := storage.NewBoltDB(config.Bolt{File: filepath.Join(t.TempDir(), "events.db")})
 					if err != nil {
 						t.Fatal(err)
 					}
 					return db
 				}
-				db, err := storage.NewPebble(config.Pebble{DataPath: ""}, zap.NewNop())
+				db, err := storage.NewPebble(config.Pebble{Mode: "memory"}, zap.NewNop())
 				if err != nil {
 					t.Fatal(err)
 				}

@@ -148,12 +148,12 @@ func (d *Dispatcher) isLeader() bool {
 	if app.A.NodeHost == nil {
 		return true
 	}
-	shardID := app.A.Config().Raft.ClusterID
+	shardID := app.A.Config().Cluster.ShardID
 	leaderID, _, valid, err := app.A.NodeHost.GetLeaderID(shardID)
 	if err != nil || !valid {
 		return false
 	}
-	return leaderID == app.A.Config().Raft.NodeID
+	return leaderID == app.A.Config().Cluster.NodeID
 }
 
 // dispatchTopic scans a single topic's key range and dispatches due messages.
@@ -165,7 +165,7 @@ func (d *Dispatcher) isLeader() bool {
 // the due messages for this topic.
 func (d *Dispatcher) dispatchTopic(topic string, nowMs int64) int {
 	topicHash := utils.TopicHash(topic)
-	nowBucket := utils.CalculateBucket(nowMs, app.A.Config().Storage.TimeBucketSize)
+	nowBucket := utils.CalculateBucket(nowMs, app.A.Config().Delivery.TimeBucket)
 
 	dispatched := 0
 	var expiredKeys [][]byte

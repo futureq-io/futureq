@@ -26,7 +26,7 @@ type Server struct {
 // New creates a fully configured gRPC server and registers all service
 // handlers. No network socket is opened yet; call Listen to do that.
 func New(
-	cfg config.Server,
+	cfg config.GRPC,
 	hub *dispatcher.Hub,
 	deleter *dispatcher.Deleter,
 	logger *zap.Logger,
@@ -34,9 +34,9 @@ func New(
 	log := logger.Named("grpc_server")
 
 	srv := grpc.NewServer(
-		grpc.MaxConcurrentStreams(cfg.MaxConns),
-		grpc.MaxRecvMsgSize(cfg.MaxRecvSizeKB*1024), // KB
-		grpc.MaxSendMsgSize(cfg.MaxSendSizeKB*1024), // KB
+		grpc.MaxConcurrentStreams(cfg.MaxConcurrentStreams),
+		grpc.MaxRecvMsgSize(int(mustSize(cfg.MaxReceiveMessageSize))),
+		grpc.MaxSendMsgSize(int(mustSize(cfg.MaxSendMessageSize))),
 
 		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
 			MinTime:             5 * time.Second,
@@ -48,7 +48,7 @@ func New(
 			MaxConnectionAge:      2 * time.Minute,
 			MaxConnectionAgeGrace: 10 * time.Second,
 			Time:                  10 * time.Second,
-			Timeout:               cfg.Timeout,
+			Timeout:               cfg.KeepaliveTimeout,
 		}),
 	)
 
@@ -62,6 +62,12 @@ func New(
 		logger: log,
 		addr:   cfg.Listen,
 	}
+}
+
+// Config validation has already checked these sizes before the server starts.
+func mustSize(size config.Size) int64 {
+	bytes, _ := size.Bytes()
+	return bytes
 }
 
 // Listen binds the TCP listener and blocks serving until the underlying

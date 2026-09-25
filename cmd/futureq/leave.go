@@ -42,7 +42,7 @@ func leaveRun(_ *cobra.Command, _ []string) {
 		stdLogger.Fatalf("failed to load config: %v", err)
 	}
 
-	if !cfg.Raft.Enabled {
+	if !cfg.Cluster.Enabled {
 		stdLogger.Fatalf("raft must be enabled in config to leave a cluster")
 	}
 
@@ -55,13 +55,13 @@ func leaveRun(_ *cobra.Command, _ []string) {
 	client := pb.NewFutureQClusterClient(conn)
 
 	req := &pb.LeaveRequest{
-		NodeId: cfg.Raft.NodeID,
+		NodeId: cfg.Cluster.NodeID,
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	stdLogger.Printf("Requesting node %d to leave cluster via seed %s...", cfg.Raft.NodeID, leaveSeedAddr)
+	stdLogger.Printf("Requesting node %d to leave cluster via seed %s...", cfg.Cluster.NodeID, leaveSeedAddr)
 	resp, err := client.LeaveCluster(ctx, req)
 	if err != nil {
 		stdLogger.Fatalf("LeaveCluster RPC failed: %v", err)
@@ -71,5 +71,5 @@ func leaveRun(_ *cobra.Command, _ []string) {
 		stdLogger.Fatalf("failed to leave cluster: %s", resp.ErrorMessage)
 	}
 
-	stdLogger.Printf("Node %d successfully left the cluster. Raft data can now be safely deleted.", cfg.Raft.NodeID)
+	stdLogger.Printf("Node %d successfully left the cluster. Raft data can now be safely deleted.", cfg.Cluster.NodeID)
 }

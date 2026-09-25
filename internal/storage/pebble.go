@@ -23,9 +23,13 @@ func NewPebble(cfg config.Pebble, logger *zap.Logger) (*Pebble, error) {
 		zap.String("engine", "pebble"),
 	)
 
-	cacheSize := cfg.CacheSizeMB * 1024 * 1024
-	if cacheSize <= 0 {
+	cacheSize, err := cfg.CacheSize.Bytes()
+	if err != nil {
 		cacheSize = 64 * 1024 * 1024
+	}
+	memtableSize, err := cfg.MemtableSize.Bytes()
+	if err != nil {
+		memtableSize = 64 * 1024 * 1024
 	}
 
 	cache := pebble.NewCache(cacheSize)
@@ -34,21 +38,23 @@ func NewPebble(cfg config.Pebble, logger *zap.Logger) (*Pebble, error) {
 
 	eventListener := pebble.MakeLoggingEventListener(pebbleLogger.Sugar())
 	dbOpts := &pebble.Options{
-		DisableWAL:    cfg.DisableWAL,
+		DisableWAL:    cfg.Mode != "memory" && !cfg.WALEnabled,
 		Logger:        pebbleLogger.Sugar(),
 		Cache:         cache,
-		MemTableSize:  cfg.InMemTableSizeMB * 1024 * 1024,
+		MemTableSize:  uint64(memtableSize),
 		EventListener: &eventListener,
 	}
 
-	if cfg.DataPath == "" {
+	path := cfg.DataDir
+	if cfg.Mode == "memory" || path == "" {
+		path = ""
 		dbOpts.FS = vfs.NewMem()
 		pebbleLogger.Info("Initializing Pebble DB in memory", zap.Bool("persist", false))
 	} else {
 		pebbleLogger.Info("Initializing Pebble DB", zap.Bool("persist", true))
 	}
 
-	db, err := pebble.Open(cfg.DataPath, dbOpts)
+	db, err := pebble.Open(path, dbOpts)
 	if err != nil {
 		return nil, err
 	}

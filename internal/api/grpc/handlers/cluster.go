@@ -36,7 +36,7 @@ func (h *ClusterHandler) GetClusterInfo(ctx context.Context, _ *pb.ClusterInfoRe
 		return nil, status.Error(codes.NotFound, "attempt to get cluster info on single mode node")
 	}
 
-	shardID := app.A.Config().Raft.ClusterID
+	shardID := app.A.Config().Cluster.ShardID
 	topo := app.A.MetadataSM.GetShardTopology(shardID)
 	if topo == nil {
 		return nil, status.Error(codes.Unavailable, "topology not yet available")
@@ -90,7 +90,7 @@ func (h *ClusterHandler) JoinCluster(ctx context.Context, req *pb.JoinRequest) (
 		return nil, status.Error(codes.FailedPrecondition, "node is not running in raft mode")
 	}
 
-	eventShard := app.A.Config().Raft.ClusterID
+	eventShard := app.A.Config().Cluster.ShardID
 
 	h.logger.Info("adding node as non-voting member",
 		zap.Uint64("node_id", req.NodeId),
@@ -152,7 +152,7 @@ func (h *ClusterHandler) LeaveCluster(ctx context.Context, req *pb.LeaveRequest)
 		return nil, status.Error(codes.FailedPrecondition, "node is not running in raft mode")
 	}
 
-	eventShard := app.A.Config().Raft.ClusterID
+	eventShard := app.A.Config().Cluster.ShardID
 
 	h.logger.Info("removing node from cluster",
 		zap.Uint64("node_id", req.NodeId),
