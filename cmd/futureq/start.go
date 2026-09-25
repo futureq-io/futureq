@@ -44,13 +44,13 @@ func init() {
 	startCmd.Flags().StringSliceVar(&joinSeeds, "join", nil, "gRPC addresses of seed nodes to join (repeatable)")
 }
 
-func startRun(_ *cobra.Command, _ []string) {
+func startRun(cmd *cobra.Command, _ []string) {
 	cfg, err := config.Load(cfgFile)
 	if err != nil {
 		stdLogger.Fatalf("failed to load config: %v", err)
 	}
 
-	logger, err := log.InitLogger(cfg.Observability.Logger)
+	logger, err := log.InitLogger(cfg.Observability.Logging)
 	if err != nil {
 		stdLogger.Fatalf("failed to init logger: %v", err)
 	}
@@ -68,14 +68,21 @@ func startRun(_ *cobra.Command, _ []string) {
 	// ── Join an existing cluster if requested ────────────────────────────────
 	// Only performed on a fresh node (no local Raft data). Restarts detect
 	// the existing data and skip the join flow entirely.
+	seeds := cfg.Cluster.JoinSeeds
+	if cmd.Flags().Changed("join") {
+		seeds = joinSeeds
+	}
 	joining := false
-	if cfg.Raft.Enabled && len(joinSeeds) > 0 {
+	if cfg.Cluster.Enabled && len(seeds) > 0 {
 		if a.HasRaftData() {
 			logger.Info("local raft data found, skipping join flow")
 		} else {
-			joinCluster(cfg, joinSeeds, logger)
+			joinCluster(cfg, seeds, logger)
 			joining = true
 		}
+	}
+	if cfg.Cluster.Enabled && !a.HasRaftData() && !joining && len(cfg.Cluster.Raft.InitialMembers) == 0 {
+		logger.Fatal("fresh cluster node requires cluster.raft.initialMembers or cluster.joinSeeds")
 	}
 
 	// ── Dispatcher components ─────────────────────────────────────────────────
@@ -83,20 +90,20 @@ func startRun(_ *cobra.Command, _ []string) {
 	strategy := dispatcher.NewRoundRobinStrategy()
 	hub := dispatcher.NewHub(strategy, logger, wakeCh)
 
-	inFlightTimeout := time.Duration(cfg.Consumer.InFlightTimeoutMs) * time.Millisecond
-	deleteInterval := time.Duration(cfg.Consumer.DeleteBatchIntervalMs) * time.Millisecond
-	dispatchInterval := time.Duration(cfg.Consumer.DispatchPollIntervalMs) * time.Millisecond
-	janitorInterval := time.Duration(cfg.Consumer.TTLJanitorIntervalMs) * time.Millisecond
+	inFlightTimeout := cfg.Delivery.InFlightTimeout
+	deleteInterval := cfg.Delivery.DeleteBatchInterval
+	dispatchInterval := cfg.Delivery.DispatchPollInterval
+	janitorInterval := cfg.Delivery.TTLSweepInterval
 
 	// ── Build the delete backend ────────────────────────────────────────────────
 	// In Raft mode: route deletions through SyncPropose(DeleteBatchCmd).
 	// In standalone mode: write deletions directly to the local storage engine.
 	var deleteBackend dispatcher.DeleteBackend
-	if cfg.Raft.Enabled {
+	if cfg.Cluster.Enabled {
 		proposeDelete := func(cmd []byte) error {
-			ctx, cancel := context.WithTimeout(a.Ctx, 5*time.Second)
+			ctx, cancel := context.WithTimeout(a.Ctx, cfg.Publish.ProposalTimeout)
 			defer cancel()
-			session := a.NodeHost.GetNoOPSession(cfg.Raft.ClusterID)
+			session := a.NodeHost.GetNoOPSession(cfg.Cluster.ShardID)
 			_, err := a.NodeHost.SyncPropose(ctx, session, cmd)
 			return err
 		}
@@ -121,7 +128,7 @@ func startRun(_ *cobra.Command, _ []string) {
 	// ── Prometheus metrics server ──────────────────────────────────────────────
 	// Start before Raft so the liveness/readiness probes have something to hit
 	// while the Raft cluster is still forming.
-	metricsSrv := metrics.NewServer(cfg.Observability.Metrics.Addr, logger)
+	metricsSrv := metrics.NewServer(cfg.Observability.Metrics.Listen, logger)
 	a.RegisterComponentWithShutdown()
 	go func() {
 		defer a.ComponentShutdownDone()
@@ -132,7 +139,7 @@ func startRun(_ *cobra.Command, _ []string) {
 	// onDeleteKeys is called by the state machine after each DeleteBatchCmd
 	// is committed. We wire it to the dispatcher so in-flight entries are
 	// removed immediately without waiting for the next scan pass.
-	if cfg.Raft.Enabled {
+	if cfg.Cluster.Enabled {
 		if err := a.StartRaft(joining, disp.RemoveInFlightBatch); err != nil {
 			logger.Fatal("failed to start raft", zap.Error(err))
 		}
@@ -161,7 +168,7 @@ func startRun(_ *cobra.Command, _ []string) {
 	}()
 
 	// ── gRPC server ───────────────────────────────────────────────────────────
-	grpcserver.New(cfg.Server, hub, deleter, logger).
+	grpcserver.New(cfg.API.GRPC, hub, deleter, logger).
 		Listen().
 		WaitForShutdown(a.Ctx)
 
@@ -176,15 +183,15 @@ func startRun(_ *cobra.Command, _ []string) {
 // and the metadata group by the seed.
 func joinCluster(cfg *config.Config, seeds []string, logger *zap.Logger) {
 	req := &pb.JoinRequest{
-		NodeId:      cfg.Raft.NodeID,
-		RaftAddress: cfg.Raft.ListenAddress,
-		GrpcAddress: cfg.Server.Listen,
+		NodeId:      cfg.Cluster.NodeID,
+		RaftAddress: cfg.Cluster.Raft.Advertise,
+		GrpcAddress: cfg.API.GRPC.Advertise,
 	}
 
 	for _, seed := range seeds {
 		logger.Info("attempting to join cluster via seed",
 			zap.String("seed", seed),
-			zap.Uint64("node_id", cfg.Raft.NodeID),
+			zap.Uint64("node_id", cfg.Cluster.NodeID),
 		)
 
 		conn, err := grpc.NewClient(seed, grpc.WithTransportCredentials(insecure.NewCredentials()))
@@ -217,7 +224,7 @@ func joinCluster(cfg *config.Config, seeds []string, logger *zap.Logger) {
 
 		logger.Info("successfully joined cluster",
 			zap.String("seed", seed),
-			zap.Uint64("node_id", cfg.Raft.NodeID),
+			zap.Uint64("node_id", cfg.Cluster.NodeID),
 		)
 		return
 	}

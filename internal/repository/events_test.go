@@ -26,7 +26,7 @@ func TestEventRepositorySuite(t *testing.T) {
 }
 
 func (s *EventRepositorySuite) SetupTest() {
-	db, err := storage.NewPebble(config.Pebble{DataPath: ""}, zap.NewNop())
+	db, err := storage.NewPebble(config.Pebble{Mode: "memory"}, zap.NewNop())
 	s.Require().NoError(err)
 	s.db = db
 }

@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -74,7 +73,7 @@ func Init(cfg *config.Config, logger *zap.Logger) (*App, error) {
 
 	var s storage.DB
 	var err error
-	switch cfg.Storage.Type {
+	switch cfg.Storage.Engine {
 	case "pebble":
 		s, err = storage.NewPebble(cfg.Storage.Pebble, logger)
 		if err != nil {
@@ -100,11 +99,11 @@ func Init(cfg *config.Config, logger *zap.Logger) (*App, error) {
 // initialised before the state machine factory captures it.
 //
 // Starts two Raft groups:
-//  1. Event shard (config.Raft.ClusterID) — replicates event data
+//  1. Event shard (config.Cluster.ShardID) — replicates event data
 //  2. Metadata shard (metadata.MetadataShardID) — replicates cluster topology
 //
 // join controls Dragonboot bootstrap semantics:
-//   - false: bootstrap a new cluster using config.Raft.InitialMembers, or
+//   - false: bootstrap a new cluster using config.Cluster.Raft.InitialMembers, or
 //     restart from local data when members are empty.
 //   - true: join an existing cluster as an already-registered member
 //     (initialMembers must be empty; membership was registered via JoinCluster).
@@ -124,11 +123,11 @@ func (a *App) StartRaft(join bool, onDeleteKeys func(keys [][]byte)) error {
 	tracker := leaderpersist.NewTracker()
 
 	nhc := raftconfig.NodeHostConfig{
-		WALDir:         cfg.Raft.DataPath,
-		NodeHostDir:    cfg.Raft.DataPath,
-		RTTMillisecond: cfg.Raft.RTTMillisecond,
-		RaftAddress:    cfg.Raft.ListenAddress,
-		// We'll set the listeners after creating the service below.
+		WALDir:         cfg.Cluster.Raft.DataDir,
+		NodeHostDir:    cfg.Cluster.Raft.DataDir,
+		RTTMillisecond: uint64(cfg.Cluster.Raft.RTT.Milliseconds()),
+		RaftAddress:    cfg.Cluster.Raft.Advertise,
+		ListenAddress:  cfg.Cluster.Raft.Listen,
 	}
 	nhc.Expert.LogDBFactory = leaderpersist.NewFactory(tracker)
 
@@ -164,7 +163,7 @@ func (a *App) StartRaft(join bool, onDeleteKeys func(keys [][]byte)) error {
 	//   - Restart:         join=false + empty members (local data exists)
 	members := make(map[uint64]dragonboat.Target)
 	if !join && !a.hasRaftData() {
-		for k, v := range cfg.Raft.InitialMembers {
+		for k, v := range cfg.Cluster.Raft.InitialMembers {
 			members[k] = dragonboat.Target(v)
 		}
 	}
@@ -181,7 +180,7 @@ func (a *App) StartRaft(join bool, onDeleteKeys func(keys [][]byte)) error {
 		return sm
 	}
 	metadataRC := raftconfig.Config{
-		ReplicaID:          cfg.Raft.NodeID,
+		ReplicaID:          cfg.Cluster.NodeID,
 		ShardID:            metadata.MetadataShardID,
 		ElectionRTT:        10,
 		HeartbeatRTT:       1,
@@ -199,8 +198,8 @@ func (a *App) StartRaft(join bool, onDeleteKeys func(keys [][]byte)) error {
 		// crash loop. Wipe the dir so the next start begins from a clean slate.
 		if errors.Is(err, dragonboat.ErrShardNotBootstrapped) {
 			a.Logger.Warn("raft bootstrap failed (shard not bootstrapped); wiping raft data dir to allow clean retry",
-				zap.String("path", cfg.Raft.DataPath))
-			_ = os.RemoveAll(cfg.Raft.DataPath)
+				zap.String("path", cfg.Cluster.Raft.DataDir))
+			_ = os.RemoveAll(cfg.Cluster.Raft.DataDir)
 		}
 		return fmt.Errorf("failed to start metadata raft group: %w", err)
 	}
@@ -213,13 +212,13 @@ func (a *App) StartRaft(join bool, onDeleteKeys func(keys [][]byte)) error {
 
 	// ── Start the event Raft group ─────────────────────────────────────────────
 	eventRC := raftconfig.Config{
-		ReplicaID:          cfg.Raft.NodeID,
-		ShardID:            cfg.Raft.ClusterID,
+		ReplicaID:          cfg.Cluster.NodeID,
+		ShardID:            cfg.Cluster.ShardID,
 		ElectionRTT:        10,
 		HeartbeatRTT:       1,
 		CheckQuorum:        true,
-		SnapshotEntries:    cfg.Raft.SnapshotEntries,
-		CompactionOverhead: cfg.Raft.CompactionOverhead,
+		SnapshotEntries:    cfg.Cluster.Raft.SnapshotEntries,
+		CompactionOverhead: cfg.Cluster.Raft.CompactionOverhead,
 	}
 
 	// Pass the fully-initialised EventRepository so the state machine uses the
@@ -228,26 +227,19 @@ func (a *App) StartRaft(join bool, onDeleteKeys func(keys [][]byte)) error {
 	if err := nh.StartOnDiskReplica(members, join, eventFactory, eventRC); err != nil {
 		if errors.Is(err, dragonboat.ErrShardNotBootstrapped) {
 			a.Logger.Warn("event raft bootstrap failed (shard not bootstrapped); wiping raft data dir to allow clean retry",
-				zap.String("path", cfg.Raft.DataPath))
-			_ = os.RemoveAll(cfg.Raft.DataPath)
+				zap.String("path", cfg.Cluster.Raft.DataDir))
+			_ = os.RemoveAll(cfg.Cluster.Raft.DataDir)
 		}
 		return fmt.Errorf("failed to start event raft group: %w", err)
 	}
 
-	// ── Announce our gRPC address to the cluster ──────────────────────────────
-	// Derive the advertise address from our Raft address (the identity the
-	// cluster knows us by) plus the gRPC port from Server.Listen. Both run
-	// in the same process, so the host is always the same.
-	grpcAdvertise, err := grpcAdvertiseAddr(nh.RaftAddress(), cfg.Server.Listen)
-	if err != nil {
-		return fmt.Errorf("failed to compute gRPC advertise address: %w", err)
-	}
+	// ── Announce the explicitly configured client address ────────────────────
 	// Retry until the metadata shard has a leader. During initial cluster
 	// bootstrap (OrderedReady), the first pod starts before peers exist, so
 	// the shard may not be ready yet. Keep retrying until it is.
 	for {
 		ctx, cancel := context.WithTimeout(a.Ctx, 5*time.Second)
-		err := metadataSvc.RegisterNodeAddr(ctx, cfg.Raft.NodeID, grpcAdvertise)
+		err := metadataSvc.RegisterNodeAddr(ctx, cfg.Cluster.NodeID, cfg.API.GRPC.Advertise)
 		cancel()
 		if err == nil {
 			break
@@ -263,24 +255,9 @@ func (a *App) StartRaft(join bool, onDeleteKeys func(keys [][]byte)) error {
 
 	// Register the event shard with the metadata service so it publishes
 	// initial topology.
-	a.MetadataSvc.RegisterShard(cfg.Raft.ClusterID)
+	a.MetadataSvc.RegisterShard(cfg.Cluster.ShardID)
 
 	return nil
-}
-
-// grpcAdvertiseAddr computes the client-facing gRPC address for this node.
-// The host is taken from raftAddr (this node's identity as the cluster sees
-// it — always dialable by peers), and the port from grpcListen.
-func grpcAdvertiseAddr(raftAddr, grpcListen string) (string, error) {
-	host, _, err := net.SplitHostPort(raftAddr)
-	if err != nil {
-		return "", fmt.Errorf("invalid raft address %q: %w", raftAddr, err)
-	}
-	_, grpcPort, err := net.SplitHostPort(grpcListen)
-	if err != nil {
-		return "", fmt.Errorf("invalid grpc listen address %q: %w", grpcListen, err)
-	}
-	return net.JoinHostPort(host, grpcPort), nil
 }
 
 // HasRaftData reports whether local Raft data exists for this node.
@@ -296,7 +273,7 @@ func (a *App) HasRaftData() bool {
 func (a *App) hasRaftData() bool {
 	// Dragonboat's sharded-pebble LogDB stores each shard in a logdb-N
 	// subdirectory. The first shard writes a MANIFEST once initialised.
-	manifest := filepath.Join(a.cfg.Raft.DataPath, "logdb-0", "MANIFEST-000001")
+	manifest := filepath.Join(a.cfg.Cluster.Raft.DataDir, "logdb-0", "MANIFEST-000001")
 	_, err := os.Stat(manifest)
 	return err == nil
 }
@@ -377,7 +354,7 @@ func (a *App) WithGracefulShutdown() error {
 }
 
 func (a *App) WithRepositories() error {
-	eventRepo, err := repository.NewEventRepository(a.DB, a.Logger, a.cfg.Storage.TimeBucketSize)
+	eventRepo, err := repository.NewEventRepository(a.DB, a.Logger, a.cfg.Delivery.TimeBucket)
 	if err != nil {
 		return fmt.Errorf("failed to init event repo: %w", err)
 	}

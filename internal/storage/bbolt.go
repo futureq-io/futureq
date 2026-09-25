@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 
 	"github.com/futureq-io/futureq/internal/config"
 	bolt "go.etcd.io/bbolt"
@@ -37,15 +39,18 @@ type boltDB struct {
 	bucket []byte
 }
 
-// NewBoltDB opens a bbolt database at cfg.DataPath and returns it as a
+// NewBoltDB opens a bbolt database at cfg.File and returns it as a
 // storage.DB. The database file is created if it does not exist.
 func NewBoltDB(cfg config.Bolt) (DB, error) {
-	db, err := bolt.Open(cfg.DataPath, 0600, nil)
+	if err := os.MkdirAll(filepath.Dir(cfg.File), 0700); err != nil {
+		return nil, fmt.Errorf("bbolt: failed to create parent directory for %q: %w", cfg.File, err)
+	}
+	db, err := bolt.Open(cfg.File, 0600, nil)
 	if err != nil {
-		return nil, fmt.Errorf("bbolt: failed to open %q: %w", cfg.DataPath, err)
+		return nil, fmt.Errorf("bbolt: failed to open %q: %w", cfg.File, err)
 	}
 
-	bname := cfg.DefaultBucket
+	bname := cfg.Bucket
 	if bname == "" {
 		bname = defaultBucket
 	}

@@ -2,6 +2,7 @@
 
 ### UNRELEASED
 
+- improve the config structure and add config validation (@hertzcodes)
 - fix snapshot recovery problems related to last-applied-idx (@hertzcodes)
 - fix storage err handling for Get operation (@hertzcodes)
 - add leader acks (@hertzcodes, #46)

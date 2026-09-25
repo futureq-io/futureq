@@ -143,9 +143,9 @@ func (h *ConsumerHandler) checkLeadership(init *pb.SubscribeInit) error {
 		return nil
 	}
 
-	shardID := app.A.Config().Raft.ClusterID
+	shardID := app.A.Config().Cluster.ShardID
 	leaderID, _, valid, err := app.A.NodeHost.GetLeaderID(shardID)
-	isLeader := err == nil && valid && leaderID == app.A.Config().Raft.NodeID
+	isLeader := err == nil && valid && leaderID == app.A.Config().Cluster.NodeID
 
 	if !isLeader {
 		h.logger.Warn("rejecting consumer: not the leader",

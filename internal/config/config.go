@@ -3,7 +3,9 @@ package config
 import (
 	"bytes"
 	"fmt"
+	"net"
 	"os"
+	"reflect"
 	"strconv"
 	"strings"
 	"time"
@@ -15,217 +17,318 @@ import (
 type AckLevel = string
 
 const (
-	Quorum AckLevel = "Quorum"
-	Leader AckLevel = "Leader"
-	NoAck  AckLevel = "NoAck"
+	Quorum AckLevel = "quorum"
+	Leader AckLevel = "leader"
+	NoAck  AckLevel = "noAck"
 )
 
 type Config struct {
-	Server        Server        `mapstructure:"server" yaml:"server"`
-	Observability Observability `mapstructure:"observability" yaml:"observability"`
+	ConfigVersion int           `mapstructure:"configVersion" yaml:"configVersion"`
+	API           API           `mapstructure:"api" yaml:"api"`
+	Cluster       Cluster       `mapstructure:"cluster" yaml:"cluster"`
 	Storage       Storage       `mapstructure:"storage" yaml:"storage"`
-	Raft          Raft          `mapstructure:"raft" yaml:"raft"`
-	Consumer      Consumer      `mapstructure:"consumer" yaml:"consumer"`
+	Publish       Publish       `mapstructure:"publish" yaml:"publish"`
+	Delivery      Delivery      `mapstructure:"delivery" yaml:"delivery"`
+	Observability Observability `mapstructure:"observability" yaml:"observability"`
 }
 
-type Server struct {
-	Listen        string        `mapstructure:"listen" yaml:"listen"`
-	MaxConns      uint32        `mapstructure:"maxConns" yaml:"maxConns"`
-	Timeout       time.Duration `mapstructure:"timeout" yaml:"timeout"`
-	MaxRecvSizeKB int           `mapstructure:"maxRecvSizeKb" yaml:"maxRecvSizeKb"`
-	MaxSendSizeKB int           `mapstructure:"maxSendSizeKb" yaml:"maxSendSizeKb"`
+type API struct {
+	GRPC GRPC `mapstructure:"grpc" yaml:"grpc"`
+}
+
+type GRPC struct {
+	Listen                string        `mapstructure:"listen" yaml:"listen"`
+	Advertise             string        `mapstructure:"advertise" yaml:"advertise"`
+	MaxConcurrentStreams  uint32        `mapstructure:"maxConcurrentStreams" yaml:"maxConcurrentStreams"`
+	MaxReceiveMessageSize Size          `mapstructure:"maxReceiveMessageSize" yaml:"maxReceiveMessageSize"`
+	MaxSendMessageSize    Size          `mapstructure:"maxSendMessageSize" yaml:"maxSendMessageSize"`
+	KeepaliveTimeout      time.Duration `mapstructure:"keepaliveTimeout" yaml:"keepaliveTimeout"`
+}
+
+type Cluster struct {
+	Enabled   bool     `mapstructure:"enabled" yaml:"enabled"`
+	NodeID    uint64   `mapstructure:"nodeId" yaml:"nodeId"`
+	ShardID   uint64   `mapstructure:"shardId" yaml:"shardId"`
+	JoinSeeds []string `mapstructure:"joinSeeds" yaml:"joinSeeds"`
+	Raft      Raft     `mapstructure:"raft" yaml:"raft"`
+}
+
+type Raft struct {
+	Listen             string            `mapstructure:"listen" yaml:"listen"`
+	Advertise          string            `mapstructure:"advertise" yaml:"advertise"`
+	DataDir            string            `mapstructure:"dataDir" yaml:"dataDir"`
+	InitialMembers     map[uint64]string `mapstructure:"initialMembers" yaml:"initialMembers"`
+	RTT                time.Duration     `mapstructure:"rtt" yaml:"rtt"`
+	SnapshotEntries    uint64            `mapstructure:"snapshotEntries" yaml:"snapshotEntries"`
+	CompactionOverhead uint64            `mapstructure:"compactionOverhead" yaml:"compactionOverhead"`
+}
+
+type Storage struct {
+	Engine string `mapstructure:"engine" yaml:"engine"`
+	Pebble Pebble `mapstructure:"pebble" yaml:"pebble"`
+	Bolt   Bolt   `mapstructure:"bolt" yaml:"bolt"`
+}
+
+type Pebble struct {
+	Mode         string `mapstructure:"mode" yaml:"mode"`
+	DataDir      string `mapstructure:"dataDir" yaml:"dataDir"`
+	WALEnabled   bool   `mapstructure:"walEnabled" yaml:"walEnabled"`
+	CacheSize    Size   `mapstructure:"cacheSize" yaml:"cacheSize"`
+	MemtableSize Size   `mapstructure:"memtableSize" yaml:"memtableSize"`
+}
+
+type Bolt struct {
+	File   string `mapstructure:"file" yaml:"file"`
+	Bucket string `mapstructure:"bucket" yaml:"bucket"`
+}
+
+type Publish struct {
+	MinAckLevel     AckLevel      `mapstructure:"minAckLevel" yaml:"minAckLevel"`
+	ProposalTimeout time.Duration `mapstructure:"proposalTimeout" yaml:"proposalTimeout"`
+}
+
+type Delivery struct {
+	TimeBucket           time.Duration `mapstructure:"timeBucket" yaml:"timeBucket"`
+	DispatchPollInterval time.Duration `mapstructure:"dispatchPollInterval" yaml:"dispatchPollInterval"`
+	InFlightTimeout      time.Duration `mapstructure:"inFlightTimeout" yaml:"inFlightTimeout"`
+	DeleteBatchInterval  time.Duration `mapstructure:"deleteBatchInterval" yaml:"deleteBatchInterval"`
+	TTLSweepInterval     time.Duration `mapstructure:"ttlSweepInterval" yaml:"ttlSweepInterval"`
 }
 
 type Observability struct {
-	Logger  Logger  `mapstructure:"logger" yaml:"logger"`
+	Logging Logger  `mapstructure:"logging" yaml:"logging"`
 	Metrics Metrics `mapstructure:"metrics" yaml:"metrics"`
 }
 
 type Metrics struct {
-	Addr string `mapstructure:"addr" yaml:"addr"`
+	Listen string `mapstructure:"listen" yaml:"listen"`
 }
-
 type Logger struct {
 	Level string `mapstructure:"level" yaml:"level"`
 }
 
-type Storage struct {
-	MinAckLevel    AckLevel      `mapstructure:"minAckLevel" yaml:"minAckLevel"`
-	Persist        bool          `mapstructure:"persist" yaml:"persist"`
-	TimeBucketSize time.Duration `mapstructure:"timeBucketSize" yaml:"timeBucketSize"`
-	Type           string        `mapstructure:"type" yaml:"type"`
-	Pebble         Pebble        `mapstructure:"pebble" yaml:"pebble"`
-	Bolt           Bolt
-}
+// Size is a binary byte quantity such as "100KiB" or "16MiB".
+type Size string
 
-type Bolt struct {
-	DataPath      string `mapstructure:"dataPath" yaml:"dataPath"`
-	DefaultBucket string `mapstructure:"defaultBucket" yaml:"defaultBucket"`
-}
-
-type Pebble struct {
-	DisableWAL       bool   `mapstructure:"disableWAL" yaml:"disableWAL"`
-	DataPath         string `mapstructure:"dataPath" yaml:"dataPath"`
-	CacheSizeMB      int64  `mapstructure:"cacheSizeMb" yaml:"cacheSizeMb"`
-	InMemTableSizeMB uint64 `mapstructure:"inMemoryTableSizeMb" yaml:"inMemoryTableSizeMb"`
-}
-
-type Raft struct {
-	Enabled        bool              `mapstructure:"enabled" yaml:"enabled"`
-	NodeID         uint64            `mapstructure:"nodeId" yaml:"nodeId"`
-	ClusterID      uint64            `mapstructure:"clusterId" yaml:"clusterId"`
-	ListenAddress  string            `mapstructure:"listenAddress" yaml:"listenAddress"`
-	DataPath       string            `mapstructure:"dataPath" yaml:"dataPath"`
-	InitialMembers map[uint64]string `mapstructure:"initialMembers" yaml:"initialMembers"`
-
-	// RTTMillisecond is the average round-trip latency between Raft peers in
-	// milliseconds.  Dragonboat uses this to calibrate election timeouts and
-	// heartbeat intervals.  Lower values mean faster leader failover but
-	// higher network overhead.  Default: 200.
-	RTTMillisecond uint64 `mapstructure:"rttMillisecond" yaml:"rttMillisecond"`
-
-	SnapshotEntries    uint64 `mapstructure:"snapShotEntries" yaml:"snapShotEntries"`
-	CompactionOverhead uint64 `mapstructure:"compactionOverHead" yaml:"compactionOverHead"`
-}
-
-// Consumer holds configuration for the message dispatch subsystem.
-type Consumer struct {
-	// DispatchPollIntervalMs is how long the dispatcher sleeps between scan
-	// passes when no ready messages were found. Shorter values reduce delivery
-	// latency at the cost of more Pebble iterator overhead. Default: 50ms.
-	DispatchPollIntervalMs uint64 `mapstructure:"dispatchPollIntervalMs" yaml:"dispatchPollIntervalMs"`
-
-	// DeleteBatchIntervalMs is how often the batched deleter flushes accumulated
-	// acknowledged-message keys via Raft. Default: 500ms.
-	DeleteBatchIntervalMs uint64 `mapstructure:"deleteBatchIntervalMs" yaml:"deleteBatchIntervalMs"`
-
-	// InFlightTimeoutMs is the duration after which a dispatched-but-unacknowledged
-	// message is considered abandoned and eligible for re-dispatch. Default: 5000ms.
-	InFlightTimeoutMs uint64 `mapstructure:"inFlightTimeoutMs" yaml:"inFlightTimeoutMs"`
-
-	// TTLJanitorIntervalMs is how often the TTL janitor performs a full Pebble
-	// scan to remove expired messages that were never consumed. Default: 60000ms.
-	TTLJanitorIntervalMs uint64 `mapstructure:"ttlJanitorIntervalMs" yaml:"ttlJanitorIntervalMs"`
+func (s Size) Bytes() (int64, error) {
+	value := string(s)
+	for _, unit := range []struct {
+		suffix string
+		factor int64
+	}{
+		{"GiB", 1 << 30}, {"MiB", 1 << 20}, {"KiB", 1 << 10}, {"B", 1},
+	} {
+		if number, ok := strings.CutSuffix(value, unit.suffix); ok {
+			n, err := strconv.ParseInt(number, 10, 64)
+			if err != nil || n <= 0 || n > (int64(^uint64(0)>>1))/unit.factor {
+				return 0, fmt.Errorf("invalid size %q", value)
+			}
+			return n * unit.factor, nil
+		}
+	}
+	return 0, fmt.Errorf("invalid size %q (use B, KiB, MiB, or GiB)", value)
 }
 
 func Load(path string) (*Config, error) {
-	var c Config
-
 	v := viper.New()
 	v.SetConfigType("yaml")
-	v.AddConfigPath(".")
 	v.SetEnvPrefix("futureq")
 	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_", "-", "_"))
+	v.AllowEmptyEnv(true)
 	v.AutomaticEnv()
 
-	defaultConfigBytes, err := yaml.Marshal(defaultConfig)
+	defaultBytes, err := yaml.Marshal(defaultConfig)
 	if err != nil {
-		return nil, fmt.Errorf("error unmarshalling default config: %w", err)
+		return nil, fmt.Errorf("marshal default config: %w", err)
 	}
-
-	err = v.ReadConfig(bytes.NewReader(defaultConfigBytes))
-	if err != nil {
-		return nil, fmt.Errorf("error reading default config: %w", err)
+	if err := v.ReadConfig(bytes.NewReader(defaultBytes)); err != nil {
+		return nil, fmt.Errorf("read default config: %w", err)
 	}
-
 	if path != "" {
 		v.SetConfigFile(path)
-		err = v.MergeInConfig()
-		if err != nil {
-			return nil, fmt.Errorf("error merge config: %w", err)
+		if err := v.MergeInConfig(); err != nil {
+			return nil, fmt.Errorf("merge config: %w", err)
 		}
 	}
-
-	err = v.Unmarshal(&c)
-	if err != nil {
-		return nil, fmt.Errorf("error unmarshalling config: %w", err)
+	if err := bindEnv(v, reflect.TypeOf(Config{}), ""); err != nil {
+		return nil, err
 	}
-
-	// Explicit env overrides — Viper's AutomaticEnv+Unmarshal does not reliably
-	// override map values that are already present in the config file, so we
-	// handle the ones we care about explicitly here.
-	if nodeID := os.Getenv("FUTUREQ_RAFT_NODEID"); nodeID != "" {
-		if v, err := strconv.ParseUint(nodeID, 10, 64); err == nil {
-			c.Raft.NodeID = v
+	// Viper cannot decode a map from one environment string. This value replaces
+	// the entire initialMembers map and uses YAML syntax, e.g. '{1: "host:50005"}'.
+	if raw, ok := os.LookupEnv("FUTUREQ_CLUSTER_RAFT_INITIALMEMBERS"); ok {
+		members := map[uint64]string{}
+		if err := yaml.Unmarshal([]byte(raw), &members); err != nil {
+			return nil, fmt.Errorf("FUTUREQ_CLUSTER_RAFT_INITIALMEMBERS: %w", err)
 		}
+		v.Set("cluster.raft.initialMembers", members)
 	}
-	if raftAddr := os.Getenv("FUTUREQ_RAFT_LISTENADDRESS"); raftAddr != "" {
-		c.Raft.ListenAddress = raftAddr
+	var c Config
+	if err := v.UnmarshalExact(&c); err != nil {
+		return nil, fmt.Errorf("decode config: %w", err)
 	}
-
-	if err := c.runPostLoadHooks(); err != nil {
-		return nil, fmt.Errorf("failed to run post load hooks for config: %w", err)
-	}
-
 	if err := c.validate(); err != nil {
-		return nil, fmt.Errorf("error validating config: %w", err)
+		return nil, fmt.Errorf("validate config: %w", err)
 	}
-
 	return &c, nil
 }
 
-func (c *Config) validate() error {
-	if err := c.validateStorage(); err != nil {
-		return err
+// Bind every documented leaf so env-only values participate in UnmarshalExact.
+func bindEnv(v *viper.Viper, typ reflect.Type, prefix string) error {
+	for i := 0; i < typ.NumField(); i++ {
+		field := typ.Field(i)
+		key := field.Tag.Get("mapstructure")
+		if key == "" {
+			continue
+		}
+		if prefix != "" {
+			key = prefix + "." + key
+		}
+		if field.Type.Kind() == reflect.Struct {
+			if err := bindEnv(v, field.Type, key); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := v.BindEnv(key); err != nil {
+			return fmt.Errorf("bind environment for %s: %w", key, err)
+		}
 	}
-
-	if err := c.validateRaft(); err != nil {
-		return err
-	}
-
 	return nil
 }
 
-func (c *Config) validateRaft() error {
-	if c.Raft.SnapshotEntries == 0 {
-		return fmt.Errorf("raft's snapshot entries cannot be zero")
+func (c *Config) validate() error {
+	if c.ConfigVersion != 1 {
+		return fmt.Errorf("configVersion must be 1")
 	}
-
-	if c.Raft.CompactionOverhead == 0 {
-		return fmt.Errorf("raft's compaction overhead cannot be zero")
+	if err := c.validateAPI(); err != nil {
+		return err
 	}
-
-	if c.Raft.RTTMillisecond == 0 {
-		return fmt.Errorf("raft's rtt millisecond cannot be zero")
+	if c.Observability.Metrics.Listen != "" && !validAddress(c.Observability.Metrics.Listen, false) {
+		return fmt.Errorf("observability.metrics.listen must be empty or a host:port address")
 	}
+	if err := c.validateStorage(); err != nil {
+		return err
+	}
+	if err := c.validateCluster(); err != nil {
+		return err
+	}
+	if err := c.validatePublishAndDelivery(); err != nil {
+		return err
+	}
+	return nil
+}
 
+func validAddress(address string, advertised bool) bool {
+	host, port, err := net.SplitHostPort(address)
+	if err != nil || host == "" || port == "" {
+		return false
+	}
+	n, err := strconv.Atoi(port)
+	if err != nil || n < 1 || n > 65535 {
+		return false
+	}
+	return !advertised || (host != "0.0.0.0" && host != "::")
+}
+
+func (c *Config) validateAPI() error {
+	g := c.API.GRPC
+	if !validAddress(g.Listen, false) {
+		return fmt.Errorf("api.grpc.listen must be a host:port address")
+	}
+	if g.Advertise != "" && !validAddress(g.Advertise, true) {
+		return fmt.Errorf("api.grpc.advertise must be a reachable host:port address")
+	}
+	if g.MaxConcurrentStreams == 0 || g.KeepaliveTimeout <= 0 {
+		return fmt.Errorf("api.grpc.maxConcurrentStreams and keepaliveTimeout must be positive")
+	}
+	for name, size := range map[string]Size{"maxReceiveMessageSize": g.MaxReceiveMessageSize, "maxSendMessageSize": g.MaxSendMessageSize} {
+		bytes, err := size.Bytes()
+		if err != nil || bytes > int64(int(^uint(0)>>1)) {
+			return fmt.Errorf("api.grpc.%s must be a positive supported size: %v", name, err)
+		}
+	}
+	return nil
+}
+
+func (c *Config) validateCluster() error {
+	if !c.Cluster.Enabled {
+		return nil
+	}
+	cl := c.Cluster
+	if cl.NodeID == 0 || cl.ShardID == 0 {
+		return fmt.Errorf("cluster.nodeId and cluster.shardId must be nonzero")
+	}
+	if !validAddress(c.API.GRPC.Advertise, true) {
+		return fmt.Errorf("api.grpc.advertise is required when cluster.enabled is true")
+	}
+	if !validAddress(cl.Raft.Listen, false) || !validAddress(cl.Raft.Advertise, true) {
+		return fmt.Errorf("cluster.raft.listen and advertise must be valid host:port addresses")
+	}
+	if cl.Raft.DataDir == "" || cl.Raft.RTT < time.Millisecond || cl.Raft.RTT%time.Millisecond != 0 || cl.Raft.SnapshotEntries == 0 || cl.Raft.CompactionOverhead == 0 {
+		return fmt.Errorf("cluster.raft requires dataDir, millisecond rtt, snapshotEntries, and compactionOverhead")
+	}
+	if len(cl.JoinSeeds) > 0 && len(cl.Raft.InitialMembers) > 0 {
+		return fmt.Errorf("cluster.joinSeeds and cluster.raft.initialMembers cannot both be set")
+	}
+	for _, seed := range cl.JoinSeeds {
+		if !validAddress(seed, true) {
+			return fmt.Errorf("cluster.joinSeeds contains invalid address %q", seed)
+		}
+	}
+	for id, addr := range cl.Raft.InitialMembers {
+		if id == 0 || !validAddress(addr, true) {
+			return fmt.Errorf("cluster.raft.initialMembers contains invalid member %d: %q", id, addr)
+		}
+	}
+	if len(cl.Raft.InitialMembers) > 0 && cl.Raft.InitialMembers[cl.NodeID] != cl.Raft.Advertise {
+		return fmt.Errorf("cluster.raft.initialMembers must include this nodeId with its raft advertise address")
+	}
 	return nil
 }
 
 func (c *Config) validateStorage() error {
-	if c.Storage.Persist && c.Storage.Pebble.DataPath == "" {
-		return fmt.Errorf("pebble's data path cannot be empty when persist is true")
-	}
-
-	if c.Storage.TimeBucketSize < 1*time.Millisecond {
-		c.Storage.TimeBucketSize = 0
-	}
-
-	if !c.Raft.Enabled {
-		if c.Storage.Pebble.DisableWAL {
-			return fmt.Errorf("WAL can not be disabled on single node setup without raft")
+	switch c.Storage.Engine {
+	case "pebble":
+		p := c.Storage.Pebble
+		if p.Mode != "disk" && p.Mode != "memory" {
+			return fmt.Errorf("storage.pebble.mode must be disk or memory")
 		}
-	}
-
-	if c.Storage.Type != "pebble" && c.Storage.Type != "bolt" {
-		return fmt.Errorf("storage type can only be in (pebble, bolt)")
-	}
-
-	switch c.Storage.MinAckLevel {
-	case Quorum, Leader, NoAck:
+		if p.Mode == "disk" && p.DataDir == "" {
+			return fmt.Errorf("storage.pebble.dataDir is required in disk mode")
+		}
+		if !p.WALEnabled && !c.Cluster.Enabled && p.Mode == "disk" {
+			return fmt.Errorf("storage.pebble.walEnabled cannot be false for a standalone disk node")
+		}
+		for name, size := range map[string]Size{"cacheSize": p.CacheSize, "memtableSize": p.MemtableSize} {
+			if _, err := size.Bytes(); err != nil {
+				return fmt.Errorf("storage.pebble.%s: %w", name, err)
+			}
+		}
+	case "bolt":
+		if c.Storage.Bolt.File == "" {
+			return fmt.Errorf("storage.bolt.file is required")
+		}
 	default:
-		return fmt.Errorf("storage minAckLevel must be one of (%s, %s, %s), got %q",
-			Quorum, Leader, NoAck, c.Storage.MinAckLevel)
+		return fmt.Errorf("storage.engine must be pebble or bolt")
 	}
-
 	return nil
 }
 
-func (c *Config) runPostLoadHooks() error {
-	if !c.Storage.Persist {
-		c.Storage.Pebble.DataPath = ""
-		c.Storage.Bolt.DataPath = ""
+func (c *Config) validatePublishAndDelivery() error {
+	switch c.Publish.MinAckLevel {
+	case Quorum, Leader, NoAck:
+	default:
+		return fmt.Errorf("publish.minAckLevel must be quorum, leader, or noAck")
 	}
-
+	if c.Publish.ProposalTimeout <= 0 {
+		return fmt.Errorf("publish.proposalTimeout must be positive")
+	}
+	d := c.Delivery
+	if d.TimeBucket < 0 || (d.TimeBucket > 0 && d.TimeBucket < time.Millisecond) {
+		return fmt.Errorf("delivery.timeBucket must be zero or at least 1ms")
+	}
+	if d.DispatchPollInterval <= 0 || d.InFlightTimeout <= 0 || d.DeleteBatchInterval <= 0 || d.TTLSweepInterval <= 0 {
+		return fmt.Errorf("delivery intervals and timeout must be positive")
+	}
 	return nil
 }

@@ -26,11 +26,7 @@ import (
 
 var errBatchSave = errors.New("failed to save batch")
 
-// proposeTimeout bounds a single Raft propose call, regardless of ack level.
-// TODO: make configurable.
-const proposeTimeout = 5 * time.Second
-
-// minProtoAckLevel maps the configured Storage.MinAckLevel string to the
+// minProtoAckLevel maps the configured Publish.MinAckLevel string to the
 // corresponding proto enum value. Proto values increase as durability weakens
 // (QUORUM=0 < LEADER=1 < NO_ACK=2), so a batch ack level weaker than the
 // configured minimum can be rejected with `ackLevel > minProtoAckLevel`.
@@ -59,7 +55,7 @@ type ProducerHandler struct {
 func NewProducerHandler(logger *zap.Logger) *ProducerHandler {
 	return &ProducerHandler{
 		logger:         logger.Named("producer"),
-		timeBucketSize: app.A.Config().Storage.TimeBucketSize,
+		timeBucketSize: app.A.Config().Delivery.TimeBucket,
 	}
 }
 
@@ -103,10 +99,10 @@ func (ph *ProducerHandler) processBatch(ctx context.Context, batch *pb.PublishBa
 	topicLabel := batchTopicLabel(batch)
 	start := time.Now()
 
-	if minLevel := minProtoAckLevel(app.A.Config().Storage.MinAckLevel); ackLevel > minLevel {
+	if minLevel := minProtoAckLevel(app.A.Config().Publish.MinAckLevel); ackLevel > minLevel {
 		metrics.PublishRequestsTotal.WithLabelValues(topicLabel, ackLevel.String(), "rejected").Inc()
 		return &pb.PublishBatchAck{Success: false}, status.Errorf(codes.InvalidArgument,
-			"ack level %s is below the broker minimum %s", ackLevel, app.A.Config().Storage.MinAckLevel)
+			"ack level %s is below the broker minimum %s", ackLevel, app.A.Config().Publish.MinAckLevel)
 	}
 
 	nowMs := time.Now().UnixMilli()
@@ -201,11 +197,11 @@ func (ph *ProducerHandler) processRaftBatch(
 	nowMs int64,
 	ackLevel pb.AckLevel,
 ) error {
-	shardID := app.A.Config().Raft.ClusterID
+	shardID := app.A.Config().Cluster.ShardID
 
 	// Only the leader may propose.
 	leaderID, _, valid, errL := app.A.NodeHost.GetLeaderID(shardID)
-	if errL != nil || !valid || leaderID != app.A.Config().Raft.NodeID {
+	if errL != nil || !valid || leaderID != app.A.Config().Cluster.NodeID {
 		return errors.New("node is not the cluster leader")
 	}
 
@@ -218,7 +214,7 @@ func (ph *ProducerHandler) processRaftBatch(
 
 		raftItem := raft.StoreBatchItem{
 			ID:        app.A.Repositories.Events.NextID(),
-			Bucket:    utils.CalculateBucket(data.EnqueuedAtUnixMs+data.DelayMs, app.A.Config().Storage.TimeBucketSize),
+			Bucket:    utils.CalculateBucket(data.EnqueuedAtUnixMs+data.DelayMs, app.A.Config().Delivery.TimeBucket),
 			TopicHash: utils.TopicHash(data.Topic),
 			Msg:       dataBytes,
 		}
@@ -244,12 +240,13 @@ func (ph *ProducerHandler) processRaftBatch(
 	}
 
 	start := time.Now()
+	proposalTimeout := app.A.Config().Publish.ProposalTimeout
 	var proposeErr error
 
 	switch ackLevel {
 	case pb.AckLevel_ACK_LEVEL_NO_ACK:
 		session := app.A.NodeHost.GetNoOPSession(shardID)
-		_, proposeErr = app.A.NodeHost.Propose(session, cmdBytes, proposeTimeout)
+		_, proposeErr = app.A.NodeHost.Propose(session, cmdBytes, proposalTimeout)
 	case pb.AckLevel_ACK_LEVEL_LEADER:
 		if app.A.LeaderTracker == nil {
 			proposeErr = errors.New("leader-persist tracker is not initialised (raft disabled?)")
@@ -260,14 +257,14 @@ func (ph *ProducerHandler) processRaftBatch(
 		defer cancelWait()
 
 		session := app.A.NodeHost.GetNoOPSession(shardID)
-		rs, err := app.A.NodeHost.Propose(session, cmdBytes, proposeTimeout)
+		rs, err := app.A.NodeHost.Propose(session, cmdBytes, proposalTimeout)
 		if err != nil {
 			proposeErr = err
 			break
 		}
 		defer rs.Release()
 
-		propCtx, cancel := context.WithTimeout(ctx, proposeTimeout)
+		propCtx, cancel := context.WithTimeout(ctx, proposalTimeout)
 		defer cancel()
 
 		select {
@@ -279,7 +276,7 @@ func (ph *ProducerHandler) processRaftBatch(
 			proposeErr = fmt.Errorf("leader-ack wait cancelled: %w", propCtx.Err())
 		}
 	default:
-		propCtx, cancel := context.WithTimeout(ctx, proposeTimeout)
+		propCtx, cancel := context.WithTimeout(ctx, proposalTimeout)
 		session := app.A.NodeHost.GetNoOPSession(shardID)
 		_, proposeErr = app.A.NodeHost.SyncPropose(propCtx, session, cmdBytes)
 		cancel()

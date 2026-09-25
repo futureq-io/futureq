@@ -76,30 +76,49 @@ cp config.example.yaml config.yaml   # adjust as needed
 ./futureq start -c config.yaml
 ```
 
-A standalone node (no `raft` section, or `raft.enabled: false`) writes directly to Pebble — perfect for local development.
+A standalone node (`cluster.enabled: false`) writes directly to Pebble — perfect for local development.
 
 ### Run a 3-node cluster
 
-On the first node, enable Raft and list all initial members:
+On the first node, enable clustering and list its bootstrap member. Use addresses that other nodes and clients can reach:
 
 ```yaml
-raft:
+api:
+  grpc:
+    advertise: "10.0.0.1:8443"
+cluster:
   enabled: true
   nodeId: 1
-  clusterId: 1
-  listenAddress: "0.0.0.0:50005"
-  initialMembers:
-    1: "10.0.0.1:50005"
+  shardId: 1
+  raft:
+    advertise: "10.0.0.1:50005"
+    initialMembers:
+      1: "10.0.0.1:50005"
 ```
 
-Additional nodes join dynamically — no need to edit `initialMembers`:
+For each additional node, give it a unique `cluster.nodeId`, its own `api.grpc.advertise` and `cluster.raft.advertise`, and a seed address. For example, node 2 uses:
+
+```yaml
+api:
+  grpc:
+    advertise: "10.0.0.2:8443"
+cluster:
+  enabled: true
+  nodeId: 2
+  raft:
+    advertise: "10.0.0.2:50005"
+  joinSeeds:
+    - "10.0.0.1:8443"
+```
+
+The `--join` flag overrides `cluster.joinSeeds` for one start:
 
 ```bash
 ./futureq start -c node2.yaml --join 10.0.0.1:8443
 ./futureq start -c node3.yaml --join 10.0.0.1:8443
 ```
 
-On first start the node contacts each seed until one accepts its `JoinCluster` request; membership is registered on both the event shard and the metadata group. Restarts detect local Raft data and skip the join flow automatically.
+On first start the node contacts each seed until one accepts its `JoinCluster` request; membership is registered on both the event shard and the metadata group. Restarts detect local Raft data and skip the join flow automatically. `cluster.raft.initialMembers` and `cluster.joinSeeds` cannot both be set in a config file.
 
 ### Docker
 
@@ -114,20 +133,20 @@ docker run -p 8443:8443 -p 9090:9090 -p 50005:50005 \
 
 Every value is documented in [`config.example.yaml`](config.example.yaml), which mirrors the built-in defaults. Key sections:
 
-| Section          | Highlights                                                        |
-| ---------------- | ----------------------------------------------------------------- |
-| `server`         | gRPC listen address, connection limits, message size caps         |
-| `storage`        | Engine (`pebble`), persistence toggle, time-bucket granularity    |
-| `storage.pebble` | WAL toggle, data path, cache/memtable sizing                      |
-| `raft`           | Node/cluster IDs, listen address, initial members, snapshot tuning |
-| `consumer`       | Dispatch poll interval, batched-delete interval, in-flight timeout, TTL janitor interval |
-| `observability`  | Log level, Prometheus listen address                              |
+| Section | Highlights |
+| ------- | ---------- |
+| `api.grpc` | Listen and advertised addresses, concurrent streams, message sizes, keepalive timeout |
+| `cluster` | Node and shard IDs, join seeds, Raft addresses and snapshot tuning |
+| `storage` | Pebble disk or memory mode, or a Bolt database file |
+| `publish` | Minimum acknowledgement level and Raft proposal timeout |
+| `delivery` | Time bucket, dispatch, in-flight, delete, and TTL sweep intervals |
+| `observability` | Log level and Prometheus listen address |
 
 Every value can be overridden with environment variables using the `FUTUREQ_` prefix, replacing dots with underscores:
 
 ```bash
-export FUTUREQ_STORAGE_PEBBLE_DATAPATH="/var/lib/futureq/data"
-export FUTUREQ_OBSERVABILITY_LOGGER_LEVEL="debug"
+export FUTUREQ_STORAGE_PEBBLE_DATADIR="/var/lib/futureq/data"
+export FUTUREQ_OBSERVABILITY_LOGGING_LEVEL="debug"
 ```
 
 ## API
@@ -143,7 +162,7 @@ FutureQ speaks gRPC; protobuf definitions live in [`futureq-io/protocol`](https:
 | `LeaveCluster`     | unary               | Gracefully remove a node from the cluster          |
 | `LeaveMetadata`    | unary               | Remove a node from the metadata group only         |
 
-Metrics are exposed at `observability.metrics.addr` (default `:9090`) in Prometheus format.
+Metrics are exposed at `observability.metrics.listen` (default `0.0.0.0:9090`) in Prometheus format.
 
 ## Project Layout
 
