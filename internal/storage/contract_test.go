@@ -62,7 +62,7 @@ func (s *DBContractSuite) TestGet_Set_RoundTrip() {
 // DRIFT NOTE: the contract in storage/contract.go says "Implementations must
 // map their own not-found sentinel to this error" (ErrNotFound). Bolt does
 // map bbolt's nil-return to ErrNotFound; Pebble does NOT — it returns
-// pebble.ErrNotFound directly. This is drift between the two engines: the
+// storage.ErrNotFound directly. This is drift between the two engines: the
 // callers of storage.DB cannot rely on errors.Is(err, storage.ErrNotFound)
 // unless Pebble's Get is patched. The test below enforces only that *some*
 // error is returned; engines are free to return either sentinel.

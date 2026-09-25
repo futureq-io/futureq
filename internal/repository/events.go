@@ -7,7 +7,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/cockroachdb/pebble/v2"
 	"github.com/futureq-io/futureq/internal/storage"
 	"github.com/futureq-io/futureq/pkg/utils"
 	storagepb "github.com/futureq-io/protocol/proto/go/storage"
@@ -41,7 +40,7 @@ func NewEventRepository(db storage.DB, logger *zap.Logger, bucketSize time.Durat
 	// Restore the durable last-id so a restarted node never reuses IDs.
 	val, closer, err := db.Get(LastIDKey)
 	if err != nil {
-		if !errors.Is(err, pebble.ErrNotFound) {
+		if !errors.Is(err, storage.ErrNotFound) {
 			return nil, err
 		}
 	} else {
