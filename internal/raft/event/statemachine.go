@@ -50,11 +50,11 @@ func NewEventStateMachineFactory(db storage.DB, repo *repository.EventRepository
 }
 
 func (s *EventStateMachine) Open(stopc <-chan struct{}) (uint64, error) {
-	index, err := readStoredUint64(s.db, appliedIndexKey)
+	index, err := s.readStoredUint64(appliedIndexKey)
 	if err != nil {
 		return 0, err
 	}
-	lastID, err := readStoredUint64(s.db, repository.LastIDKey)
+	lastID, err := s.readStoredUint64(repository.LastIDKey)
 	if err != nil {
 		return 0, err
 	}
@@ -64,8 +64,8 @@ func (s *EventStateMachine) Open(stopc <-chan struct{}) (uint64, error) {
 	return s.lastApplied, nil
 }
 
-func readStoredUint64(db storage.DB, key []byte) (uint64, error) {
-	val, closer, err := db.Get(key)
+func (s *EventStateMachine) readStoredUint64(key []byte) (uint64, error) {
+	val, closer, err := s.db.Get(key)
 	if errors.Is(err, storage.ErrNotFound) {
 		return 0, nil
 	}
@@ -309,14 +309,14 @@ func (s *EventStateMachine) RecoverFromSnapshot(r io.Reader, stopc <-chan struct
 		return err
 	}
 
-	index, err := readStoredUint64(s.db, appliedIndexKey)
+	index, err := s.readStoredUint64(appliedIndexKey)
 	if err != nil {
 		return err
 	}
 
 	// The snapshot carries last-id; the repo loaded before recovery, so
 	// observe it now.
-	lastID, err := readStoredUint64(s.db, repository.LastIDKey)
+	lastID, err := s.readStoredUint64(repository.LastIDKey)
 	if err != nil {
 		return err
 	}
