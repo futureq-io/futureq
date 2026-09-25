@@ -59,9 +59,18 @@ type StoreBatchItem struct {
 func MarshalStoreBatchCmd(items []StoreBatchItem) ([]byte, error) {
 	// Pre-calculate total size to do a single allocation.
 	size := 1 + 8 // cmdType + count
-	for _, it := range items {
+	for i, it := range items {
+		if len(it.Indexes) > int(^uint16(0)) {
+			return nil, fmt.Errorf("raft: item %d has %d indexes, max %d", i, len(it.Indexes), ^uint16(0))
+		}
+		if uint64(len(it.Msg)) > uint64(^uint32(0)) {
+			return nil, fmt.Errorf("raft: item %d message has %d bytes, max %d", i, len(it.Msg), ^uint32(0))
+		}
 		size += 8 + 8 + 8 + 2 // id + bucket + topicHash + numIdx
-		for _, idx := range it.Indexes {
+		for j, idx := range it.Indexes {
+			if len(idx) > int(^uint16(0)) {
+				return nil, fmt.Errorf("raft: item %d index %d has %d bytes, max %d", i, j, len(idx), ^uint16(0))
+			}
 			size += 2 + len(idx) // idxLen + data
 		}
 		size += 4 + len(it.Msg) // valLen + value
@@ -110,6 +119,10 @@ func UnmarshalStoreBatchCmd(data []byte) ([]StoreBatchItem, error) {
 	}
 
 	count := binary.BigEndian.Uint64(data[1:9])
+	// Each item needs at least its fixed fields and the message length.
+	if count > uint64((len(data)-9)/30) {
+		return nil, fmt.Errorf("raft: StoreBatchCmd too short for %d items", count)
+	}
 	items := make([]StoreBatchItem, 0, count)
 
 	pos := 9
@@ -126,7 +139,7 @@ func UnmarshalStoreBatchCmd(data []byte) ([]StoreBatchItem, error) {
 
 		numIdx := int(binary.BigEndian.Uint16(data[pos : pos+2]))
 		pos += 2
-		
+
 		indexes := make([][]byte, 0, numIdx)
 		for j := 0; j < numIdx; j++ {
 			if pos+2 > len(data) {
@@ -134,11 +147,11 @@ func UnmarshalStoreBatchCmd(data []byte) ([]StoreBatchItem, error) {
 			}
 			idxLen := int(binary.BigEndian.Uint16(data[pos : pos+2]))
 			pos += 2
-			
+
 			if pos+idxLen > len(data) {
 				return nil, fmt.Errorf("raft: StoreBatchCmd truncated at item %d index %d data", i, j)
 			}
-			indexes = append(indexes, data[pos : pos+idxLen])
+			indexes = append(indexes, data[pos:pos+idxLen])
 			pos += idxLen
 		}
 
@@ -162,6 +175,9 @@ func UnmarshalStoreBatchCmd(data []byte) ([]StoreBatchItem, error) {
 			Indexes:   indexes,
 			Msg:       value,
 		})
+	}
+	if pos != len(data) {
+		return nil, fmt.Errorf("raft: StoreBatchCmd has %d trailing bytes", len(data)-pos)
 	}
 
 	return items, nil
@@ -201,13 +217,17 @@ func UnmarshalDeleteBatchCmd(data []byte) ([][]byte, error) {
 	if CommandType(data[0]) != DeleteBatchCmd {
 		return nil, fmt.Errorf("raft: expected DeleteBatchCmd (1), got %d", data[0])
 	}
-	count := int(binary.BigEndian.Uint64(data[1:9]))
-	if len(data) < 9+count*24 {
+	count := binary.BigEndian.Uint64(data[1:9])
+	remaining := len(data) - 9
+	if count > uint64(remaining/24) {
 		return nil, fmt.Errorf("raft: DeleteBatchCmd too short for %d keys", count)
 	}
+	if uint64(remaining) != count*24 {
+		return nil, fmt.Errorf("raft: DeleteBatchCmd has %d trailing bytes", uint64(remaining)-count*24)
+	}
 
-	keys := make([][]byte, count)
-	for i := 0; i < count; i++ {
+	keys := make([][]byte, int(count))
+	for i := range keys {
 		start := 9 + i*24
 		keys[i] = data[start : start+24]
 	}

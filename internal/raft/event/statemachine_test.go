@@ -3,6 +3,9 @@ package raft
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
+	"io"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -135,15 +138,65 @@ func (s *EventStateMachineSuite) TestUpdate_EmptyCmd_Skipped() {
 	require.Equal(uint64(0), results[0].Result.Value)
 }
 
-func (s *EventStateMachineSuite) TestUpdate_UnknownCmd_ReturnsZero() {
+func (s *EventStateMachineSuite) TestUpdate_InvalidCommandAbortsWholeBatch() {
 	require := s.Require()
-
-	sm := s.newSM(nil)
-
-	entries := []statemachine.Entry{{Index: 1, Cmd: []byte{0xFF, 0x01}}}
-	results, err := sm.Update(entries)
+	var deleted [][]byte
+	sm := s.newSM(func(keys [][]byte) { deleted = append(deleted, keys...) })
+	store := func(id uint64) []byte {
+		cmd, err := MarshalStoreBatchCmd([]StoreBatchItem{{ID: id, Bucket: 1, TopicHash: 1, Msg: []byte("m")}})
+		require.NoError(err)
+		return cmd
+	}
+	_, err := sm.Update([]statemachine.Entry{{Index: 1, Cmd: store(1)}})
 	require.NoError(err)
-	require.Equal(uint64(0), results[0].Result.Value)
+
+	var storedKey []byte
+	require.NoError(s.db.Scan(nil, func(key, _ []byte) error {
+		if len(key) == 24 {
+			storedKey = append([]byte(nil), key...)
+		}
+		return nil
+	}))
+	require.Len(storedKey, 24)
+	deleteCmd, err := MarshalDeleteBatchCmd([][]byte{storedKey})
+	require.NoError(err)
+
+	for _, tc := range []struct {
+		name string
+		cmd  []byte
+	}{
+		{name: "truncated store", cmd: []byte{byte(StoreBatchCmd), 1}},
+		{name: "truncated delete", cmd: []byte{byte(DeleteBatchCmd), 1}},
+		{name: "unknown type", cmd: []byte{0xff, 1}},
+	} {
+		s.Run(tc.name, func() {
+			_, err := sm.Update([]statemachine.Entry{
+				{Index: 2, Cmd: store(2)},
+				{Index: 3, Cmd: deleteCmd},
+				{Index: 4, Cmd: tc.cmd},
+			})
+			require.Error(err)
+			require.Equal(uint64(1), sm.lastApplied)
+			require.Equal(uint64(1), sm.lastPersistedID)
+			require.Empty(deleted)
+
+			for _, key := range [][]byte{appliedIndexKey, repository.LastIDKey} {
+				value, closer, err := s.db.Get(key)
+				require.NoError(err)
+				require.Equal(uint64(1), binary.BigEndian.Uint64(value))
+				require.NoError(closer.Close())
+			}
+			var ids []uint64
+			require.NoError(s.db.Scan(nil, func(key, _ []byte) error {
+				if len(key) == 24 {
+					ids = append(ids, binary.BigEndian.Uint64(key[16:24]))
+				}
+				return nil
+			}))
+			require.Equal([]uint64{1}, ids)
+		})
+	}
+	require.Equal(uint64(2), s.repo.NextID())
 }
 
 // ─── Update: DeleteBatchCmd ───────────────────────────────────────────────────
@@ -254,6 +307,61 @@ func (s *EventStateMachineSuite) TestUpdate_MultipleEntries_AdvancesAppliedIndex
 	require.Equal(uint64(12), binary.BigEndian.Uint64(val))
 }
 
+func (s *EventStateMachineSuite) TestUpdate_OutOfOrderIDsKeepDurableMaximum() {
+	require := s.Require()
+	sm := s.newSM(nil)
+	store := func(id uint64) []byte {
+		cmd, err := MarshalStoreBatchCmd([]StoreBatchItem{{ID: id, Bucket: 1, TopicHash: 1, Msg: []byte("m")}})
+		require.NoError(err)
+		return cmd
+	}
+
+	_, err := sm.Update([]statemachine.Entry{
+		{Index: 1, Cmd: store(20)},
+		{Index: 2, Cmd: store(10)},
+	})
+	require.NoError(err)
+	_, err = sm.Update([]statemachine.Entry{{Index: 3, Cmd: store(9)}})
+	require.NoError(err)
+
+	val, closer, err := s.db.Get(repository.LastIDKey)
+	require.NoError(err)
+	require.Equal(uint64(20), binary.BigEndian.Uint64(val))
+	require.NoError(closer.Close())
+
+	restartedRepo, err := repository.NewEventRepository(s.db, zap.NewNop(), time.Second)
+	require.NoError(err)
+	restartedSM, ok := NewEventStateMachineFactory(s.db, restartedRepo, nil, zap.NewNop())(1, 1).(*EventStateMachine)
+	require.True(ok)
+	index, err := restartedSM.Open(nil)
+	require.NoError(err)
+	require.Equal(uint64(3), index)
+	require.Equal(uint64(20), restartedSM.lastPersistedID)
+	require.Equal(uint64(21), restartedRepo.NextID())
+}
+
+type failingCommitDB struct{ storage.DB }
+type failingCommitBatch struct{ storage.Batch }
+
+func (db failingCommitDB) NewBatch() storage.Batch {
+	return failingCommitBatch{Batch: db.DB.NewBatch()}
+}
+
+func (failingCommitBatch) Commit(storage.SyncMode) error { return errors.New("commit failed") }
+
+func (s *EventStateMachineSuite) TestUpdate_FailedCommitDoesNotAdvanceWatermarks() {
+	require := s.Require()
+	db := failingCommitDB{DB: s.db}
+	sm := &EventStateMachine{db: db, repo: s.repo}
+	cmd, err := MarshalStoreBatchCmd([]StoreBatchItem{{ID: 20, Bucket: 1, TopicHash: 1, Msg: []byte("m")}})
+	require.NoError(err)
+	_, err = sm.Update([]statemachine.Entry{{Index: 5, Cmd: cmd}})
+	require.ErrorContains(err, "commit failed")
+	require.Zero(sm.lastApplied)
+	require.Zero(sm.lastPersistedID)
+	require.Equal(uint64(1), s.repo.NextID())
+}
+
 // ─── Sync / Lookup / PrepareSnapshot ─────────────────────────────────────────
 
 func (s *EventStateMachineSuite) TestSync_NoError() {
@@ -272,13 +380,16 @@ func (s *EventStateMachineSuite) TestLookup_ReturnsNil() {
 	require.Nil(result)
 }
 
-func (s *EventStateMachineSuite) TestPrepareSnapshot_ReturnsLastApplied() {
+func (s *EventStateMachineSuite) TestPrepareSnapshot_CapturesLastApplied() {
 	require := s.Require()
 
 	sm := s.newSM(nil)
-	result, err := sm.PrepareSnapshot()
+	ctx, err := sm.PrepareSnapshot()
 	require.NoError(err)
-	require.Equal(uint64(0), result) // fresh SM
+	snapshot, ok := ctx.(*eventSnapshot)
+	require.True(ok)
+	require.Equal(uint64(0), snapshot.index)
+	require.NoError(snapshot.iter.Close())
 }
 
 // ─── Snapshot round-trip ──────────────────────────────────────────────────────
@@ -300,7 +411,9 @@ func (s *EventStateMachineSuite) TestSnapshot_RoundTrip() {
 
 	// Save snapshot.
 	var buf bytes.Buffer
-	err = sm.SaveSnapshot(nil, &buf, nil)
+	ctx, err := sm.PrepareSnapshot()
+	require.NoError(err)
+	err = sm.SaveSnapshot(ctx, &buf, nil)
 	require.NoError(err)
 	require.NotZero(buf.Len(), "snapshot must not be empty")
 
@@ -344,6 +457,137 @@ func (s *EventStateMachineSuite) TestSnapshot_RoundTrip() {
 	// recovered SM was constructed before recovery, so recovery itself must
 	// have observed the restored last-id. A new ID must not collide with 1.
 	require.Equal(uint64(2), repo2.NextID())
+}
+
+func TestSnapshot_PrepareFreezesAppliedState(t *testing.T) {
+	for _, engine := range []string{"pebble", "bolt"} {
+		t.Run(engine, func(t *testing.T) {
+			newDB := func() storage.DB {
+				t.Helper()
+				if engine == "bolt" {
+					db, err := storage.NewBoltDB(config.Bolt{DataPath: filepath.Join(t.TempDir(), "events.db")})
+					if err != nil {
+						t.Fatal(err)
+					}
+					return db
+				}
+				db, err := storage.NewPebble(config.Pebble{DataPath: ""}, zap.NewNop())
+				if err != nil {
+					t.Fatal(err)
+				}
+				return db
+			}
+			db := newDB()
+			defer db.Close()
+			repo, err := repository.NewEventRepository(db, zap.NewNop(), time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			sm := &EventStateMachine{db: db, repo: repo}
+			store := func(index, id uint64) {
+				t.Helper()
+				cmd, err := MarshalStoreBatchCmd([]StoreBatchItem{{ID: id, Bucket: 1, TopicHash: 1, Msg: []byte{byte(id)}}})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := sm.Update([]statemachine.Entry{{Index: index, Cmd: cmd}}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			store(5, 1)
+			ctx, err := sm.PrepareSnapshot()
+			if err != nil {
+				t.Fatal(err)
+			}
+			cmd, err := MarshalStoreBatchCmd([]StoreBatchItem{{ID: 2, Bucket: 1, TopicHash: 1, Msg: []byte{2}}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			updateDone := make(chan error, 1)
+			go func() {
+				_, err := sm.Update([]statemachine.Entry{{Index: 6, Cmd: cmd}})
+				updateDone <- err
+			}()
+			if engine == "pebble" {
+				if err := <-updateDone; err != nil {
+					t.Fatal(err)
+				}
+			}
+			var snapshot bytes.Buffer
+			if err := sm.SaveSnapshot(ctx, &snapshot, nil); err != nil {
+				t.Fatal(err)
+			}
+			if engine == "bolt" {
+				if err := <-updateDone; err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			recoveredDB := newDB()
+			defer recoveredDB.Close()
+			recoveredRepo, err := repository.NewEventRepository(recoveredDB, zap.NewNop(), time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			recovered := &EventStateMachine{db: recoveredDB, repo: recoveredRepo}
+			if err := recovered.RecoverFromSnapshot(&snapshot, nil); err != nil {
+				t.Fatal(err)
+			}
+			if recovered.lastApplied != 5 || recovered.lastPersistedID != 1 {
+				t.Fatalf("recovered watermarks: index=%d id=%d, want 5 and 1", recovered.lastApplied, recovered.lastPersistedID)
+			}
+			var foundIDs []uint64
+			if err := recoveredDB.Scan(nil, func(key, _ []byte) error {
+				if len(key) == 24 {
+					foundIDs = append(foundIDs, binary.BigEndian.Uint64(key[16:24]))
+				}
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if len(foundIDs) != 1 || foundIDs[0] != 1 {
+				t.Fatalf("recovered event IDs = %v, want [1]", foundIDs)
+			}
+		})
+	}
+}
+
+type trackingIterator struct {
+	storage.Iterator
+	closed bool
+}
+
+func (it *trackingIterator) Close() error {
+	it.closed = true
+	return it.Iterator.Close()
+}
+
+type failingWriter struct{}
+
+func (failingWriter) Write([]byte) (int, error) { return 0, io.ErrClosedPipe }
+
+func (s *EventStateMachineSuite) TestSaveSnapshot_ClosesIteratorOnFailure() {
+	require := s.Require()
+	sm := s.newSM(nil)
+	_, err := sm.Update([]statemachine.Entry{{Index: 1}})
+	require.NoError(err)
+	ctx, err := sm.PrepareSnapshot()
+	require.NoError(err)
+	snapshot := ctx.(*eventSnapshot)
+	tracked := &trackingIterator{Iterator: snapshot.iter}
+	snapshot.iter = tracked
+	require.ErrorIs(sm.SaveSnapshot(snapshot, failingWriter{}, nil), io.ErrClosedPipe)
+	require.True(tracked.closed)
+
+	ctx, err = sm.PrepareSnapshot()
+	require.NoError(err)
+	snapshot = ctx.(*eventSnapshot)
+	tracked = &trackingIterator{Iterator: snapshot.iter}
+	snapshot.iter = tracked
+	stop := make(chan struct{})
+	close(stop)
+	require.ErrorIs(sm.SaveSnapshot(snapshot, io.Discard, stop), statemachine.ErrSnapshotStopped)
+	require.True(tracked.closed)
 }
 
 // ─── Close ────────────────────────────────────────────────────────────────────

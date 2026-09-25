@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"encoding/binary"
 	"testing"
 
 	"github.com/stretchr/testify/suite"
@@ -113,6 +114,39 @@ func (s *CommandsSuite) TestStoreBatchCmd_TruncatedMsg_Fails() {
 	require.Error(err)
 }
 
+func (s *CommandsSuite) TestStoreBatchCmd_ImpossibleCountAndTrailingDataFail() {
+	require := s.Require()
+	cmd := make([]byte, 9)
+	cmd[0] = byte(StoreBatchCmd)
+	binary.BigEndian.PutUint64(cmd[1:], ^uint64(0))
+	_, err := UnmarshalStoreBatchCmd(cmd)
+	require.ErrorContains(err, "too short")
+
+	valid, err := MarshalStoreBatchCmd([]StoreBatchItem{{ID: 1, Msg: []byte("m")}})
+	require.NoError(err)
+	_, err = UnmarshalStoreBatchCmd(append(valid, 0))
+	require.ErrorContains(err, "trailing bytes")
+}
+
+func (s *CommandsSuite) TestStoreBatchCmd_IndexLengthLimit() {
+	require := s.Require()
+	maxIndex := make([]byte, int(^uint16(0)))
+	cmd, err := MarshalStoreBatchCmd([]StoreBatchItem{{Indexes: [][]byte{maxIndex}, Msg: []byte("m")}})
+	require.NoError(err)
+	items, err := UnmarshalStoreBatchCmd(cmd)
+	require.NoError(err)
+	require.Len(items[0].Indexes[0], len(maxIndex))
+
+	_, err = MarshalStoreBatchCmd([]StoreBatchItem{{Indexes: [][]byte{make([]byte, len(maxIndex)+1)}}})
+	require.ErrorContains(err, "index 0")
+}
+
+func (s *CommandsSuite) TestStoreBatchCmd_IndexCountLimit() {
+	require := s.Require()
+	_, err := MarshalStoreBatchCmd([]StoreBatchItem{{Indexes: make([][]byte, int(^uint16(0))+1)}})
+	require.ErrorContains(err, "indexes")
+}
+
 // ─── DeleteBatchCmd round-trips ──────────────────────────────────────────────
 
 func (s *CommandsSuite) TestDeleteBatchCmd_BasicRoundTrip() {
@@ -180,6 +214,20 @@ func (s *CommandsSuite) TestDeleteBatchCmd_TruncatedKeyData_Fails() {
 	// Cut mid-key.
 	_, err := UnmarshalDeleteBatchCmd(cmd[:len(cmd)-10])
 	require.Error(err)
+}
+
+func (s *CommandsSuite) TestDeleteBatchCmd_ImpossibleCountAndTrailingDataFail() {
+	require := s.Require()
+	cmd := make([]byte, 9)
+	cmd[0] = byte(DeleteBatchCmd)
+	binary.BigEndian.PutUint64(cmd[1:], ^uint64(0))
+	_, err := UnmarshalDeleteBatchCmd(cmd)
+	require.ErrorContains(err, "too short")
+
+	valid, err := MarshalDeleteBatchCmd([][]byte{make([]byte, 24)})
+	require.NoError(err)
+	_, err = UnmarshalDeleteBatchCmd(append(valid, 0))
+	require.ErrorContains(err, "trailing bytes")
 }
 
 // TestStoreBatchCmd_DifferentIDsProduceDifferentBytes locks the invariant
