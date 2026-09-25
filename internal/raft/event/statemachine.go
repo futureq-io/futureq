@@ -7,7 +7,6 @@ import (
 	"io"
 	"log"
 
-	"github.com/cockroachdb/pebble/v2"
 	"github.com/futureq-io/futureq/internal/repository"
 	"github.com/futureq-io/futureq/internal/storage"
 	"github.com/lni/dragonboat/v4/statemachine"
@@ -52,7 +51,7 @@ func (s *EventStateMachine) Open(stopc <-chan struct{}) (uint64, error) {
 	val, closer, err := s.db.Get(appliedIndexKey)
 
 	if err != nil {
-		if errors.Is(err, pebble.ErrNotFound) {
+		if errors.Is(err, storage.ErrNotFound) {
 			s.lastApplied = 0
 			return 0, nil
 		}
@@ -257,7 +256,7 @@ func (s *EventStateMachine) RecoverFromSnapshot(r io.Reader, stopc <-chan struct
 	if err == nil {
 		s.lastApplied = binary.BigEndian.Uint64(val)
 		defer closer.Close() //nolint:errcheck
-	} else if !errors.Is(err, pebble.ErrNotFound) {
+	} else if !errors.Is(err, storage.ErrNotFound) {
 		return err
 	}
 
@@ -267,7 +266,7 @@ func (s *EventStateMachine) RecoverFromSnapshot(r io.Reader, stopc <-chan struct
 	if err == nil {
 		s.repo.ObserveID(binary.BigEndian.Uint64(lv))
 		lCloser.Close() //nolint:errcheck
-	} else if !errors.Is(err, pebble.ErrNotFound) {
+	} else if !errors.Is(err, storage.ErrNotFound) {
 		return err
 	}
 

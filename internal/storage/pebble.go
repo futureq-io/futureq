@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"errors"
 	"fmt"
 	"io"
 
@@ -58,7 +59,12 @@ func NewPebble(cfg config.Pebble, logger *zap.Logger) (*Pebble, error) {
 // ── storage.DB implementation ─────────────────────────────────────────────────
 
 func (p *Pebble) Get(key []byte) ([]byte, io.Closer, error) {
-	return p.db.Get(key)
+	val, closer, err := p.db.Get(key)
+	if errors.Is(err, pebble.ErrNotFound) {
+		return val, closer, ErrNotFound
+	}
+
+	return val, closer, err
 }
 
 func (p *Pebble) NewBatch() Batch {
