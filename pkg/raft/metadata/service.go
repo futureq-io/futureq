@@ -2,6 +2,7 @@ package metadata
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"time"
 
@@ -82,9 +83,6 @@ func (s *Service) RegisterNodeAddr(ctx context.Context, nodeID uint64, grpcAddr 
 // ChangeConsumer records a group subscription before it can receive messages.
 // The command starts a rebalance barrier on every replica.
 func (s *Service) ChangeConsumer(ctx context.Context, shardID uint64, topic, group string, member ConsumerMember, add bool) error {
-	if group == "" {
-		return nil
-	}
 	membership, err := s.nh.SyncGetShardMembership(ctx, shardID)
 	if err != nil {
 		return err
@@ -95,6 +93,18 @@ func (s *Service) ChangeConsumer(ctx context.Context, shardID uint64, topic, gro
 	}
 	for id := range membership.NonVotings {
 		required = append(required, id)
+	}
+	if add {
+		memberPresent := false
+		for _, id := range required {
+			if id == member.NodeID {
+				memberPresent = true
+				break
+			}
+		}
+		if !memberPresent {
+			return fmt.Errorf("node %d is not an event shard replica", member.NodeID)
+		}
 	}
 	op := "remove"
 	if add {

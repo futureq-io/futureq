@@ -17,6 +17,11 @@ const (
 	// DeleteBatchCmd atomically deletes a batch of message keys from Pebble.
 	// Used for Raft-replicated ACK-driven deletions and TTL expirations.
 	DeleteBatchCmd
+	// PrepareDeliveryCmd freezes independent fan-out recipients before sending.
+	PrepareDeliveryCmd
+	// AckDeliveryBatchCmd records recipient ACKs, deleting the payload only
+	// when all independent recipients have completed.
+	AckDeliveryBatchCmd
 )
 
 // StoreBatchItem is the minimal per-message metadata carried in a StoreBatchCmd.

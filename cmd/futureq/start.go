@@ -20,6 +20,7 @@ import (
 	"github.com/futureq-io/futureq/internal/metrics"
 	"github.com/futureq-io/futureq/pkg/log"
 	pb "github.com/futureq-io/protocol/proto/go"
+	"github.com/lni/dragonboat/v4/statemachine"
 )
 
 var joinSeeds []string
@@ -112,18 +113,39 @@ func startRun(cmd *cobra.Command, _ []string) {
 		deleteBackend = dispatcher.NewDirectDeleteBackend(a.DB, logger)
 	}
 
-	deleter := dispatcher.NewDeleter(deleteBackend, deleteInterval, logger)
+	var proposeDelivery func([]byte) (statemachine.Result, error)
+	recipients := hub.LocalDeliveryRecipients
+	if cfg.Cluster.Enabled {
+		recipients = func(topic string) (uint64, []string, bool) {
+			return a.MetadataSM.DeliveryRecipients(topic)
+		}
+		proposeDelivery = func(cmd []byte) (statemachine.Result, error) {
+			ctx, cancel := context.WithTimeout(a.Ctx, cfg.Publish.ProposalTimeout)
+			defer cancel()
+			return a.NodeHost.SyncPropose(ctx, a.NodeHost.GetNoOPSession(cfg.Cluster.ShardID), cmd)
+		}
+	}
+	ledger := dispatcher.NewDeliveryLedger(a.DB, recipients, deleteBackend, proposeDelivery)
+	deleter := dispatcher.NewDeleter(ledger, deleteInterval, logger)
+	deleter.AcknowledgeBatch = ledger.Acknowledge
 	disp := dispatcher.NewDispatcher(
 		a.DB, hub, deleter,
 		dispatchInterval, inFlightTimeout,
 		wakeCh, logger,
 	)
+	disp.PrepareDelivery = ledger.Prepare
+	ledger.OnDelete = func(keys [][]byte) {
+		disp.RemoveInFlightBatch(keys)
+		hub.RemoveDeletedBatch(keys)
+	}
 
 	// Wire the OnDelete callback so the deleter notifies the dispatcher when
 	// a delete completes — removes the key from the in-flight tracker.
 	deleter.OnDelete = func(key []byte) {
 		disp.RemoveInFlight(key)
+		hub.RemoveDeletedBatch([][]byte{key})
 	}
+	hub.OnNack = disp.RemoveInFlight
 
 	// ── Prometheus metrics server ──────────────────────────────────────────────
 	// Start before Raft so the liveness/readiness probes have something to hit
@@ -140,9 +162,28 @@ func startRun(cmd *cobra.Command, _ []string) {
 	// is committed. We wire it to the dispatcher so in-flight entries are
 	// removed immediately without waiting for the next scan pass.
 	if cfg.Cluster.Enabled {
-		if err := a.StartRaft(joining, disp.RemoveInFlightBatch); err != nil {
+		if err := a.StartRaft(joining, func(keys [][]byte) {
+			disp.RemoveInFlightBatch(keys)
+			hub.RemoveDeletedBatch(keys)
+		}); err != nil {
 			logger.Fatal("failed to start raft", zap.Error(err))
 		}
+		hub.SetGroupMembership(a.MetadataSM.ConsumerGroup)
+		hub.SetDeliveryFence(a.MetadataSM.ConsumerVersion, inFlightTimeout)
+		a.MetadataSM.SetConsumerBarrier(hub.WithRebalanceBarrier)
+		disp.ReadBarrier = dispatcher.NewConsumerReadBarrier(a.Ctx, a.NodeHost, a.MetadataSM, hub, cfg.Cluster.ShardID)
+		// Clear subscriptions from an earlier process before this node serves
+		// new streams. A crash cannot run the stream's unregister defer.
+		ctx, cancel := context.WithTimeout(a.Ctx, 10*time.Second)
+		if err := a.MetadataSvc.ReconcileNodeConsumers(ctx, cfg.Cluster.ShardID, cfg.Cluster.NodeID, nil); err != nil {
+			logger.Warn("initial consumer reconciliation failed", zap.Error(err))
+		}
+		cancel()
+		a.RegisterComponentWithShutdown()
+		go func() {
+			defer a.ComponentShutdownDone()
+			consumerMetadataLoop(a.Ctx, a, hub, logger)
+		}()
 	}
 
 	// ── TTL Janitor ───────────────────────────────────────────────────────────
@@ -176,6 +217,14 @@ func startRun(cmd *cobra.Command, _ []string) {
 	if err := a.WithGracefulShutdown(); err != nil {
 		logger.Fatal("failed to graceful shutdown", zap.Error(err))
 	}
+}
+
+// consumerMetadataLoop drains deliveries, reconciles subscriptions, and fences
+// unavailable replicas after their bounded delivery authorization expires.
+func consumerMetadataLoop(ctx context.Context, a *app.App, hub *dispatcher.Hub, logger *zap.Logger) {
+	coordinator := dispatcher.NewConsumerCoordinator(hub, a.MetadataSM, a.MetadataSvc,
+		a.Config().Cluster.ShardID, a.Config().Cluster.NodeID, a.Config().Delivery.InFlightTimeout, logger)
+	coordinator.Run(ctx)
 }
 
 // joinCluster contacts each seed in order until one accepts this node's

@@ -3,7 +3,6 @@ package metadata
 import (
 	"encoding/json"
 	"io"
-	"slices"
 	"sort"
 	"sync"
 
@@ -25,7 +24,7 @@ type MetadataStateMachine struct {
 	// consumerBarrier excludes a local delivery while membership changes.
 	// Set once during startup, before subscriptions are accepted.
 	consumerBarrier func(func())
-	logger    *zap.Logger
+	logger          *zap.Logger
 }
 
 // NewMetadataStateMachineFactory returns the factory function that Dragonboat
@@ -64,10 +63,7 @@ func (s *MetadataStateMachine) Update(entry statemachine.Entry) (statemachine.Re
 				s.topology.Epoch = topo.Epoch
 			}
 			if len(s.consumers.Groups) > 0 {
-				required := consumerNodes(topo)
-				if !slices.Equal(required, s.consumers.Required) {
-					s.consumers.startRebalance(required)
-				}
+				s.consumers.applyTopology(consumerNodes(topo))
 			}
 		})
 
@@ -104,6 +100,18 @@ func (s *MetadataStateMachine) Update(entry statemachine.Entry) (statemachine.Re
 		s.mu.Lock()
 		s.consumers.acknowledge(ack)
 		s.mu.Unlock()
+		return statemachine.Result{Value: 1}, nil
+
+	case ConsumerFenceCmd:
+		var ack consumerAck
+		if err := json.Unmarshal(entry.Cmd[1:], &ack); err != nil {
+			return statemachine.Result{}, err
+		}
+		s.withConsumerBarrier(func() {
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			s.consumers.fence(ack.Epoch)
+		})
 		return statemachine.Result{Value: 1}, nil
 
 	case RegisterNodeAddrCmd:
@@ -316,6 +324,12 @@ func (s *MetadataStateMachine) SaveSnapshot(w io.Writer, _ statemachine.ISnapsho
 
 // RecoverFromSnapshot rebuilds the in-memory state from a snapshot reader.
 func (s *MetadataStateMachine) RecoverFromSnapshot(r io.Reader, _ []statemachine.SnapshotFile, _ <-chan struct{}) error {
+	var result error
+	s.withConsumerBarrier(func() { result = s.recoverSnapshot(r) })
+	return result
+}
+
+func (s *MetadataStateMachine) recoverSnapshot(r io.Reader) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 

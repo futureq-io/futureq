@@ -9,6 +9,7 @@ import (
 
 	"github.com/futureq-io/futureq/internal/repository"
 	"github.com/futureq-io/futureq/internal/storage"
+	"github.com/futureq-io/futureq/pkg/utils"
 	"github.com/lni/dragonboat/v4/statemachine"
 	"go.uber.org/zap"
 )
@@ -90,7 +91,7 @@ func (s *EventStateMachine) readStoredUint64(key []byte) (uint64, error) {
 // the end of Update, so returning an error means nothing partial is written.
 // A replica that cannot write must stop (Dragonboat halts it on Update error)
 // rather than silently diverge with a watermark lagging its stored keys.
-func (s *EventStateMachine) applyEntry(batch storage.Batch, cmd []byte) (statemachine.Result, [][]byte, uint64, error) {
+func (s *EventStateMachine) applyEntry(batch storage.Batch, delivery *DeliveryBatch, cmd []byte) (statemachine.Result, [][]byte, uint64, error) {
 	if len(cmd) == 0 {
 		return statemachine.Result{Value: 0}, nil, 0, nil
 	}
@@ -106,6 +107,7 @@ func (s *EventStateMachine) applyEntry(batch storage.Batch, cmd []byte) (statema
 			if _, err := s.repo.StoreRawWithBatch(batch, it.ID, it.Bucket, it.TopicHash, it.Indexes, it.Msg); err != nil {
 				return statemachine.Result{}, nil, 0, fmt.Errorf("raft: StoreRawWithBatch: %w", err)
 			}
+			delivery.ObserveStore(utils.EventKey(it.Bucket, it.TopicHash, it.ID))
 			if it.ID > maxID {
 				maxID = it.ID
 			}
@@ -121,12 +123,16 @@ func (s *EventStateMachine) applyEntry(batch storage.Batch, cmd []byte) (statema
 		for _, k := range keys {
 			kCopy := make([]byte, len(k))
 			copy(kCopy, k)
-			if err := batch.Delete(kCopy); err != nil {
+			if err := delivery.Delete(kCopy); err != nil {
 				return statemachine.Result{}, nil, 0, fmt.Errorf("raft: batch.Delete: %w", err)
 			}
 			deleted = append(deleted, kCopy)
 		}
 		return statemachine.Result{Value: uint64(len(deleted))}, deleted, 0, nil
+
+	case PrepareDeliveryCmd, AckDeliveryBatchCmd:
+		result, deleted, err := delivery.Apply(cmd)
+		return result, deleted, 0, err
 
 	default:
 		return statemachine.Result{}, nil, 0, fmt.Errorf("raft: unknown command type: %d", cmd[0])
@@ -135,6 +141,7 @@ func (s *EventStateMachine) applyEntry(batch storage.Batch, cmd []byte) (statema
 
 func (s *EventStateMachine) Update(entries []statemachine.Entry) ([]statemachine.Entry, error) {
 	batch := s.db.NewBatch()
+	delivery := NewDeliveryBatch(s.db, batch)
 
 	defer batch.Close() //nolint:errcheck
 
@@ -143,7 +150,7 @@ func (s *EventStateMachine) Update(entries []statemachine.Entry) ([]statemachine
 	lastID := s.lastPersistedID
 
 	for i := range entries {
-		result, deletedKeys, entryMaxID, err := s.applyEntry(batch, entries[i].Cmd)
+		result, deletedKeys, entryMaxID, err := s.applyEntry(batch, delivery, entries[i].Cmd)
 		if err != nil {
 			return nil, err
 		}

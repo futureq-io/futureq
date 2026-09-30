@@ -65,7 +65,10 @@ func (b *directDeleteBackend) DeleteKeys(keys [][]byte) error {
 
 	for _, key := range keys {
 		if err := batch.Delete(key); err != nil {
-			b.logger.Error("failed to mark key for deletion", zap.Error(err))
+			return err
+		}
+		if err := batch.Delete(raft.DeliveryStateKey(key)); err != nil {
+			return err
 		}
 	}
 
@@ -74,12 +77,9 @@ func (b *directDeleteBackend) DeleteKeys(keys [][]byte) error {
 
 // ─── Deleter ─────────────────────────────────────────────────────────────────
 
-// Deleter accumulates acknowledged-message keys and periodically flushes them
-// as a single batch through the configured DeleteBackend.
-//
-// Routing deletions through Raft ensures that all replicas remove acknowledged
-// messages atomically, preventing a new leader from re-dispatching a message
-// that was already acknowledged before a failover.
+// Deleter batches independent recipient ACKs and explicit/TTL deletions.
+// Recipient ACKs retain the shared payload until all required interests finish.
+// Failed proposals are retried; a crash before commit may cause redelivery.
 type Deleter struct {
 	backend  DeleteBackend
 	logger   *zap.Logger
@@ -87,6 +87,10 @@ type Deleter struct {
 
 	mu      sync.Mutex
 	pending [][]byte
+	acks    []raft.DeliveryAck
+	// AcknowledgeBatch persists independent recipient completions. It deletes
+	// a shared payload only after every required recipient has ACKed.
+	AcknowledgeBatch func([]raft.DeliveryAck) error
 
 	// OnDelete is called after keys are successfully deleted, with copies of
 	// each key. Used to remove entries from the dispatcher's in-flight map.
@@ -114,6 +118,18 @@ func (d *Deleter) MarkDeleted(key []byte) {
 	d.mu.Unlock()
 }
 
+// MarkAcknowledged releases local consumer tracking immediately; persistence
+// and retries happen asynchronously, independently of the rebalance drain.
+func (d *Deleter) MarkAcknowledged(key []byte, recipient string) {
+	if d.AcknowledgeBatch == nil {
+		d.MarkDeleted(key)
+		return
+	}
+	d.mu.Lock()
+	d.acks = append(d.acks, raft.DeliveryAck{Key: append([]byte(nil), key...), Recipient: recipient})
+	d.mu.Unlock()
+}
+
 // Run starts the batched delete loop. It blocks until ctx is cancelled.
 func (d *Deleter) Run(ctx context.Context) {
 	ticker := time.NewTicker(d.interval)
@@ -133,6 +149,19 @@ func (d *Deleter) Run(ctx context.Context) {
 // flush drains the pending queue and deletes the accumulated keys via the
 // configured backend. On success, invokes the OnDelete callback for each key.
 func (d *Deleter) flush() {
+	d.mu.Lock()
+	acks := d.acks
+	d.acks = nil
+	d.mu.Unlock()
+	if len(acks) > 0 {
+		if err := d.AcknowledgeBatch(acks); err != nil {
+			d.logger.Error("failed to persist recipient ACKs", zap.Error(err))
+			metrics.DeleteFailuresTotal.Inc()
+			d.mu.Lock()
+			d.acks = append(acks, d.acks...)
+			d.mu.Unlock()
+		}
+	}
 	d.mu.Lock()
 	if len(d.pending) == 0 {
 		d.mu.Unlock()

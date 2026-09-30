@@ -29,6 +29,9 @@ const (
 	// dispatching with the previous assignment.
 	ConsumerChangeCmd
 	ConsumerAckCmd
+	// ConsumerFenceCmd activates a drained assignment without unavailable
+	// replicas, after their bounded delivery permits have expired.
+	ConsumerFenceCmd
 )
 
 // ShardTopology describes the current state of a single Raft shard.

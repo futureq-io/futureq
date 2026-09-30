@@ -10,6 +10,7 @@ import (
 
 	"github.com/futureq-io/futureq/internal/app"
 	"github.com/futureq-io/futureq/internal/metrics"
+	raft "github.com/futureq-io/futureq/internal/raft/event"
 	"github.com/futureq-io/futureq/internal/storage"
 
 	"github.com/futureq-io/futureq/pkg/utils"
@@ -42,6 +43,9 @@ type Dispatcher struct {
 	inFlightTimeout time.Duration
 	wakeCh          chan struct{}
 	inFlight        sync.Map // key: string(pebbleKey) → *inFlightEntry
+	// Installed before Run. Cluster reads also refresh the bounded metadata permit.
+	ReadBarrier     func() error
+	PrepareDelivery func(string, []byte) (*raft.DeliveryState, error)
 }
 
 // NewDispatcher constructs a Dispatcher.
@@ -54,6 +58,7 @@ func NewDispatcher(
 	wakeCh chan struct{},
 	logger *zap.Logger,
 ) *Dispatcher {
+	hub.SetDeliveryTimeout(inFlightTimeout)
 	return &Dispatcher{
 		db:              db,
 		hub:             hub,
@@ -114,13 +119,24 @@ func (d *Dispatcher) Run(ctx context.Context) {
 // dispatchAll performs one full dispatch pass across all active topics.
 // Returns the total number of messages dispatched.
 func (d *Dispatcher) dispatchAll() int {
+	d.hub.ExpireInFlight(time.Now())
 	if !d.hub.HasConsumers() {
 		return 0
 	}
 
-	// In Raft mode, only the leader dispatches messages.
-	if !d.isLeader() {
-		return 0
+	// A follower must apply committed writes and deletes before reading its
+	// local store. SyncRead is a linearizable Raft read barrier.
+	if d.ReadBarrier != nil {
+		if err := d.ReadBarrier(); err != nil {
+			return 0
+		}
+	} else if app.A != nil && app.A.NodeHost != nil {
+		ctx, cancel := context.WithTimeout(app.A.Ctx, 2*time.Second)
+		_, err := app.A.NodeHost.SyncRead(ctx, app.A.Config().Cluster.ShardID, nil)
+		cancel()
+		if err != nil {
+			return 0
+		}
 	}
 
 	activeTopics := d.hub.ActiveTopics()
@@ -140,20 +156,6 @@ func (d *Dispatcher) dispatchAll() int {
 	metrics.DispatchPassDurationMs.Observe(float64(time.Since(start).Milliseconds()))
 
 	return totalDispatched
-}
-
-// isLeader returns true if this node should dispatch messages.
-// In standalone mode (no Raft), always returns true.
-func (d *Dispatcher) isLeader() bool {
-	if app.A.NodeHost == nil {
-		return true
-	}
-	shardID := app.A.Config().Cluster.ShardID
-	leaderID, _, valid, err := app.A.NodeHost.GetLeaderID(shardID)
-	if err != nil || !valid {
-		return false
-	}
-	return leaderID == app.A.Config().Cluster.NodeID
 }
 
 // dispatchTopic scans a single topic's key range and dispatches due messages.
@@ -177,6 +179,9 @@ func (d *Dispatcher) dispatchTopic(topic string, nowMs int64) int {
 		LowerBound: utils.TopicLowerBound(topicHash),
 		UpperBound: utils.DueUpperBound(topicHash, nowBucket),
 	}, func(key, val []byte) error {
+		if len(key) != 24 {
+			return nil // receipt metadata and secondary indexes are not events
+		}
 		// Check in-flight status.
 		if d.isInFlight(key) {
 			return nil
@@ -211,7 +216,19 @@ func (d *Dispatcher) dispatchTopic(topic string, nowMs int64) int {
 		}
 
 		// Dispatch to all eligible consumers on this topic.
-		sentTo := d.hub.DispatchToTopic(topic, qMsg, keyCopy)
+		var manifest *raft.DeliveryState
+		if d.PrepareDelivery != nil {
+			var err error
+			manifest, err = d.PrepareDelivery(topic, keyCopy)
+			if err != nil {
+				d.logger.Warn("failed to prepare delivery", zap.Error(err))
+				return nil
+			}
+			if manifest == nil {
+				return nil // no active assignment or payload already deleted
+			}
+		}
+		sentTo := d.hub.DispatchPrepared(topic, qMsg, keyCopy, manifest)
 		if len(sentTo) > 0 {
 			// Track in-flight for timeout-based redelivery.
 			d.inFlight.Store(string(keyCopy), &inFlightEntry{
@@ -281,6 +298,7 @@ func (d *Dispatcher) isInFlight(key []byte) bool {
 
 	// Timed out — allow re-dispatch.
 	d.inFlight.Delete(string(key))
+	d.hub.RemoveDeletedBatch([][]byte{key})
 	return false
 }
 
