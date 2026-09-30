@@ -79,6 +79,64 @@ func (s *Service) RegisterNodeAddr(ctx context.Context, nodeID uint64, grpcAddr 
 	return nil
 }
 
+// ChangeConsumer records a group subscription before it can receive messages.
+// The command starts a rebalance barrier on every replica.
+func (s *Service) ChangeConsumer(ctx context.Context, shardID uint64, topic, group string, member ConsumerMember, add bool) error {
+	if group == "" {
+		return nil
+	}
+	membership, err := s.nh.SyncGetShardMembership(ctx, shardID)
+	if err != nil {
+		return err
+	}
+	required := make([]uint64, 0, len(membership.Nodes)+len(membership.NonVotings))
+	for id := range membership.Nodes {
+		required = append(required, id)
+	}
+	for id := range membership.NonVotings {
+		required = append(required, id)
+	}
+	op := "remove"
+	if add {
+		op = "add"
+	}
+	cmd, err := marshalConsumerChange(consumerChange{Operation: op, Topic: topic, Group: group, Member: member, Required: required})
+	if err != nil {
+		return err
+	}
+	return s.propose(ctx, cmd)
+}
+
+// ReconcileNodeConsumers removes subscriptions orphaned by a lost stream or
+// process restart. It is safe to propose repeatedly; unchanged state is a no-op.
+func (s *Service) ReconcileNodeConsumers(ctx context.Context, shardID, nodeID uint64, ids []string) error {
+	membership, err := s.nh.SyncGetShardMembership(ctx, shardID)
+	if err != nil {
+		return err
+	}
+	required := make([]uint64, 0, len(membership.Nodes)+len(membership.NonVotings))
+	for id := range membership.Nodes {
+		required = append(required, id)
+	}
+	for id := range membership.NonVotings {
+		required = append(required, id)
+	}
+	cmd, err := marshalConsumerChange(consumerChange{Operation: "reconcile", NodeID: nodeID, LocalIDs: ids, Required: required})
+	if err != nil {
+		return err
+	}
+	return s.propose(ctx, cmd)
+}
+
+// AcknowledgeConsumers confirms this replica has applied the pending freeze.
+func (s *Service) AcknowledgeConsumers(ctx context.Context, epoch, nodeID uint64) error {
+	cmd, err := marshalConsumerAck(epoch, nodeID)
+	if err != nil {
+		return err
+	}
+	return s.propose(ctx, cmd)
+}
+
 // ─── IRaftEventListener ──────────────────────────────────────────────────────
 
 // LeaderUpdated is called by Dragonboat when a leader changes for any shard.

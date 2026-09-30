@@ -24,6 +24,11 @@ const (
 	// topology updates — publishTopology merges it into each shard's
 	// GrpcAddrs map before proposing.
 	RegisterNodeAddrCmd
+	// ConsumerChangeCmd changes a group membership and starts a cluster-wide
+	// delivery barrier. ConsumerAckCmd acknowledges that a replica has stopped
+	// dispatching with the previous assignment.
+	ConsumerChangeCmd
+	ConsumerAckCmd
 )
 
 // ShardTopology describes the current state of a single Raft shard.

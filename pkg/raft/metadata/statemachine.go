@@ -1,7 +1,10 @@
 package metadata
 
 import (
+	"encoding/json"
 	"io"
+	"slices"
+	"sort"
 	"sync"
 
 	"github.com/lni/dragonboat/v4/statemachine"
@@ -17,6 +20,11 @@ type MetadataStateMachine struct {
 	mu        sync.RWMutex
 	topology  *TopologySnapshot
 	grpcAddrs map[uint64]string // nodeID → client-facing gRPC address
+	consumers ConsumerState
+	barrierMu sync.RWMutex
+	// consumerBarrier excludes a local delivery while membership changes.
+	// Set once during startup, before subscriptions are accepted.
+	consumerBarrier func(func())
 	logger    *zap.Logger
 }
 
@@ -29,6 +37,7 @@ func NewMetadataStateMachineFactory(logger *zap.Logger) func(uint64, uint64) sta
 				Shards: make(map[uint64]*ShardTopology),
 			},
 			grpcAddrs: make(map[uint64]string),
+			consumers: ConsumerState{Groups: make(map[string]map[string][]ConsumerMember), Acked: make(map[uint64]bool)},
 			logger:    logger.Named("metadata_sm"),
 		}
 	}
@@ -47,18 +56,54 @@ func (s *MetadataStateMachine) Update(entry statemachine.Entry) (statemachine.Re
 			s.logger.Error("failed to unmarshal UpdateTopologyCmd", zap.Error(err))
 			return statemachine.Result{Value: 0}, nil
 		}
-		s.mu.Lock()
-		s.topology.Shards[topo.ShardID] = topo
-		if topo.Epoch > s.topology.Epoch {
-			s.topology.Epoch = topo.Epoch
-		}
-		s.mu.Unlock()
+		s.withConsumerBarrier(func() {
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			s.topology.Shards[topo.ShardID] = topo
+			if topo.Epoch > s.topology.Epoch {
+				s.topology.Epoch = topo.Epoch
+			}
+			if len(s.consumers.Groups) > 0 {
+				required := consumerNodes(topo)
+				if !slices.Equal(required, s.consumers.Required) {
+					s.consumers.startRebalance(required)
+				}
+			}
+		})
 
 		s.logger.Debug("topology updated",
 			zap.Uint64("shard_id", topo.ShardID),
 			zap.Uint64("leader_id", topo.LeaderID),
 			zap.Uint64("epoch", topo.Epoch),
 		)
+		return statemachine.Result{Value: 1}, nil
+
+	case ConsumerChangeCmd:
+		var change consumerChange
+		if err := json.Unmarshal(entry.Cmd[1:], &change); err != nil {
+			s.logger.Error("failed to unmarshal ConsumerChangeCmd", zap.Error(err))
+			return statemachine.Result{Value: 0}, nil
+		}
+		var changed bool
+		s.withConsumerBarrier(func() {
+			s.mu.Lock()
+			changed = s.consumers.applyChange(change)
+			s.mu.Unlock()
+		})
+		if changed {
+			return statemachine.Result{Value: 1}, nil
+		}
+		return statemachine.Result{Value: 0}, nil
+
+	case ConsumerAckCmd:
+		var ack consumerAck
+		if err := json.Unmarshal(entry.Cmd[1:], &ack); err != nil {
+			s.logger.Error("failed to unmarshal ConsumerAckCmd", zap.Error(err))
+			return statemachine.Result{Value: 0}, nil
+		}
+		s.mu.Lock()
+		s.consumers.acknowledge(ack)
+		s.mu.Unlock()
 		return statemachine.Result{Value: 1}, nil
 
 	case RegisterNodeAddrCmd:
@@ -81,6 +126,79 @@ func (s *MetadataStateMachine) Update(entry statemachine.Entry) (statemachine.Re
 		s.logger.Warn("unknown metadata command type", zap.Uint8("type", entry.Cmd[0]))
 		return statemachine.Result{Value: 0}, nil
 	}
+}
+
+func consumerNodes(topo *ShardTopology) []uint64 {
+	ids := make([]uint64, 0, len(topo.Nodes)+len(topo.NonVotings))
+	for id := range topo.Nodes {
+		ids = append(ids, id)
+	}
+	for id := range topo.NonVotings {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	return uniqueNodeIDs(ids)
+}
+
+// SetConsumerBarrier installs the local delivery fence used on membership
+// changes. It must be installed before accepting consumer streams.
+func (s *MetadataStateMachine) SetConsumerBarrier(barrier func(func())) {
+	s.barrierMu.Lock()
+	s.consumerBarrier = barrier
+	s.barrierMu.Unlock()
+}
+
+func (s *MetadataStateMachine) withConsumerBarrier(apply func()) {
+	s.barrierMu.RLock()
+	barrier := s.consumerBarrier
+	s.barrierMu.RUnlock()
+	if barrier != nil {
+		barrier(apply)
+	} else {
+		apply()
+	}
+}
+
+// ConsumerGroup returns the active, cluster-wide ordered group assignment.
+// A pending rebalance returns no members so replicas pause delivery.
+func (s *MetadataStateMachine) ConsumerGroup(topic, group string) []ConsumerMember {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.consumers.Pending {
+		return nil
+	}
+	members := s.consumers.Groups[topic][group]
+	return append([]ConsumerMember(nil), members...)
+}
+
+// ConsumerStatus returns the current epoch, its barrier state, and whether
+// this node has already acknowledged that epoch.
+func (s *MetadataStateMachine) ConsumerStatus(nodeID uint64) (uint64, bool, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	needed := false
+	for _, id := range s.consumers.Required {
+		if id == nodeID {
+			needed = true
+			break
+		}
+	}
+	return s.consumers.Epoch, s.consumers.Pending && needed, s.consumers.Acked[nodeID]
+}
+
+// ConsumerActive reports whether the member is in an activated assignment.
+func (s *MetadataStateMachine) ConsumerActive(topic, group, id string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.consumers.Pending {
+		return false
+	}
+	for _, member := range s.consumers.Groups[topic][group] {
+		if member.ID == id {
+			return true
+		}
+	}
+	return false
 }
 
 // Lookup handles read-only queries against the in-memory state.
@@ -182,6 +300,16 @@ func (s *MetadataStateMachine) SaveSnapshot(w io.Writer, _ statemachine.ISnapsho
 			return err
 		}
 	}
+	consumerData, err := json.Marshal(s.consumers)
+	if err != nil {
+		return err
+	}
+	if err := writeUint32(w, uint32(len(consumerData))); err != nil {
+		return err
+	}
+	if _, err := w.Write(consumerData); err != nil {
+		return err
+	}
 
 	return nil
 }
@@ -195,6 +323,7 @@ func (s *MetadataStateMachine) RecoverFromSnapshot(r io.Reader, _ []statemachine
 		Shards: make(map[uint64]*ShardTopology),
 	}
 	s.grpcAddrs = make(map[uint64]string)
+	s.consumers = ConsumerState{Groups: make(map[string]map[string][]ConsumerMember), Acked: make(map[uint64]bool)}
 
 	// Read the gRPC address registry.
 	grpcCount, err := readUint32(r)
@@ -240,6 +369,21 @@ func (s *MetadataStateMachine) RecoverFromSnapshot(r io.Reader, _ []statemachine
 			s.topology.Epoch = topo.Epoch
 		}
 	}
+	consumerLen, err := readUint32(r)
+	if err == io.EOF {
+		return nil // snapshots from before consumer groups were introduced
+	}
+	if err != nil {
+		return err
+	}
+	consumerData := make([]byte, consumerLen)
+	if _, err := io.ReadFull(r, consumerData); err != nil {
+		return err
+	}
+	if err := json.Unmarshal(consumerData, &s.consumers); err != nil {
+		return err
+	}
+	s.consumers.normalize()
 
 	return nil
 }
