@@ -51,11 +51,19 @@ publish:
   proposalTimeout: 5s
 
 delivery:
+  consumerQueueSize: 1024 # 1..65536 messages per consumer sender queue
   timeBucket: 1ms
-  dispatchPollInterval: 50ms
+  dispatchPollInterval: 5ms
   inFlightTimeout: 5s
   deleteBatchInterval: 500ms
   ttlSweepInterval: 1m0s
+  # Each topic gets one bounded chunk at a time, with cyclic cursor wrap.
+  prepareBatchSize: 64 # 1..64 candidates; new Raft command tag 4
+  prepareBatchBytes: 256KiB # command cap and local scan byte budget
+  scanMaxKeys: 256 # includes remote owners, in-flight keys, and skipped keys
+  scanWorkBudget: 5ms # local work only; iterators close before proposal waits
+  prepareTimeout: 250ms # uncertain completion is retried idempotently
+  prepareWorkers: 2 # bounded jobs; at most one per topic
 
 observability:
   logging:

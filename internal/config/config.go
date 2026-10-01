@@ -88,11 +88,18 @@ type Publish struct {
 }
 
 type Delivery struct {
+	ConsumerQueueSize    int           `mapstructure:"consumerQueueSize" yaml:"consumerQueueSize"`
 	TimeBucket           time.Duration `mapstructure:"timeBucket" yaml:"timeBucket"`
 	DispatchPollInterval time.Duration `mapstructure:"dispatchPollInterval" yaml:"dispatchPollInterval"`
 	InFlightTimeout      time.Duration `mapstructure:"inFlightTimeout" yaml:"inFlightTimeout"`
 	DeleteBatchInterval  time.Duration `mapstructure:"deleteBatchInterval" yaml:"deleteBatchInterval"`
 	TTLSweepInterval     time.Duration `mapstructure:"ttlSweepInterval" yaml:"ttlSweepInterval"`
+	PrepareBatchSize     int           `mapstructure:"prepareBatchSize" yaml:"prepareBatchSize"`
+	PrepareBatchBytes    Size          `mapstructure:"prepareBatchBytes" yaml:"prepareBatchBytes"`
+	ScanMaxKeys          int           `mapstructure:"scanMaxKeys" yaml:"scanMaxKeys"`
+	ScanWorkBudget       time.Duration `mapstructure:"scanWorkBudget" yaml:"scanWorkBudget"`
+	PrepareTimeout       time.Duration `mapstructure:"prepareTimeout" yaml:"prepareTimeout"`
+	PrepareWorkers       int           `mapstructure:"prepareWorkers" yaml:"prepareWorkers"`
 }
 
 type Observability struct {
@@ -324,11 +331,23 @@ func (c *Config) validatePublishAndDelivery() error {
 		return fmt.Errorf("publish.proposalTimeout must be positive")
 	}
 	d := c.Delivery
+	if d.ConsumerQueueSize < 1 || d.ConsumerQueueSize > 65536 {
+		return fmt.Errorf("delivery.consumerQueueSize must be 1..65536")
+	}
 	if d.TimeBucket < 0 || (d.TimeBucket > 0 && d.TimeBucket < time.Millisecond) {
 		return fmt.Errorf("delivery.timeBucket must be zero or at least 1ms")
 	}
 	if d.DispatchPollInterval <= 0 || d.InFlightTimeout <= 0 || d.DeleteBatchInterval <= 0 || d.TTLSweepInterval <= 0 {
 		return fmt.Errorf("delivery intervals and timeout must be positive")
+	}
+	if d.PrepareBatchSize < 1 || d.PrepareBatchSize > 64 || d.ScanMaxKeys < d.PrepareBatchSize || d.ScanMaxKeys > 65536 {
+		return fmt.Errorf("delivery.prepareBatchSize must be 1..64 and scanMaxKeys must be between batch size and 65536")
+	}
+	if size, err := d.PrepareBatchBytes.Bytes(); err != nil || size < 1024 || size > 256<<10 {
+		return fmt.Errorf("delivery.prepareBatchBytes must be 1KiB..256KiB")
+	}
+	if d.ScanWorkBudget <= 0 || d.ScanWorkBudget > 50*time.Millisecond || d.PrepareTimeout <= 0 || d.PrepareTimeout > time.Second || d.PrepareWorkers < 1 || d.PrepareWorkers > 16 {
+		return fmt.Errorf("delivery requires scanWorkBudget in (0,50ms], prepareTimeout in (0,1s], and prepareWorkers in 1..16")
 	}
 	return nil
 }

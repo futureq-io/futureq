@@ -2,9 +2,16 @@ package dispatcher
 
 import (
 	"bytes"
+	"encoding/binary"
 	"fmt"
+	"hash/fnv"
+	"sort"
 	"sync"
+	"time"
 
+	"github.com/futureq-io/futureq/internal/metrics"
+	raft "github.com/futureq-io/futureq/internal/raft/event"
+	"github.com/futureq-io/futureq/pkg/raft/metadata"
 	pb "github.com/futureq-io/protocol/proto/go"
 	"go.uber.org/zap"
 )
@@ -44,7 +51,9 @@ func (s *RoundRobinStrategy) Select(candidates []*ConsumerEntry, _ *pb.QueueMess
 
 	s.mu.Lock()
 	idx := s.next[groupKey]
-	s.next[groupKey] = (idx + 1) % uint64(len(candidates))
+	// Keep a monotonic cursor so a changed group size immediately uses the
+	// new modulus instead of restarting at a stale wrapped position.
+	s.next[groupKey] = idx + 1
 	s.mu.Unlock()
 
 	return candidates[idx%uint64(len(candidates))]
@@ -159,7 +168,17 @@ func (ts *TopicSubscription) universalSnapshot() []*ConsumerEntry {
 //     message (competing consumers). Different groups each get an independent
 //     copy (fan-out across groups).
 type Hub struct {
-	mu sync.RWMutex
+	mu         sync.RWMutex
+	registryMu sync.Mutex
+	// deliveryMu fences every delivery against a metadata Raft rebalance.
+	deliveryMu      sync.RWMutex
+	groupMembers    func(topic, group string) []metadata.ConsumerMember
+	deliveryView    func(string) metadata.TopicDeliveryView
+	version         func() (uint64, bool)
+	permitEpoch     uint64
+	permitUntil     time.Time
+	registryEpoch   uint64
+	inFlightTimeout time.Duration
 
 	// topics: topic → *TopicSubscription
 	topics map[string]*TopicSubscription
@@ -170,10 +189,51 @@ type Hub struct {
 	// inFlightByConsumer: consumerID → [][]byte (keys in-flight to that consumer)
 	inFlightByConsumer map[string][][]byte
 	inFlightMu         sync.Mutex
+	deliveryRecords    map[string]map[string]deliveryRecord
 
 	strategy DispatchStrategy
 	logger   *zap.Logger
 	wakeCh   chan struct{}
+	// OnNack immediately clears the dispatcher's local in-flight entry.
+	OnNack func([]byte)
+}
+
+// WithConsumerRegistry serializes local registration proposals and stale-ID
+// reconciliation so an old snapshot cannot erase a newly added consumer.
+func (h *Hub) WithConsumerRegistry(apply func() error) error {
+	h.registryMu.Lock()
+	defer h.registryMu.Unlock()
+	return apply()
+}
+
+// SetGroupMembership switches grouped delivery to the metadata Raft view.
+// Call before starting the dispatcher or accepting streams.
+func (h *Hub) SetGroupMembership(source func(topic, group string) []metadata.ConsumerMember) {
+	h.deliveryMu.Lock()
+	h.groupMembers = source
+	h.deliveryMu.Unlock()
+}
+
+// WithRebalanceBarrier waits for active local sends, then applies a Raft
+// membership change while new sends are excluded.
+func (h *Hub) WithRebalanceBarrier(apply func()) {
+	h.deliveryMu.Lock()
+	defer h.deliveryMu.Unlock()
+	h.permitUntil = time.Time{}
+	apply()
+}
+
+// LocalConsumerIDs returns the subscriptions to retain when reconciling a
+// restarted node's stale group members in metadata Raft.
+func (h *Hub) LocalConsumerIDs() []string {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	ids := make([]string, 0, len(h.byID))
+	for id := range h.byID {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	return ids
 }
 
 // NewHub constructs a Hub. wakeCh is signalled when a new consumer connects,
@@ -183,6 +243,8 @@ func NewHub(strategy DispatchStrategy, logger *zap.Logger, wakeCh chan struct{})
 		topics:             make(map[string]*TopicSubscription),
 		byID:               make(map[string]*ConsumerEntry),
 		inFlightByConsumer: make(map[string][][]byte),
+		deliveryRecords:    make(map[string]map[string]deliveryRecord),
+		inFlightTimeout:    5 * time.Second,
 		strategy:           strategy,
 		logger:             logger.Named("hub"),
 		wakeCh:             wakeCh,
@@ -205,6 +267,7 @@ func (h *Hub) Register(id, topic, groupID string, ch chan *pb.QueueMessage) {
 	}
 	h.topics[topic].add(entry)
 	h.byID[id] = entry
+	h.registryEpoch++
 	h.mu.Unlock()
 
 	h.logger.Info("consumer registered",
@@ -223,6 +286,8 @@ func (h *Hub) Register(id, topic, groupID string, ch chan *pb.QueueMessage) {
 
 // Unregister removes a consumer from the Hub and deletes its in-flight keys.
 func (h *Hub) Unregister(id string) {
+	h.deliveryMu.Lock()
+	defer h.deliveryMu.Unlock()
 	h.mu.Lock()
 	entry, ok := h.byID[id]
 	if !ok {
@@ -236,6 +301,7 @@ func (h *Hub) Unregister(id string) {
 		}
 	}
 	delete(h.byID, id)
+	h.registryEpoch++
 	h.mu.Unlock()
 
 	h.logger.Info("consumer unregistered",
@@ -247,6 +313,7 @@ func (h *Hub) Unregister(id string) {
 	// Delete in-flight keys for this consumer.
 	h.inFlightMu.Lock()
 	delete(h.inFlightByConsumer, id)
+	delete(h.deliveryRecords, id)
 	h.inFlightMu.Unlock()
 }
 
@@ -255,6 +322,26 @@ func (h *Hub) Unregister(id string) {
 // receive a copy. Returns the group IDs the message was successfully sent to
 // (universal consumers are reported with an empty group id).
 func (h *Hub) DispatchToTopic(topic string, msg *pb.QueueMessage, deliveryTag []byte) []string {
+	return h.DispatchPrepared(topic, msg, deliveryTag, nil)
+}
+
+// DispatchPrepared skips interests already completed in the durable manifest.
+// A nil manifest retains the Hub's direct-use behavior for callers without a ledger.
+func (h *Hub) DispatchPrepared(topic string, msg *pb.QueueMessage, deliveryTag []byte, manifest *raft.DeliveryState) []string {
+	h.deliveryMu.RLock()
+	defer h.deliveryMu.RUnlock()
+	if !h.permitted() {
+		metrics.DeliveryRejectedTotal.WithLabelValues("permit").Inc()
+		return nil
+	}
+	if manifest != nil && h.version != nil && manifest.Epoch != h.permitEpoch {
+		metrics.DeliveryRejectedTotal.WithLabelValues("epoch").Inc()
+		return nil
+	}
+	if time.Now().UnixMilli() < msg.EnqueuedAtUnixMs+msg.DelayMs {
+		metrics.DeliveryRejectedTotal.WithLabelValues("not_due").Inc()
+		return nil
+	}
 	h.mu.RLock()
 	sub, ok := h.topics[topic]
 	if !ok {
@@ -271,7 +358,25 @@ func (h *Hub) DispatchToTopic(topic string, msg *pb.QueueMessage, deliveryTag []
 
 	// Dispatch to each group — strategy picks one consumer per group.
 	for gid, consumers := range groups {
-		selected := h.strategy.Select(consumers, msg)
+		if manifest != nil && !manifest.Needs(metadata.DeliveryRecipient(gid, "")) {
+			continue
+		}
+		var selected *ConsumerEntry
+		if h.groupMembers != nil {
+			members := h.groupMembers(topic, gid)
+			if len(members) == 0 {
+				continue // no committed assignment, or rebalance is pending
+			}
+			owner := members[deliveryOrdinal(deliveryTag)%uint64(len(members))].ID
+			for _, consumer := range consumers {
+				if consumer.ID == owner {
+					selected = consumer
+					break
+				}
+			}
+		} else {
+			selected = h.strategy.Select(consumers, msg)
+		}
 		if selected == nil {
 			continue
 		}
@@ -282,6 +387,9 @@ func (h *Hub) DispatchToTopic(topic string, msg *pb.QueueMessage, deliveryTag []
 
 	// Dispatch to all universal consumers.
 	for _, c := range universal {
+		if manifest != nil && !manifest.Needs(metadata.DeliveryRecipient("", c.ID)) {
+			continue
+		}
 		if h.trySend(c, msg, deliveryTag) {
 			sentTo = append(sentTo, "")
 		}
@@ -290,16 +398,51 @@ func (h *Hub) DispatchToTopic(topic string, msg *pb.QueueMessage, deliveryTag []
 	return sentTo
 }
 
+// deliveryOrdinal is the event ID in the topic-first storage key. Using the
+// same ordinal on every replica gives a stable modulo assignment.
+func deliveryOrdinal(tag []byte) uint64 {
+	if len(tag) == 24 {
+		return binary.BigEndian.Uint64(tag[16:24])
+	}
+	h := fnv.New64a()
+	_, _ = h.Write(tag)
+	return h.Sum64()
+}
+
 // trySend attempts to deliver a message to a single consumer. Returns true on
 // success. Tracks the delivery tag as in-flight for the consumer.
 func (h *Hub) trySend(c *ConsumerEntry, msg *pb.QueueMessage, deliveryTag []byte) bool {
+	h.inFlightMu.Lock()
+	defer h.inFlightMu.Unlock()
+	if h.deliveryRecords[c.ID] == nil {
+		h.deliveryRecords[c.ID] = make(map[string]deliveryRecord)
+	}
+	// A fast sender with stalled ACKs must not turn a bounded channel into an
+	// unbounded retry map. Expiry or ACK releases one of these fixed slots.
+	if len(h.deliveryRecords[c.ID]) >= max(1024, cap(c.Ch)) {
+		metrics.DeliveryRejectedTotal.WithLabelValues("in_flight_limit").Inc()
+		return false
+	}
+	if _, exists := h.deliveryRecords[c.ID][string(deliveryTag)]; exists {
+		return false
+	}
+	// Separate pointers let the sender reject an old queued attempt after a
+	// timeout, even if the same key has since been delivered to this stream again.
+	queued := &pb.QueueMessage{
+		Topic: msg.Topic, Payload: msg.Payload, DeliveryTag: deliveryTag,
+		EnqueuedAtUnixMs: msg.EnqueuedAtUnixMs, DelayMs: msg.DelayMs,
+	}
+	// Capture before the channel handoff, but observe only successful enqueues.
+	// This excludes time waiting in the sender queue and inside stream.Send.
+	queuedAt := time.Now()
 	select {
-	case c.Ch <- msg:
-		h.inFlightMu.Lock()
+	case c.Ch <- queued:
+		metrics.DeliverySenderEnqueueLatenessMs.WithLabelValues(msg.Topic).Observe(float64(queuedAt.UnixNano())/1e6 - float64(msg.EnqueuedAtUnixMs+msg.DelayMs))
 		h.inFlightByConsumer[c.ID] = append(h.inFlightByConsumer[c.ID], deliveryTag)
-		h.inFlightMu.Unlock()
+		h.deliveryRecords[c.ID][string(deliveryTag)] = deliveryRecord{message: queued, expires: time.Now().Add(h.inFlightTimeout), epoch: h.permitEpoch}
 		return true
 	default:
+		metrics.DeliveryRejectedTotal.WithLabelValues("full_queue").Inc()
 		h.logger.Warn("consumer channel full, skipping",
 			zap.String("consumer_id", c.ID),
 			zap.String("topic", c.Topic),
@@ -311,16 +454,69 @@ func (h *Hub) trySend(c *ConsumerEntry, msg *pb.QueueMessage, deliveryTag []byte
 
 // RemoveInFlightForConsumer removes a specific key from a consumer's in-flight
 // tracking. Called when the consumer ACKs or NACKs a message.
-func (h *Hub) RemoveInFlightForConsumer(consumerID string, key []byte) {
+func (h *Hub) RemoveInFlightForConsumer(consumerID string, key []byte) bool {
 	h.inFlightMu.Lock()
 	defer h.inFlightMu.Unlock()
 	keys := h.inFlightByConsumer[consumerID]
 	for i, k := range keys {
 		if bytes.Equal(k, key) {
 			h.inFlightByConsumer[consumerID] = append(keys[:i], keys[i+1:]...)
-			return
+			delete(h.deliveryRecords[consumerID], string(key))
+			return true
 		}
 	}
+	return false
+}
+
+// HasInFlightForConsumer validates an ACK against a message actually sent on
+// this stream, so an arbitrary delivery tag cannot delete another message.
+func (h *Hub) HasInFlightForConsumer(consumerID string, key []byte) bool {
+	h.inFlightMu.Lock()
+	defer h.inFlightMu.Unlock()
+	for _, k := range h.inFlightByConsumer[consumerID] {
+		if bytes.Equal(k, key) {
+			return true
+		}
+	}
+	return false
+}
+
+// RemoveDeletedBatch clears tracking when a delete applies or an attempt times out.
+func (h *Hub) RemoveDeletedBatch(keys [][]byte) {
+	deleted := make(map[string]struct{}, len(keys))
+	for _, key := range keys {
+		deleted[string(key)] = struct{}{}
+	}
+	h.inFlightMu.Lock()
+	defer h.inFlightMu.Unlock()
+	for id, pending := range h.inFlightByConsumer {
+		kept := pending[:0]
+		for _, key := range pending {
+			if _, ok := deleted[string(key)]; !ok {
+				kept = append(kept, key)
+			} else {
+				delete(h.deliveryRecords[id], string(key))
+			}
+		}
+		h.inFlightByConsumer[id] = kept
+	}
+}
+
+// GroupInFlightCount is the number of deliveries that must finish before this
+// replica acknowledges a rebalance freeze.
+func (h *Hub) GroupInFlightCount() int {
+	h.ExpireInFlight(time.Now())
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	h.inFlightMu.Lock()
+	defer h.inFlightMu.Unlock()
+	count := 0
+	for id, entry := range h.byID {
+		if entry.Group != "" {
+			count += len(h.inFlightByConsumer[id])
+		}
+	}
+	return count
 }
 
 // ActiveTopics returns a snapshot of all topics that currently have at least
