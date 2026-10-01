@@ -66,7 +66,7 @@ func (h *ConsumerHandler) Subscribe(stream grpc.BidiStreamingServer[pb.ConsumerF
 
 	// ─── Register consumer with the Hub ────────────────────────────────────────
 	consumerID := uuid.New().String()
-	ch := make(chan *pb.QueueMessage, 1024)
+	ch := make(chan *pb.QueueMessage, app.A.Config().Delivery.ConsumerQueueSize)
 	clusteredGroup := app.A.NodeHost != nil
 	if clusteredGroup {
 		member := metadata.ConsumerMember{ID: consumerID, NodeID: app.A.Config().Cluster.NodeID}

@@ -51,6 +51,7 @@ publish:
   proposalTimeout: 5s
 
 delivery:
+  consumerQueueSize: 1024 # 1..65536 messages per consumer sender queue
   timeBucket: 1ms
   dispatchPollInterval: 5ms
   inFlightTimeout: 5s

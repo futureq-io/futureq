@@ -88,6 +88,7 @@ type Publish struct {
 }
 
 type Delivery struct {
+	ConsumerQueueSize    int           `mapstructure:"consumerQueueSize" yaml:"consumerQueueSize"`
 	TimeBucket           time.Duration `mapstructure:"timeBucket" yaml:"timeBucket"`
 	DispatchPollInterval time.Duration `mapstructure:"dispatchPollInterval" yaml:"dispatchPollInterval"`
 	InFlightTimeout      time.Duration `mapstructure:"inFlightTimeout" yaml:"inFlightTimeout"`
@@ -330,6 +331,9 @@ func (c *Config) validatePublishAndDelivery() error {
 		return fmt.Errorf("publish.proposalTimeout must be positive")
 	}
 	d := c.Delivery
+	if d.ConsumerQueueSize < 1 || d.ConsumerQueueSize > 65536 {
+		return fmt.Errorf("delivery.consumerQueueSize must be 1..65536")
+	}
 	if d.TimeBucket < 0 || (d.TimeBucket > 0 && d.TimeBucket < time.Millisecond) {
 		return fmt.Errorf("delivery.timeBucket must be zero or at least 1ms")
 	}

@@ -419,7 +419,7 @@ func (h *Hub) trySend(c *ConsumerEntry, msg *pb.QueueMessage, deliveryTag []byte
 	}
 	// A fast sender with stalled ACKs must not turn a bounded channel into an
 	// unbounded retry map. Expiry or ACK releases one of these fixed slots.
-	if len(h.deliveryRecords[c.ID]) >= 1024 {
+	if len(h.deliveryRecords[c.ID]) >= max(1024, cap(c.Ch)) {
 		metrics.DeliveryRejectedTotal.WithLabelValues("in_flight_limit").Inc()
 		return false
 	}
