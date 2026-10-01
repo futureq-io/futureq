@@ -110,7 +110,9 @@ func (c *replicaTestCluster) start(id uint64, restart bool) *replicaTestNode {
 	node.deleter = NewDeleter(ledger, time.Hour, zap.NewNop())
 	node.deleter.AcknowledgeBatch = ledger.Acknowledge
 	node.dispatcher = NewDispatcher(db, node.hub, node.deleter, time.Millisecond, replicaTestTimeout, wake, zap.NewNop())
-	node.dispatcher.PrepareDelivery = ledger.Prepare
+	node.dispatcher.PrepareBatch = ledger.PrepareBatch
+	node.dispatcher.MaintenanceRecipients = node.sm.DeliveryRecipients
+	node.hub.SetDeliveryView(node.sm.TopicDeliverySnapshot)
 	node.dispatcher.ReadBarrier = NewConsumerReadBarrier(context.Background(), nh, node.sm, node.hub, replicaTestShard)
 	node.hub.OnNack = node.dispatcher.RemoveInFlight
 	node.coordinator = NewConsumerCoordinator(node.hub, node.sm, node.svc, replicaTestShard, id, replicaTestTimeout, zap.NewNop())

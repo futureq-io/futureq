@@ -126,6 +126,11 @@ func startRun(cmd *cobra.Command, _ []string) {
 		}
 	}
 	ledger := dispatcher.NewDeliveryLedger(a.DB, recipients, deleteBackend, proposeDelivery)
+	if cfg.Cluster.Enabled {
+		ledger.ProposeContext = func(ctx context.Context, cmd []byte) (statemachine.Result, error) {
+			return a.NodeHost.SyncPropose(ctx, a.NodeHost.GetNoOPSession(cfg.Cluster.ShardID), cmd)
+		}
+	}
 	deleter := dispatcher.NewDeleter(ledger, deleteInterval, logger)
 	deleter.AcknowledgeBatch = ledger.Acknowledge
 	disp := dispatcher.NewDispatcher(
@@ -133,7 +138,15 @@ func startRun(cmd *cobra.Command, _ []string) {
 		dispatchInterval, inFlightTimeout,
 		wakeCh, logger,
 	)
-	disp.PrepareDelivery = ledger.Prepare
+	disp.PrepareBatch = ledger.PrepareBatch
+	disp.MaintenanceRecipients = recipients
+	disp.TimeBucket = cfg.Delivery.TimeBucket
+	prepareBytes, _ := cfg.Delivery.PrepareBatchBytes.Bytes() // validated during Load
+	disp.Limits = dispatcher.ScanLimits{
+		Candidates: cfg.Delivery.PrepareBatchSize, Examined: cfg.Delivery.ScanMaxKeys,
+		Bytes: int(prepareBytes), WorkTime: cfg.Delivery.ScanWorkBudget,
+		PrepareTimeout: cfg.Delivery.PrepareTimeout, Workers: cfg.Delivery.PrepareWorkers,
+	}
 	ledger.OnDelete = func(keys [][]byte) {
 		disp.RemoveInFlightBatch(keys)
 		hub.RemoveDeletedBatch(keys)
@@ -169,6 +182,7 @@ func startRun(cmd *cobra.Command, _ []string) {
 			logger.Fatal("failed to start raft", zap.Error(err))
 		}
 		hub.SetGroupMembership(a.MetadataSM.ConsumerGroup)
+		hub.SetDeliveryView(a.MetadataSM.TopicDeliverySnapshot)
 		hub.SetDeliveryFence(a.MetadataSM.ConsumerVersion, inFlightTimeout)
 		a.MetadataSM.SetConsumerBarrier(hub.WithRebalanceBarrier)
 		disp.ReadBarrier = dispatcher.NewConsumerReadBarrier(a.Ctx, a.NodeHost, a.MetadataSM, hub, cfg.Cluster.ShardID)

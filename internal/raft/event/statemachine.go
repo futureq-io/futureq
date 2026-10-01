@@ -130,7 +130,7 @@ func (s *EventStateMachine) applyEntry(batch storage.Batch, delivery *DeliveryBa
 		}
 		return statemachine.Result{Value: uint64(len(deleted))}, deleted, 0, nil
 
-	case PrepareDeliveryCmd, AckDeliveryBatchCmd:
+	case PrepareDeliveryCmd, AckDeliveryBatchCmd, PrepareDeliveryBatchCmd:
 		result, deleted, err := delivery.Apply(cmd)
 		return result, deleted, 0, err
 

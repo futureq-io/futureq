@@ -85,9 +85,11 @@ type Deleter struct {
 	logger   *zap.Logger
 	interval time.Duration
 
-	mu      sync.Mutex
-	pending [][]byte
-	acks    []raft.DeliveryAck
+	mu         sync.Mutex
+	pending    [][]byte
+	acks       []raft.DeliveryAck
+	ackKeys    map[string]bool // includes a batch currently being persisted
+	deleteKeys map[string]bool
 	// AcknowledgeBatch persists independent recipient completions. It deletes
 	// a shared payload only after every required recipient has ACKed.
 	AcknowledgeBatch func([]raft.DeliveryAck) error
@@ -100,34 +102,66 @@ type Deleter struct {
 // NewDeleter constructs a Deleter with the given backend and flush interval.
 func NewDeleter(backend DeleteBackend, interval time.Duration, logger *zap.Logger) *Deleter {
 	return &Deleter{
-		backend:  backend,
-		logger:   logger.Named("deleter"),
-		interval: interval,
-		pending:  make([][]byte, 0, 1024),
+		backend:    backend,
+		logger:     logger.Named("deleter"),
+		interval:   interval,
+		pending:    make([][]byte, 0, 1024),
+		ackKeys:    make(map[string]bool),
+		deleteKeys: make(map[string]bool),
 	}
 }
 
 // MarkDeleted enqueues a key for batched deletion. The key is the 24-byte
 // storage key received as the delivery_tag from the consumer's AckRequest.
 func (d *Deleter) MarkDeleted(key []byte) {
-	keyCopy := make([]byte, len(key))
-	copy(keyCopy, key)
+	if !d.TryMarkDeleted(key) {
+		d.logger.Warn("delete queue full; stored key will be revisited by scan or TTL sweep")
+	}
+}
 
+// MaxPendingCompletions includes proposals in progress. Accepted completions
+// are retained across failures; new work backpressures through redelivery when
+// the bound is reached. Durable payloads stay in storage until a commit.
+const MaxPendingCompletions = 8192
+
+func (d *Deleter) TryMarkDeleted(key []byte) bool {
 	d.mu.Lock()
-	d.pending = append(d.pending, keyCopy)
-	d.mu.Unlock()
+	defer d.mu.Unlock()
+	if d.deleteKeys[string(key)] {
+		return true
+	}
+	if len(d.deleteKeys) >= MaxPendingCompletions {
+		return false
+	}
+	d.deleteKeys[string(key)] = true
+	d.pending = append(d.pending, append([]byte(nil), key...))
+	return true
 }
 
 // MarkAcknowledged releases local consumer tracking immediately; persistence
 // and retries happen asynchronously, independently of the rebalance drain.
 func (d *Deleter) MarkAcknowledged(key []byte, recipient string) {
+	if !d.TryMarkAcknowledged(key, recipient) {
+		d.logger.Warn("ACK queue full; uncommitted recipient will be redelivered")
+	}
+}
+
+func (d *Deleter) TryMarkAcknowledged(key []byte, recipient string) bool {
 	if d.AcknowledgeBatch == nil {
-		d.MarkDeleted(key)
-		return
+		return d.TryMarkDeleted(key)
 	}
 	d.mu.Lock()
+	defer d.mu.Unlock()
+	id := string(key) + "\x00" + recipient
+	if d.ackKeys[id] {
+		return true
+	}
+	if len(d.ackKeys) >= MaxPendingCompletions {
+		return false
+	}
+	d.ackKeys[id] = true
 	d.acks = append(d.acks, raft.DeliveryAck{Key: append([]byte(nil), key...), Recipient: recipient})
-	d.mu.Unlock()
+	return true
 }
 
 // Run starts the batched delete loop. It blocks until ctx is cancelled.
@@ -160,6 +194,12 @@ func (d *Deleter) flush() {
 			d.mu.Lock()
 			d.acks = append(acks, d.acks...)
 			d.mu.Unlock()
+		} else {
+			d.mu.Lock()
+			for _, ack := range acks {
+				delete(d.ackKeys, string(ack.Key)+"\x00"+ack.Recipient)
+			}
+			d.mu.Unlock()
 		}
 	}
 	d.mu.Lock()
@@ -185,6 +225,11 @@ func (d *Deleter) flush() {
 	}
 
 	metrics.DeleteBatchSize.Observe(float64(len(keysToFlush)))
+	d.mu.Lock()
+	for _, key := range keysToFlush {
+		delete(d.deleteKeys, string(key))
+	}
+	d.mu.Unlock()
 	d.logger.Debug("flushed delete batch", zap.Int("count", len(keysToFlush)))
 
 	if d.OnDelete != nil {

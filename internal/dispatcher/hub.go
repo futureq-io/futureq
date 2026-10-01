@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/futureq-io/futureq/internal/metrics"
 	raft "github.com/futureq-io/futureq/internal/raft/event"
 	"github.com/futureq-io/futureq/pkg/raft/metadata"
 	pb "github.com/futureq-io/protocol/proto/go"
@@ -172,6 +173,7 @@ type Hub struct {
 	// deliveryMu fences every delivery against a metadata Raft rebalance.
 	deliveryMu      sync.RWMutex
 	groupMembers    func(topic, group string) []metadata.ConsumerMember
+	deliveryView    func(string) metadata.TopicDeliveryView
 	version         func() (uint64, bool)
 	permitEpoch     uint64
 	permitUntil     time.Time
@@ -329,6 +331,15 @@ func (h *Hub) DispatchPrepared(topic string, msg *pb.QueueMessage, deliveryTag [
 	h.deliveryMu.RLock()
 	defer h.deliveryMu.RUnlock()
 	if !h.permitted() {
+		metrics.DeliveryRejectedTotal.WithLabelValues("permit").Inc()
+		return nil
+	}
+	if manifest != nil && h.version != nil && manifest.Epoch != h.permitEpoch {
+		metrics.DeliveryRejectedTotal.WithLabelValues("epoch").Inc()
+		return nil
+	}
+	if time.Now().UnixMilli() < msg.EnqueuedAtUnixMs+msg.DelayMs {
+		metrics.DeliveryRejectedTotal.WithLabelValues("not_due").Inc()
 		return nil
 	}
 	h.mu.RLock()
@@ -406,6 +417,12 @@ func (h *Hub) trySend(c *ConsumerEntry, msg *pb.QueueMessage, deliveryTag []byte
 	if h.deliveryRecords[c.ID] == nil {
 		h.deliveryRecords[c.ID] = make(map[string]deliveryRecord)
 	}
+	// A fast sender with stalled ACKs must not turn a bounded channel into an
+	// unbounded retry map. Expiry or ACK releases one of these fixed slots.
+	if len(h.deliveryRecords[c.ID]) >= 1024 {
+		metrics.DeliveryRejectedTotal.WithLabelValues("in_flight_limit").Inc()
+		return false
+	}
 	if _, exists := h.deliveryRecords[c.ID][string(deliveryTag)]; exists {
 		return false
 	}
@@ -415,12 +432,17 @@ func (h *Hub) trySend(c *ConsumerEntry, msg *pb.QueueMessage, deliveryTag []byte
 		Topic: msg.Topic, Payload: msg.Payload, DeliveryTag: deliveryTag,
 		EnqueuedAtUnixMs: msg.EnqueuedAtUnixMs, DelayMs: msg.DelayMs,
 	}
+	// Capture before the channel handoff, but observe only successful enqueues.
+	// This excludes time waiting in the sender queue and inside stream.Send.
+	queuedAt := time.Now()
 	select {
 	case c.Ch <- queued:
+		metrics.DeliverySenderEnqueueLatenessMs.WithLabelValues(msg.Topic).Observe(float64(queuedAt.UnixNano())/1e6 - float64(msg.EnqueuedAtUnixMs+msg.DelayMs))
 		h.inFlightByConsumer[c.ID] = append(h.inFlightByConsumer[c.ID], deliveryTag)
 		h.deliveryRecords[c.ID][string(deliveryTag)] = deliveryRecord{message: queued, expires: time.Now().Add(h.inFlightTimeout), epoch: h.permitEpoch}
 		return true
 	default:
+		metrics.DeliveryRejectedTotal.WithLabelValues("full_queue").Inc()
 		h.logger.Warn("consumer channel full, skipping",
 			zap.String("consumer_id", c.ID),
 			zap.String("topic", c.Topic),

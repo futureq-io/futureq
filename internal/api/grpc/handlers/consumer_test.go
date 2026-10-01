@@ -46,9 +46,11 @@ func (b *retryDeleteBackend) DeleteKeys(keys [][]byte) error {
 
 func TestAckReleasesRebalanceBeforeDeleteCommits(t *testing.T) {
 	hub := dispatcher.NewHub(dispatcher.NewRoundRobinStrategy(), zap.NewNop(), make(chan struct{}, 1))
-	hub.Register("consumer", "orders", "workers", make(chan *pb.QueueMessage, 1))
+	queue := make(chan *pb.QueueMessage, 1)
+	hub.Register("consumer", "orders", "workers", queue)
 	key := []byte("delivery-tag")
 	require.Equal(t, []string{"workers"}, hub.DispatchToTopic("orders", &pb.QueueMessage{}, key))
+	require.True(t, hub.BeginSend("consumer", <-queue))
 	require.Equal(t, 1, hub.GroupInFlightCount())
 	backend := &retryDeleteBackend{fail: true}
 	deleter := dispatcher.NewDeleter(backend, time.Hour, zap.NewNop())

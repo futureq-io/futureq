@@ -5,6 +5,30 @@ import (
 	"sort"
 )
 
+// TopicDeliveryView is an immutable copy of one committed assignment. Member
+// order is the same order used by ConsumerGroup and deliveryOrdinal ownership.
+type TopicDeliveryView struct {
+	Epoch uint64
+	Active bool
+	Groups map[string][]ConsumerMember
+	Recipients []string
+}
+
+func (s *MetadataStateMachine) TopicDeliverySnapshot(topic string) TopicDeliveryView {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	view := TopicDeliveryView{Epoch: s.consumers.Epoch, Active: !s.consumers.Pending, Groups: make(map[string][]ConsumerMember)}
+	if !view.Active { return view }
+	for group, members := range s.consumers.Groups[topic] {
+		view.Groups[group] = append([]ConsumerMember(nil), members...)
+		if group == "" {
+			for _, member := range members { view.Recipients = append(view.Recipients, DeliveryRecipient("", member.ID)) }
+		} else if len(members) > 0 { view.Recipients = append(view.Recipients, DeliveryRecipient(group, "")) }
+	}
+	sort.Strings(view.Recipients)
+	return view
+}
+
 // ConsumerVersion is the local applied assignment version. It is safe to use
 // for delivery only after a linearizable metadata read, within a bounded permit.
 func (s *MetadataStateMachine) ConsumerVersion() (uint64, bool) {

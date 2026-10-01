@@ -191,13 +191,18 @@ func (h *ConsumerHandler) sender(
 			errCh <- ctx.Err()
 			return
 		case msg := <-ch:
-			if !h.hub.CanSend(consumerID, msg) {
+			if !h.hub.BeginSend(consumerID, msg) {
+				h.hub.RejectQueuedAttempt(consumerID, msg)
 				continue // expired, ACKed, or fenced buffered delivery
 			}
+			// Observe before Send: consumer backpressure can block this call.
+			// Count attempted sends here, including attempts that fail in Send.
+			metrics.DeliverySendLatenessMs.WithLabelValues(msg.Topic).Observe(float64(time.Now().UnixNano())/1e6 - float64(msg.EnqueuedAtUnixMs+msg.DelayMs))
 			if err := stream.Send(msg); err != nil {
 				errCh <- err
 				return
 			}
+			metrics.DeliveryGRPCSendsTotal.WithLabelValues(msg.Topic).Inc()
 		}
 	}
 }
@@ -233,7 +238,7 @@ func (h *ConsumerHandler) receiver(
 			init.Topic, init.GroupId, boolToStr(success),
 		).Inc()
 
-		if !h.hub.RemoveInFlightForConsumer(consumerID, ackReq.DeliveryTag) {
+		if !h.hub.AcknowledgeSent(consumerID, ackReq.DeliveryTag) {
 			h.logger.Warn("ignoring ACK for a delivery not sent to this consumer", zap.String("consumer_id", consumerID))
 			continue
 		}
@@ -241,7 +246,10 @@ func (h *ConsumerHandler) receiver(
 			// ACK completes this delivery immediately. Rebalancing may proceed
 			// while the replicated delete is pending; a replica can redeliver
 			// the message in that window under at-least-once semantics.
-			h.deleter.MarkAcknowledged(ackReq.DeliveryTag, metadata.DeliveryRecipient(init.GroupId, consumerID))
+			if !h.deleter.TryMarkAcknowledged(ackReq.DeliveryTag, metadata.DeliveryRecipient(init.GroupId, consumerID)) {
+				errCh <- status.Error(codes.ResourceExhausted, "durable ACK queue full; retry subscription")
+				return
+			}
 		} else {
 			if h.hub.OnNack != nil {
 				h.hub.OnNack(ackReq.DeliveryTag)

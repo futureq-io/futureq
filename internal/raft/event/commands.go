@@ -22,6 +22,9 @@ const (
 	// AckDeliveryBatchCmd records recipient ACKs, deleting the payload only
 	// when all independent recipients have completed.
 	AckDeliveryBatchCmd
+	// PrepareDeliveryBatchCmd is appended for log compatibility. All voting
+	// replicas must support it before a broker enables batched preparation.
+	PrepareDeliveryBatchCmd
 )
 
 // StoreBatchItem is the minimal per-message metadata carried in a StoreBatchCmd.

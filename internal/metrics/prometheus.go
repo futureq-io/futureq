@@ -11,6 +11,8 @@ import (
 )
 
 // All histograms use millisecond units.
+var deliveryBuckets = []float64{0.1, 1, 5, 10, 25, 50, 100, 250, 500, 1000, 5000, 15000, 30000, 60000, 120000}
+
 var (
 	// ─── Producer ────────────────────────────────────────────────────────────
 
@@ -78,12 +80,59 @@ var (
 		Help: "Total number of messages dispatched to consumers.",
 	}, []string{"topic", "group_id"})
 
-	// DispatchPassDurationMs measures one full dispatcher scan pass.
+	// DispatchPassDurationMs measures a bounded chunk, replacing the old full
+	// topic pass. Separate scan/preparation/read metrics attribute its cost.
 	DispatchPassDurationMs = promauto.NewHistogram(prometheus.HistogramOpts{
 		Name:    "futureq_dispatch_pass_duration_ms",
-		Help:    "Duration of each dispatcher scan pass in milliseconds.",
-		Buckets: prometheus.ExponentialBuckets(0.1, 2, 16),
+		Help:    "Bounded delivery chunk duration from scan start through preparation and queueing in milliseconds (formerly a full scan pass).",
+		Buckets: deliveryBuckets,
 	})
+
+	ReadBarrierDurationMs = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name: "futureq_delivery_read_barrier_duration_ms", Help: "Duration of quorum delivery read barriers in milliseconds.", Buckets: deliveryBuckets,
+	})
+	DeliveryScanDurationMs = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name: "futureq_delivery_scan_duration_ms", Help: "Local scan work per bounded chunk, excluding preparation and read barriers.", Buckets: deliveryBuckets,
+	})
+	DeliveryPrepareDurationMs = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name: "futureq_delivery_prepare_duration_ms", Help: "Preparation wait in milliseconds per batch or candidate (including existing manifests).", Buckets: deliveryBuckets,
+	}, []string{"unit"})
+	DeliveryPrepareProposalsTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "futureq_delivery_prepare_proposals_total", Help: "Number of durable delivery preparation proposals, including retries.",
+	})
+	DeliveryPrepareKeys = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name: "futureq_delivery_prepare_keys", Help: "Keys in each durable preparation proposal.", Buckets: []float64{1, 2, 4, 8, 16, 32, 64},
+	})
+	DeliveryManifestHitsTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "futureq_delivery_manifest_hits_total", Help: "Preparation candidates with an existing manifest in the requested epoch.",
+	})
+	DeliveryScannedKeysTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "futureq_delivery_scanned_keys_total", Help: "Event keys examined by bounded delivery scans.",
+	})
+	DeliveryOwnershipFilteredTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "futureq_delivery_ownership_filtered_total", Help: "Event keys without a locally owned interest.",
+	})
+	DeliveryRejectedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "futureq_delivery_rejected_total", Help: "Delivery attempts rejected by permission, queue capacity, or fencing.",
+	}, []string{"reason"})
+	DeliveryQueueDepth = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "futureq_delivery_queue_depth", Help: "Current bounded queue depth, summed across local subscriptions or preparation jobs.",
+	}, []string{"queue"})
+	DeliveryOldestQueuedLatenessMs = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "futureq_delivery_oldest_queued_lateness_ms", Help: "Lateness of the oldest pending local delivery attempt in milliseconds.",
+	})
+	DeliveryOldestPreparationLatenessMs = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "futureq_delivery_oldest_preparation_lateness_ms", Help: "Oldest due-message lateness in bounded preparation jobs in milliseconds.",
+	})
+	DeliverySenderEnqueueLatenessMs = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name: "futureq_delivery_sender_enqueue_lateness_ms", Help: "Lateness immediately before successfully queueing a delivery attempt for the sender goroutine, relative to its individual due time, in milliseconds; includes retries.", Buckets: deliveryBuckets,
+	}, []string{"topic"})
+	DeliverySendLatenessMs = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name: "futureq_delivery_send_lateness_ms", Help: "Lateness immediately before each gRPC Send attempt, relative to the individual due time, in milliseconds; includes failed send attempts.", Buckets: deliveryBuckets,
+	}, []string{"topic"})
+	DeliveryGRPCSendsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "futureq_delivery_grpc_sends_total", Help: "Successful gRPC delivery sends.",
+	}, []string{"topic"})
 
 	// DeliveryLatencyMs measures the total time from when the producer enqueued
 	// the message to when the dispatcher handed it to a consumer. Includes any
@@ -100,8 +149,8 @@ var (
 	// dispatcher is falling behind.
 	DeliveryOverheadMs = promauto.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    "futureq_delivery_overhead_ms",
-		Help:    "Dispatch lateness past scheduled delivery time in milliseconds.",
-		Buckets: prometheus.ExponentialBuckets(0.1, 2, 16), // 0.1ms..~6.5s
+		Help:    "Scan-start lateness past scheduled delivery time in milliseconds; excludes preparation and sender queue time.",
+		Buckets: deliveryBuckets,
 	}, []string{"topic"})
 
 	// MessagesExpiredTotal counts messages discarded because their TTL elapsed.

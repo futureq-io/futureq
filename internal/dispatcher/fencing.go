@@ -18,6 +18,7 @@ type deliveryRecord struct {
 	message *pb.QueueMessage
 	expires time.Time
 	epoch   uint64
+	sending bool // true only after the sender authorizes an actual stream send
 }
 
 func (h *Hub) SetDeliveryTimeout(timeout time.Duration) {
