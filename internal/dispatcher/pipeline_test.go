@@ -193,7 +193,7 @@ func TestExactDueTimeInCoarseBucketAndMaintenanceWithoutConsumers(t *testing.T) 
 	ch := make(chan *pb.QueueMessage, 1)
 	d.hub.Register("universal", "orders", "", ch)
 	now := time.Now().UnixMilli()
-	key := putPipelineEvent(t, d, "orders", 1, now+10000)
+	key := putPipelineEvent(t, d, "orders", 1, now+10000) //nolint
 	require.Empty(t, d.collectTopic("orders", now+20000).items, "a coarse range upper bound cannot authorize an early delivery")
 	// Prepare a separate already due universal-only interest, then disconnect
 	// the last local subscriber. Maintenance must still release its receipt.
