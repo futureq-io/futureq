@@ -264,15 +264,26 @@ func TestReplicaClusterEarlyAckPreservesIndependentDeliveries(t *testing.T) {
 
 func TestReplicaClusterTimeoutOfflineRebalanceAndRestart(t *testing.T) {
 	c := newReplicaTestCluster(t)
+	// A dispatch pass is bounded and may return zero during transient Raft
+	// delays. Retry like the broker loop, retaining the exact delivery count.
+	dispatch := func(nodeID uint64, expected int) {
+		t.Helper()
+		delivered := 0
+		require.Eventually(t, func() bool {
+			delivered += c.nodes[nodeID].dispatcher.dispatchAll()
+			return delivered >= expected
+		}, 5*time.Second, 20*time.Millisecond, "node %d did not deliver %d events", nodeID, expected)
+		require.Equal(t, expected, delivered)
+	}
 	old := c.subscribe(1, "old", "workers")
 	remote := c.subscribe(3, "remote", "workers")
 	c.activate()
 	c.publish(1) // remainder 1 belongs to node 3
 	c.publish(2) // remainder 0 belongs to node 1
-	require.Equal(t, 1, c.nodes[3].dispatcher.dispatchAll())
+	dispatch(3, 1)
 	staleHub := c.nodes[3].hub
 	staleMessage := receiveReplicaMessage(t, remote)
-	require.Equal(t, 1, c.nodes[1].dispatcher.dispatchAll())
+	dispatch(1, 1)
 	firstAttempt := receiveReplicaMessage(t, old) // remains unacknowledged
 	c.stop(3)
 	joined := c.subscribe(2, "joined", "workers")
@@ -286,18 +297,18 @@ func TestReplicaClusterTimeoutOfflineRebalanceAndRestart(t *testing.T) {
 	require.False(t, staleHub.CanSend("remote", staleMessage))
 	require.Empty(t, staleHub.DispatchToTopic("orders", staleMessage, staleMessage.DeliveryTag), "stale replica permit has expired")
 
-	require.Equal(t, 2, c.nodes[2].dispatcher.dispatchAll()) // IDs 1 and 3 belong to joined
+	dispatch(2, 2) // IDs 1 and 3 belong to joined
 	first := receiveReplicaMessage(t, joined)
 	second := receiveReplicaMessage(t, joined)
 	// NACK during the new assignment requeues only the incomplete interest.
 	require.True(t, c.nodes[2].hub.RemoveInFlightForConsumer("joined", first.DeliveryTag))
 	c.nodes[2].hub.OnNack(first.DeliveryTag)
-	require.Equal(t, 1, c.nodes[2].dispatcher.dispatchAll())
+	dispatch(2, 1)
 	redelivery := receiveReplicaMessage(t, joined)
 	require.Equal(t, first.DeliveryTag, redelivery.DeliveryTag)
 	c.ack(2, "joined", "workers", redelivery)
 	c.ack(2, "joined", "workers", second)
-	require.Equal(t, 1, c.nodes[1].dispatcher.dispatchAll()) // timed-out ID 2 retries
+	dispatch(1, 1) // timed-out ID 2 retries
 	c.ack(1, "old", "workers", receiveReplicaMessage(t, old))
 
 	// Disconnect starts another barrier while the replica is still offline.
@@ -307,7 +318,7 @@ func TestReplicaClusterTimeoutOfflineRebalanceAndRestart(t *testing.T) {
 	cancel()
 	c.activate()
 	c.publish(4)
-	require.Equal(t, 1, c.nodes[1].dispatcher.dispatchAll())
+	dispatch(1, 1)
 	c.ack(1, "old", "workers", receiveReplicaMessage(t, old))
 
 	// Reopen the same Raft and Pebble directories. It catches up before serving,
@@ -317,7 +328,7 @@ func TestReplicaClusterTimeoutOfflineRebalanceAndRestart(t *testing.T) {
 	reconnected := c.subscribe(3, "reconnected", "workers")
 	c.activate()
 	c.publish(5)
-	require.Equal(t, 1, c.nodes[3].dispatcher.dispatchAll())
+	dispatch(3, 1)
 	c.ack(3, "reconnected", "workers", receiveReplicaMessage(t, reconnected))
 	c.sync()
 	require.False(t, c.nodes[3].sm.ConsumerPresent("orders", "workers", "remote"))
