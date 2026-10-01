@@ -312,8 +312,14 @@ func (s *EventStateMachine) RecoverFromSnapshot(r io.Reader, stopc <-chan struct
 		}
 	}
 
-	if err := batch.Commit(storage.Sync); err != nil {
+	// A synchronous commit requires Pebble's WAL, which can be disabled when
+	// Raft supplies the write-ahead log. Flush the restored state explicitly
+	// before reporting successful recovery, including its applied index.
+	if err := batch.Commit(storage.NoSync); err != nil {
 		return err
+	}
+	if err := s.db.Flush(); err != nil {
+		return fmt.Errorf("raft: flush recovered snapshot: %w", err)
 	}
 
 	index, err := s.readStoredUint64(appliedIndexKey)
