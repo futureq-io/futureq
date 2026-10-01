@@ -14,3 +14,14 @@ notes.md
 .claude
 AGENTS.md
 CLAUDE.md
+testing/*
+!testing/cmd/
+testing/cmd/*
+!testing/cmd/futureq-bench/
+!testing/go.mod
+!testing/go.sum
+!testing/reset-bench-cluster.sh
+!testing/set-bench-variant.py
+!testing/run-replica-bench.py
+futureq-bench
+.gitnexusignore
