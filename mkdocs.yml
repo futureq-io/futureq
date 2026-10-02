@@ -1,0 +1,44 @@
+site_name: FutureQ
+site_description: A high-performance, distributed delayed-message queue broker written in Go.
+site_url: https://futureq-io.github.io/
+repo_url: https://github.com/futureq-io/futureq
+repo_name: futureq-io/futureq
+edit_uri: edit/main/docs/
+
+theme:
+  name: material
+  palette:
+    scheme: slate
+    primary: blue
+    accent: light blue
+  features:
+    - navigation.tracking
+    - navigation.sections
+    - navigation.top
+    - navigation.expand
+    - content.code.copy
+    - toc.follow
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.highlight
+  - tables
+  - attr_list
+  - md_in_html
+  - toc:
+      permalink: true
+
+nav:
+  - Overview: index.md
+  - Quick start: quickstart.md
+  - Configuration: configuration.md
+  - Architecture: architecture.md
+  - Storage & key schema: storage.md
+  - Delivery pipeline: delivery.md
+  - Raft clustering: clustering.md
+  - gRPC API: api.md
+  - Observability: observability.md
+  - CLI: cli.md
+  - Project layout: project.md
