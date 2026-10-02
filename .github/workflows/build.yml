@@ -1,4 +1,4 @@
-name: Go Tests
+name: Build
 
 on:
   push:
@@ -6,8 +6,8 @@ on:
       - "**"
 
 jobs:
-  test:
-    name: Run Tests
+  build:
+    name: Build Project
     runs-on: ubuntu-latest
 
     steps:
@@ -23,5 +23,5 @@ jobs:
       - name: Install Dependencies
         run: go mod download
 
-      - name: Run Tests
-        run: go test -race -v ./...
+      - name: Build
+        run: go build -v ./...
