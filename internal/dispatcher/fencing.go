@@ -16,6 +16,8 @@ const ConsumerReadPermit = time.Second
 
 type deliveryRecord struct {
 	message    *pb.QueueMessage
+	topic      string
+	group      string
 	expires    time.Time
 	epoch      uint64
 	sending    bool // true only after the sender authorizes an actual stream send
@@ -99,7 +101,7 @@ func (h *Hub) ExpireInFlight(now time.Time) {
 			if record, exists := h.deliveryRecords[id][string(key)]; exists && now.Before(record.expires) {
 				kept = append(kept, key)
 			} else {
-				delete(h.deliveryRecords[id], string(key))
+				h.removeDeliveryRecordLocked(id, string(key))
 			}
 		}
 		h.inFlightByConsumer[id] = kept

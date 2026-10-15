@@ -8,8 +8,10 @@ import (
 	"time"
 
 	"github.com/futureq-io/futureq/internal/dispatcher"
+	"github.com/futureq-io/futureq/internal/metrics"
 	raft "github.com/futureq-io/futureq/internal/raft/event"
 	pb "github.com/futureq-io/protocol/proto/go"
+	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
@@ -45,6 +47,13 @@ func (b *retryDeleteBackend) DeleteKeys(keys [][]byte) error {
 	return nil
 }
 
+func inFlightGaugeValue(t *testing.T) float64 {
+	t.Helper()
+	var metric dto.Metric
+	require.NoError(t, metrics.MessagesInFlight.WithLabelValues("orders", "workers").Write(&metric))
+	return metric.GetGauge().GetValue()
+}
+
 func TestAckRetainsInFlightUntilPersistenceSucceeds(t *testing.T) {
 	for _, recipientACKs := range []bool{false, true} {
 		name := "delete-backend"
@@ -52,6 +61,7 @@ func TestAckRetainsInFlightUntilPersistenceSucceeds(t *testing.T) {
 			name = "recipient-acks"
 		}
 		t.Run(name, func(t *testing.T) {
+			baseline := inFlightGaugeValue(t)
 			hub := dispatcher.NewHub(dispatcher.NewRoundRobinStrategy(), zap.NewNop(), make(chan struct{}, 1))
 			queue := make(chan *pb.QueueMessage, 1)
 			hub.Register("consumer", "orders", "workers", queue)
@@ -85,6 +95,7 @@ func TestAckRetainsInFlightUntilPersistenceSucceeds(t *testing.T) {
 			handler.receiver(stream, "consumer", &pb.SubscribeInit{Topic: "orders", GroupId: "workers"}, errCh)
 			require.NoError(t, <-errCh)
 			require.Equal(t, 1, hub.GroupInFlightCount())
+			require.Equal(t, baseline+1, inFlightGaugeValue(t), "ACK receipt must not release the gauge before persistence")
 			require.False(t, hub.CanSend("consumer", message), "ACKed attempts cannot be sent again while persistence is pending")
 			require.False(t, hub.BeginSend("consumer", message))
 			require.Empty(t, hub.DispatchToTopic("orders", &pb.QueueMessage{}, key), "queued ACK must suppress redispatch")
@@ -95,9 +106,12 @@ func TestAckRetainsInFlightUntilPersistenceSucceeds(t *testing.T) {
 			cancel()
 			deleter.Run(ctx) // failed flush retains both the work and local tracking
 			require.Equal(t, 1, hub.GroupInFlightCount())
+			require.Equal(t, baseline+1, inFlightGaugeValue(t))
 			deleter.Run(ctx) // successful retry releases the in-flight record
 			require.Zero(t, hub.GroupInFlightCount())
+			require.Equal(t, baseline, inFlightGaugeValue(t))
 			deleter.Run(ctx) // completed batches must not be proposed again
+			require.Equal(t, baseline, inFlightGaugeValue(t))
 			if recipientACKs {
 				expected := []raft.DeliveryAck{{Key: key, Recipient: "g:workers"}}
 				require.Equal(t, [][]raft.DeliveryAck{expected, expected}, persisted)
@@ -110,6 +124,7 @@ func TestAckRetainsInFlightUntilPersistenceSucceeds(t *testing.T) {
 }
 
 func TestNackReleasesInFlightWithoutPersistence(t *testing.T) {
+	baseline := inFlightGaugeValue(t)
 	hub := dispatcher.NewHub(dispatcher.NewRoundRobinStrategy(), zap.NewNop(), make(chan struct{}, 1))
 	queue := make(chan *pb.QueueMessage, 1)
 	hub.Register("consumer", "orders", "workers", queue)
@@ -129,6 +144,7 @@ func TestNackReleasesInFlightWithoutPersistence(t *testing.T) {
 	NewConsumerHandler(zap.NewNop(), hub, deleter).receiver(stream, "consumer", &pb.SubscribeInit{Topic: "orders", GroupId: "workers"}, errCh)
 	require.NoError(t, <-errCh)
 	require.Zero(t, hub.GroupInFlightCount())
+	require.Equal(t, baseline, inFlightGaugeValue(t), "NACK must subtract exactly once")
 	require.Equal(t, [][]byte{key}, nacked)
 	require.NotEmpty(t, hub.DispatchToTopic("orders", &pb.QueueMessage{}, key))
 	ctx, cancel := context.WithCancel(context.Background())

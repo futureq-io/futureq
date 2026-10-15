@@ -65,10 +65,11 @@ var (
 		Help: "Total number of consumer acknowledgements received.",
 	}, []string{"topic", "group_id", "success"})
 
-	// MessagesInFlight tracks messages dispatched but not yet ACKed/NACKed.
+	// MessagesInFlight tracks live delivery records, including queued sends and
+	// successful ACKs awaiting persistence. The Hub owns all updates.
 	MessagesInFlight = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "futureq_messages_in_flight",
-		Help: "Current number of dispatched but unacknowledged messages.",
+		Help: "Current number of tracked delivery attempts, including queued sends and acknowledgements awaiting persistence.",
 	}, []string{"topic", "group_id"})
 
 	// ─── Dispatcher / delivery ───────────────────────────────────────────────

@@ -173,7 +173,7 @@ func (h *Hub) RejectQueuedAttempt(consumerID string, msg *pb.QueueMessage) {
 	h.inFlightMu.Lock()
 	record, exists := h.deliveryRecords[consumerID][string(msg.DeliveryTag)]
 	if exists && record.message == msg && !record.sending {
-		delete(h.deliveryRecords[consumerID], string(msg.DeliveryTag))
+		h.removeDeliveryRecordLocked(consumerID, string(msg.DeliveryTag))
 		keys := h.inFlightByConsumer[consumerID]
 		for i, key := range keys {
 			if string(key) == string(msg.DeliveryTag) {
@@ -229,7 +229,7 @@ func (h *Hub) RemoveAcknowledgedBatch(acks []raft.DeliveryAck) {
 		kept := keys[:0]
 		for _, key := range keys {
 			if done[string(key)] {
-				delete(h.deliveryRecords[id], string(key))
+				h.removeDeliveryRecordLocked(id, string(key))
 			} else {
 				kept = append(kept, key)
 			}
@@ -246,7 +246,7 @@ func (h *Hub) AcknowledgeSent(consumerID string, key []byte) bool {
 	if !exists || !record.sending || record.ackPending {
 		return false
 	}
-	delete(h.deliveryRecords[consumerID], string(key))
+	h.removeDeliveryRecordLocked(consumerID, string(key))
 	keys := h.inFlightByConsumer[consumerID]
 	for i, pending := range keys {
 		if string(pending) == string(key) {

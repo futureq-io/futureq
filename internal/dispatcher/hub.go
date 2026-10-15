@@ -313,6 +313,9 @@ func (h *Hub) Unregister(id string) {
 	// Delete in-flight keys for this consumer.
 	h.inFlightMu.Lock()
 	delete(h.inFlightByConsumer, id)
+	for key := range h.deliveryRecords[id] {
+		h.removeDeliveryRecordLocked(id, key)
+	}
 	delete(h.deliveryRecords, id)
 	h.inFlightMu.Unlock()
 }
@@ -439,7 +442,8 @@ func (h *Hub) trySend(c *ConsumerEntry, msg *pb.QueueMessage, deliveryTag []byte
 	case c.Ch <- queued:
 		metrics.DeliverySenderEnqueueLatenessMs.WithLabelValues(msg.Topic).Observe(float64(queuedAt.UnixNano())/1e6 - float64(msg.EnqueuedAtUnixMs+msg.DelayMs))
 		h.inFlightByConsumer[c.ID] = append(h.inFlightByConsumer[c.ID], deliveryTag)
-		h.deliveryRecords[c.ID][string(deliveryTag)] = deliveryRecord{message: queued, expires: time.Now().Add(h.inFlightTimeout), epoch: h.permitEpoch}
+		h.deliveryRecords[c.ID][string(deliveryTag)] = deliveryRecord{message: queued, topic: c.Topic, group: c.Group, expires: time.Now().Add(h.inFlightTimeout), epoch: h.permitEpoch}
+		metrics.MessagesInFlight.WithLabelValues(c.Topic, c.Group).Inc()
 		return true
 	default:
 		metrics.DeliveryRejectedTotal.WithLabelValues("full_queue").Inc()
@@ -452,6 +456,16 @@ func (h *Hub) trySend(c *ConsumerEntry, msg *pb.QueueMessage, deliveryTag []byte
 	}
 }
 
+// removeDeliveryRecordLocked releases metric accounting exactly once, even if
+// timeout, disconnect, ACK persistence, and deletion revisit the same delivery.
+// The caller must hold inFlightMu.
+func (h *Hub) removeDeliveryRecordLocked(consumerID, key string) {
+	if record, exists := h.deliveryRecords[consumerID][key]; exists {
+		delete(h.deliveryRecords[consumerID], key)
+		metrics.MessagesInFlight.WithLabelValues(record.topic, record.group).Dec()
+	}
+}
+
 // RemoveInFlightForConsumer removes a specific key from a consumer's in-flight
 // tracking. Called when the consumer ACKs or NACKs a message.
 func (h *Hub) RemoveInFlightForConsumer(consumerID string, key []byte) bool {
@@ -461,7 +475,7 @@ func (h *Hub) RemoveInFlightForConsumer(consumerID string, key []byte) bool {
 	for i, k := range keys {
 		if bytes.Equal(k, key) {
 			h.inFlightByConsumer[consumerID] = append(keys[:i], keys[i+1:]...)
-			delete(h.deliveryRecords[consumerID], string(key))
+			h.removeDeliveryRecordLocked(consumerID, string(key))
 			return true
 		}
 	}
@@ -495,7 +509,7 @@ func (h *Hub) RemoveDeletedBatch(keys [][]byte) {
 			if _, ok := deleted[string(key)]; !ok {
 				kept = append(kept, key)
 			} else {
-				delete(h.deliveryRecords[id], string(key))
+				h.removeDeliveryRecordLocked(id, string(key))
 			}
 		}
 		h.inFlightByConsumer[id] = kept

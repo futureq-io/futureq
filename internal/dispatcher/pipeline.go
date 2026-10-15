@@ -459,7 +459,6 @@ func (d *Dispatcher) deliverChunk(chunk deliveryChunk, states map[string]*raft.D
 		metrics.DeliveryOverheadMs.WithLabelValues(chunk.topic).Observe(float64(max(0, chunk.scanStarted-msg.EnqueuedAtUnixMs-msg.DelayMs)))
 		for _, group := range sentTo {
 			metrics.MessagesDispatchedTotal.WithLabelValues(chunk.topic, group).Inc()
-			metrics.MessagesInFlight.WithLabelValues(chunk.topic, group).Inc()
 		}
 	}
 	return delivered
