@@ -35,16 +35,17 @@ Different groups each get an independent copy of each message. Delivery to a cha
 - Once a message is actually sent to at least one consumer, the dispatcher records it in an in-flight map keyed by the raw storage key with the dispatch time.
 - An in-flight message blocks re-dispatch until `delivery.inFlightTimeout` (default 5s) elapses — then the entry is dropped and the message is re-dispatched on the next pass, possibly to a different consumer in the group.
 - Removal paths:
-    - Consumer ACK or NACK (the gRPC handler removes the entry either way — a NACK makes the message immediately re-dispatchable).
+    - Consumer ACK persistence succeeds (only that recipient's tracking is released; failed batches retain tracking while they retry, subject to the normal timeout and disconnect behavior).
+    - Consumer NACK (the gRPC handler releases the entry immediately, making the message re-dispatchable).
     - Consumer disconnect (the hub drops that consumer's in-flight keys instantly).
     - Batched delete applied through Raft (replicas clear their in-flight maps too).
 
 ## Deleter
 
-- ACKs and TTL expirations feed keys into the deleter via `MarkDeleted`.
+- ACKs feed recipient completions into the deleter via `TryMarkAcknowledged`; explicit deletions and TTL expirations enqueue keys via `MarkDeleted`.
 - Every `delivery.deleteBatchInterval` (default 500ms) it flushes the accumulated batch (up to 1024 keys per flush): one Raft `DeleteBatchCmd` proposal in clustered mode — replicated so a new leader can't re-dispatch ACKed messages after failover — or a single storage batch in standalone mode.
 - Failed batches are re-queued and retried on the next flush (`delete_failures_total` tracks failures).
-- After a successful flush, the dispatcher's in-flight entries for those keys are removed.
+- After a successful ACK flush, the hub releases tracking for the committed recipients, allowing the rebalance drain to proceed. The shared payload is deleted only after all required recipients complete. Successful explicit deletions clear tracking for the deleted keys.
 
 ## TTL janitor
 

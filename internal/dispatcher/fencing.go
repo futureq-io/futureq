@@ -15,10 +15,11 @@ import (
 const ConsumerReadPermit = time.Second
 
 type deliveryRecord struct {
-	message *pb.QueueMessage
-	expires time.Time
-	epoch   uint64
-	sending bool // true only after the sender authorizes an actual stream send
+	message    *pb.QueueMessage
+	expires    time.Time
+	epoch      uint64
+	sending    bool // true only after the sender authorizes an actual stream send
+	ackPending bool // ACK received, but persistence has not completed
 }
 
 func (h *Hub) SetDeliveryTimeout(timeout time.Duration) {
@@ -84,7 +85,7 @@ func (h *Hub) CanSend(consumerID string, msg *pb.QueueMessage) bool {
 	h.inFlightMu.Lock()
 	defer h.inFlightMu.Unlock()
 	record, exists := h.deliveryRecords[consumerID][string(msg.DeliveryTag)]
-	return exists && record.message == msg && time.Now().Before(record.expires) && (h.version == nil || record.epoch == h.permitEpoch)
+	return exists && !record.ackPending && record.message == msg && time.Now().Before(record.expires) && (h.version == nil || record.epoch == h.permitEpoch)
 }
 
 // ExpireInFlight runs even while dispatch is frozen. Stalled consumers cannot

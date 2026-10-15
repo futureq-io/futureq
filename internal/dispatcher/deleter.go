@@ -93,6 +93,9 @@ type Deleter struct {
 	// AcknowledgeBatch persists independent recipient completions. It deletes
 	// a shared payload only after every required recipient has ACKed.
 	AcknowledgeBatch func([]raft.DeliveryAck) error
+	// OnAcknowledged releases local recipient tracking after ACK persistence.
+	// Install before Run. It is not called for failed batches.
+	OnAcknowledged func([]raft.DeliveryAck)
 
 	// OnDelete is called after keys are successfully deleted, with copies of
 	// each key. Used to remove entries from the dispatcher's in-flight map.
@@ -138,8 +141,8 @@ func (d *Deleter) TryMarkDeleted(key []byte) bool {
 	return true
 }
 
-// MarkAcknowledged releases local consumer tracking immediately; persistence
-// and retries happen asynchronously, independently of the rebalance drain.
+// MarkAcknowledged queues recipient persistence and retries asynchronously.
+// Local tracking is released by OnAcknowledged after a successful flush.
 func (d *Deleter) MarkAcknowledged(key []byte, recipient string) {
 	if !d.TryMarkAcknowledged(key, recipient) {
 		d.logger.Warn("ACK queue full; uncommitted recipient will be redelivered")
@@ -200,6 +203,9 @@ func (d *Deleter) flush() {
 				delete(d.ackKeys, string(ack.Key)+"\x00"+ack.Recipient)
 			}
 			d.mu.Unlock()
+			if d.OnAcknowledged != nil {
+				d.OnAcknowledged(acks)
+			}
 		}
 	}
 	d.mu.Lock()
