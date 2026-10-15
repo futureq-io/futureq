@@ -5,7 +5,7 @@
 FutureQ lets producers publish messages with a relative delay and guarantees reliable dispatch to consumers when the delay expires. It combines durable embedded storage, Raft-based replication, and bidirectional gRPC streaming into a single, easy-to-operate binary.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Go](https://img.shields.io/badge/Go-1.26-00ADD8?logo=go)](go.mod)
+[![Go](https://img.shields.io/badge/Go-1.27.1-00ADD8?logo=go)](go.mod)
 
 ---
 
@@ -24,7 +24,7 @@ FutureQ lets producers publish messages with a relative delay and guarantees rel
 
 | Concern      | Choice                                        |
 | ------------ | --------------------------------------------- |
-| Language     | Go 1.26                                       |
+| Language     | Go 1.27.1                                     |
 | Storage      | Pebble (LSM tree)                             |
 | Consensus    | Dragonboat (multi-group Raft)                 |
 | Transport    | gRPC (bidirectional streaming)                |
@@ -96,7 +96,7 @@ to run this version before replica consumption is enabled.
 
 ### Prerequisites
 
-- Go 1.26+
+- Go 1.27.1+
 - (Optional) Docker
 
 ### Build & run a standalone node

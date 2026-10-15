@@ -2,7 +2,7 @@
 
 ## Prerequisites
 
-- Go 1.26+
+- Go 1.27.1+
 - (Optional) Docker
 
 ## Build & run a standalone node

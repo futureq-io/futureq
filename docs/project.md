@@ -44,7 +44,7 @@ golangci-lint run    # lint
 | `test.yml`         | `go test -race -v ./...` |
 | `golangci-lint.yml`| golangci-lint action (latest version, read-only permissions) |
 
-All on ubuntu-latest with Go 1.26.5.
+All on ubuntu-latest with Go 1.27.1, read from `go.mod`.
 
 ## Contributing
 

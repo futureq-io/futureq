@@ -23,7 +23,7 @@ FutureQ lets producers publish messages with a relative delay and guarantees rel
 
 | Concern   | Choice                                          |
 | --------- | ----------------------------------------------- |
-| Language  | Go 1.26                                         |
+| Language  | Go 1.27.1                                       |
 | Storage   | Pebble (LSM tree) · bbolt (alternative) · in-memory |
 | Consensus | Dragonboat v4 (multi-group Raft)                |
 | Transport | gRPC (bidirectional streaming)                  |
