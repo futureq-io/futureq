@@ -229,7 +229,9 @@ func (d *Dispatcher) collectTopic(topic string, nowMs int64) deliveryChunk {
 	examined, bytesRead, commandBytes := 0, 0, 3
 	valid := iter.First()
 	for valid {
-		if examined >= d.Limits.Examined || len(chunk.items) >= d.Limits.Candidates || bytesRead >= d.Limits.Bytes || time.Since(started) >= d.Limits.WorkTime || !d.hub.DeliveryPermitted() {
+		// Iterator setup may consume the entire time budget. Examine one key
+		// before yielding on time so repeated scans can advance the cursor.
+		if examined >= d.Limits.Examined || len(chunk.items) >= d.Limits.Candidates || bytesRead >= d.Limits.Bytes || (examined > 0 && time.Since(started) >= d.Limits.WorkTime) || !d.hub.DeliveryPermitted() {
 			break
 		}
 		key, value := iter.Key(), iter.Value()
@@ -329,7 +331,9 @@ func (d *Dispatcher) collectMaintenance() deliveryChunk {
 	examined, bytesRead, commandBytes := 0, 0, 3
 	valid := iter.First()
 	for valid {
-		if examined >= d.Limits.Examined || len(chunk.items) >= d.Limits.Candidates || bytesRead >= d.Limits.Bytes || time.Since(started) >= d.Limits.WorkTime || !d.hub.DeliveryPermitted() {
+		// Maintenance must also advance when iterator setup exhausts the
+		// time budget; permission and size limits still apply to the first key.
+		if examined >= d.Limits.Examined || len(chunk.items) >= d.Limits.Candidates || bytesRead >= d.Limits.Bytes || (examined > 0 && time.Since(started) >= d.Limits.WorkTime) || !d.hub.DeliveryPermitted() {
 			break
 		}
 		key, value := iter.Key(), iter.Value()
