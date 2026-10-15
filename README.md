@@ -58,6 +58,40 @@ FutureQ lets producers publish messages with a relative delay and guarantees rel
 
 Delivery is **at-least-once** — consumers should be idempotent.
 
+### Replica consumption and acknowledgements
+
+Consumers can connect to any event replica. Named groups share a deterministic
+assignment based on the event ID modulo the number of consumers, ordered by node
+ID and then registration order. Consumers with an empty group ID receive
+independent copies; they do not compete with each other.
+
+Before a message's first delivery, the event shard records its recipients: one
+interest per connected named group and one per universal subscription. An ACK
+completes only that interest. The payload and its receipt state are deleted
+together after all required interests finish. Recipient ACKs are batched through
+Raft, and completed groups are skipped on later scans. New subscriptions do not
+join an already prepared message's recipient list. An incomplete named-group
+interest survives disconnects and can resume when the group reconnects.
+Universal subscriptions are ephemeral: a later scan releases their interest
+after they unregister. TTL and explicit message deletion override these interests
+and remove the message across the cluster.
+
+Consumer membership changes pause delivery until replicas drain or time out
+their old deliveries. A replica must pass fresh quorum reads for both metadata
+and event data to serve messages; its delivery permit lasts one second. If a
+replica cannot acknowledge a rebalance, the available replicas can fence it after
+`delivery.inFlightTimeout` plus that one-second permit, with scheduling and Raft
+latency added. Fencing removes the unavailable replica's subscriptions from the
+assignment. Returning replicas must catch up and register live subscriptions
+before serving again. Consumer timeouts and a crash before ACK persistence can
+cause duplicate deliveries, as permitted by at-least-once delivery.
+
+Fan-out retention means an incomplete named group can retain a payload until it
+ACKs, reconnects and ACKs, or the message expires/is explicitly deleted. Each newly
+prepared message adds an event-Raft write; throughput with this bookkeeping has
+not been benchmarked. Upgrading the command format requires all cluster members
+to run this version before replica consumption is enabled.
+
 ## Quick Start
 
 ### Prerequisites
@@ -163,6 +197,15 @@ FutureQ speaks gRPC; protobuf definitions live in [`futureq-io/protocol`](https:
 | `LeaveMetadata`    | unary               | Remove a node from the metadata group only         |
 
 Metrics are exposed at `observability.metrics.listen` (default `0.0.0.0:9090`) in Prometheus format.
+
+`delivery.consumerQueueSize` sets the sender channel capacity per consumer (default 1024, range 1..65536). Override it with `FUTUREQ_DELIVERY_CONSUMERQUEUESIZE`, for example `2048`. In-flight attempt tracking is bounded by the larger of 1024 and that consumer's queue capacity; larger queues therefore increase per-connection memory capacity.
+
+Delivery lateness is measured against each message's enqueue timestamp plus its requested delay:
+
+- `futureq_delivery_sender_enqueue_lateness_ms`: timestamp immediately before a successful handoff to the sender queue minus the due time. Includes retries; excludes rejected enqueues and time spent waiting in the sender queue.
+- `futureq_delivery_send_lateness_ms`: timestamp immediately before `stream.Send()` minus the due time. Includes retries and send attempts that later fail; excludes time blocked in that attempt's `Send()` call.
+
+Both are histograms in milliseconds, labeled by topic. A queued attempt can expire before sending, so their sample populations can differ; subtracting their percentiles does not measure queue wait.
 
 ## Project Layout
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"time"
 
 	"github.com/google/uuid"
 	"go.uber.org/zap"
@@ -14,6 +15,7 @@ import (
 	"github.com/futureq-io/futureq/internal/app"
 	"github.com/futureq-io/futureq/internal/dispatcher"
 	"github.com/futureq-io/futureq/internal/metrics"
+	"github.com/futureq-io/futureq/pkg/raft/metadata"
 	pb "github.com/futureq-io/protocol/proto/go"
 )
 
@@ -58,21 +60,48 @@ func (h *ConsumerHandler) Subscribe(stream grpc.BidiStreamingServer[pb.ConsumerF
 	if err != nil {
 		return err
 	}
-
-	// ─── Verify leadership in Raft mode ────────────────────────────────────────
-	// TODO: WE SHALL ENABLE CONSUME ON REPLICAS
-	if err := h.checkLeadership(init); err != nil {
-		return err
+	if init == nil {
+		return nil
 	}
 
 	// ─── Register consumer with the Hub ────────────────────────────────────────
 	consumerID := uuid.New().String()
-	ch := make(chan *pb.QueueMessage, 1024)
-	h.hub.Register(consumerID, init.Topic, init.GroupId, ch)
+	ch := make(chan *pb.QueueMessage, app.A.Config().Delivery.ConsumerQueueSize)
+	clusteredGroup := app.A.NodeHost != nil
+	if clusteredGroup {
+		member := metadata.ConsumerMember{ID: consumerID, NodeID: app.A.Config().Cluster.NodeID}
+		err = h.hub.WithConsumerRegistry(func() error {
+			h.hub.Register(consumerID, init.Topic, init.GroupId, ch)
+			ctx, cancel := context.WithTimeout(stream.Context(), 10*time.Second)
+			defer cancel()
+			if err := app.A.MetadataSvc.ChangeConsumer(ctx, app.A.Config().Cluster.ShardID, init.Topic, init.GroupId, member, true); err != nil {
+				h.hub.Unregister(consumerID)
+				return err
+			}
+			return nil
+		})
+		if err != nil {
+			return status.Errorf(codes.Unavailable, "failed to register consumer: %v", err)
+		}
+	} else {
+		h.hub.Register(consumerID, init.Topic, init.GroupId, ch)
+	}
 
 	metrics.ActiveConsumers.WithLabelValues(init.Topic, init.GroupId).Inc()
 	defer func() {
-		h.hub.Unregister(consumerID)
+		if clusteredGroup {
+			if err := h.hub.WithConsumerRegistry(func() error {
+				h.hub.Unregister(consumerID)
+				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer cancel()
+				member := metadata.ConsumerMember{ID: consumerID, NodeID: app.A.Config().Cluster.NodeID}
+				return app.A.MetadataSvc.ChangeConsumer(ctx, app.A.Config().Cluster.ShardID, init.Topic, init.GroupId, member, false)
+			}); err != nil {
+				h.logger.Warn("failed to unregister consumer; reconciliation will retry", zap.Error(err))
+			}
+		} else {
+			h.hub.Unregister(consumerID)
+		}
 		metrics.ActiveConsumers.WithLabelValues(init.Topic, init.GroupId).Dec()
 		h.logger.Info("consumer disconnected",
 			zap.String("id", consumerID),
@@ -80,6 +109,17 @@ func (h *ConsumerHandler) Subscribe(stream grpc.BidiStreamingServer[pb.ConsumerF
 			zap.String("group_id", init.GroupId),
 		)
 	}()
+	if clusteredGroup {
+		ticker := time.NewTicker(20 * time.Millisecond)
+		defer ticker.Stop()
+		for !app.A.MetadataSM.ConsumerActive(init.Topic, init.GroupId, consumerID) {
+			select {
+			case <-stream.Context().Done():
+				return stream.Context().Err()
+			case <-ticker.C:
+			}
+		}
+	}
 
 	h.logger.Info("consumer connected",
 		zap.String("id", consumerID),
@@ -94,7 +134,7 @@ func (h *ConsumerHandler) Subscribe(stream grpc.BidiStreamingServer[pb.ConsumerF
 	errCh := make(chan error, 2)
 
 	// ─── Sender goroutine: push messages to the consumer ─────────────────────
-	go h.sender(ctx, stream, ch, errCh)
+	go h.sender(ctx, stream, consumerID, ch, errCh)
 
 	// ─── Receiver goroutine: process ACK/NACK frames ─────────────────────────
 	go h.receiver(stream, consumerID, init, errCh)
@@ -137,32 +177,11 @@ func (h *ConsumerHandler) readInit(stream grpc.BidiStreamingServer[pb.ConsumerFr
 	return init, nil
 }
 
-// checkLeadership verifies this node is the Raft leader (if Raft is enabled).
-func (h *ConsumerHandler) checkLeadership(init *pb.SubscribeInit) error {
-	if app.A.NodeHost == nil {
-		return nil
-	}
-
-	shardID := app.A.Config().Cluster.ShardID
-	leaderID, _, valid, err := app.A.NodeHost.GetLeaderID(shardID)
-	isLeader := err == nil && valid && leaderID == app.A.Config().Cluster.NodeID
-
-	if !isLeader {
-		h.logger.Warn("rejecting consumer: not the leader",
-			zap.String("topic", init.Topic),
-			zap.String("group_id", init.GroupId),
-		)
-		return status.Errorf(codes.FailedPrecondition,
-			"node is not the cluster leader")
-	}
-
-	return nil
-}
-
 // sender pushes messages from the consumer's channel to the gRPC stream.
 func (h *ConsumerHandler) sender(
 	ctx context.Context,
 	stream grpc.BidiStreamingServer[pb.ConsumerFrame, pb.QueueMessage],
+	consumerID string,
 	ch chan *pb.QueueMessage,
 	errCh chan error,
 ) {
@@ -172,10 +191,18 @@ func (h *ConsumerHandler) sender(
 			errCh <- ctx.Err()
 			return
 		case msg := <-ch:
+			if !h.hub.BeginSend(consumerID, msg) {
+				h.hub.RejectQueuedAttempt(consumerID, msg)
+				continue // expired, ACKed, or fenced buffered delivery
+			}
+			// Observe before Send: consumer backpressure can block this call.
+			// Count attempted sends here, including attempts that fail in Send.
+			metrics.DeliverySendLatenessMs.WithLabelValues(msg.Topic).Observe(float64(time.Now().UnixNano())/1e6 - float64(msg.EnqueuedAtUnixMs+msg.DelayMs))
 			if err := stream.Send(msg); err != nil {
 				errCh <- err
 				return
 			}
+			metrics.DeliveryGRPCSendsTotal.WithLabelValues(msg.Topic).Inc()
 		}
 	}
 }
@@ -211,10 +238,22 @@ func (h *ConsumerHandler) receiver(
 			init.Topic, init.GroupId, boolToStr(success),
 		).Inc()
 
-		h.hub.RemoveInFlightForConsumer(consumerID, ackReq.DeliveryTag)
+		if !h.hub.AcknowledgeSent(consumerID, ackReq.DeliveryTag) {
+			h.logger.Warn("ignoring ACK for a delivery not sent to this consumer", zap.String("consumer_id", consumerID))
+			continue
+		}
 		if success {
-			// ACK: queue the key for Raft-replicated deletion.
-			h.deleter.MarkDeleted(ackReq.DeliveryTag)
+			// ACK completes this delivery immediately. Rebalancing may proceed
+			// while the replicated delete is pending; a replica can redeliver
+			// the message in that window under at-least-once semantics.
+			if !h.deleter.TryMarkAcknowledged(ackReq.DeliveryTag, metadata.DeliveryRecipient(init.GroupId, consumerID)) {
+				errCh <- status.Error(codes.ResourceExhausted, "durable ACK queue full; retry subscription")
+				return
+			}
+		} else {
+			if h.hub.OnNack != nil {
+				h.hub.OnNack(ackReq.DeliveryTag)
+			}
 		}
 		// NACK: the key remains in storage; the dispatcher will re-deliver it.
 		// In-flight gauge was incremented at dispatch time in the hub.

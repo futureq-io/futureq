@@ -19,8 +19,16 @@ type Pebble struct {
 
 // NewPebble opens a Pebble database using the given config.
 func NewPebble(cfg config.Pebble, logger *zap.Logger) (*Pebble, error) {
+	concurrency := cfg.CompactionConcurrency
+	if concurrency < 0 {
+		return nil, fmt.Errorf("pebble compaction concurrency must be positive")
+	}
+	if concurrency == 0 {
+		concurrency = 1 // Preserve direct callers that omit this configuration field.
+	}
 	pebbleLogger := logger.Named("storage").With(
 		zap.String("engine", "pebble"),
+		zap.Int("compaction_concurrency", concurrency),
 	)
 
 	cacheSize, err := cfg.CacheSize.Bytes()
@@ -38,11 +46,12 @@ func NewPebble(cfg config.Pebble, logger *zap.Logger) (*Pebble, error) {
 
 	eventListener := pebble.MakeLoggingEventListener(pebbleLogger.Sugar())
 	dbOpts := &pebble.Options{
-		DisableWAL:    cfg.Mode != "memory" && !cfg.WALEnabled,
-		Logger:        pebbleLogger.Sugar(),
-		Cache:         cache,
-		MemTableSize:  uint64(memtableSize),
-		EventListener: &eventListener,
+		DisableWAL:                 cfg.Mode != "memory" && !cfg.WALEnabled,
+		Logger:                     pebbleLogger.Sugar(),
+		Cache:                      cache,
+		MemTableSize:               uint64(memtableSize),
+		EventListener:              &eventListener,
+		CompactionConcurrencyRange: func() (int, int) { return concurrency, concurrency },
 	}
 
 	path := cfg.DataDir

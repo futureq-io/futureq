@@ -196,7 +196,7 @@ func (s *DispatcherSuite) TestIsExpired_TTLNotYetElapsed_False() {
 // ─── dispatchAll (standalone mode, no raft) ─────────────────────────────────
 //
 // These tests exercise the standalone path where app.A.NodeHost == nil, so
-// isLeader() always returns true.
+// Standalone mode dispatches without a Raft read barrier.
 
 func (s *DispatcherSuite) TestDispatchAll_NoConsumers_ReturnsZero() {
 	require := s.Require()
