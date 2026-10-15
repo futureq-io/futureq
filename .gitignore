@@ -25,3 +25,4 @@ testing/cmd/*
 !testing/run-replica-bench.py
 futureq-bench
 .gitnexusignore
+CLAUDE.mdsite/
