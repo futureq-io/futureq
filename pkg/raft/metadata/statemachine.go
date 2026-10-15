@@ -91,6 +91,33 @@ func (s *MetadataStateMachine) Update(entry statemachine.Entry) (statemachine.Re
 		}
 		return statemachine.Result{Value: 0}, nil
 
+	case ConsumerHeartbeatCmd:
+		var heartbeat consumerAck
+		if err := json.Unmarshal(entry.Cmd[1:], &heartbeat); err != nil {
+			return statemachine.Result{}, err
+		}
+		s.mu.Lock()
+		if s.consumers.Heartbeats == nil {
+			s.consumers.Heartbeats = make(map[uint64]uint64)
+		}
+		s.consumers.Heartbeats[heartbeat.NodeID]++
+		s.mu.Unlock()
+		return statemachine.Result{Value: 1}, nil
+
+	case ConsumerProbeCmd:
+		var probe consumerAck
+		if err := json.Unmarshal(entry.Cmd[1:], &probe); err != nil {
+			return statemachine.Result{}, err
+		}
+		s.withConsumerBarrier(func() {
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			if !s.consumers.Pending && s.consumers.Epoch == probe.Epoch && len(s.consumers.Groups) > 0 {
+				s.consumers.startRebalance(s.consumers.Required)
+			}
+		})
+		return statemachine.Result{Value: 1}, nil
+
 	case ConsumerAckCmd:
 		var ack consumerAck
 		if err := json.Unmarshal(entry.Cmd[1:], &ack); err != nil {

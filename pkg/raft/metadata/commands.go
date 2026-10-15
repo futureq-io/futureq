@@ -32,6 +32,11 @@ const (
 	// ConsumerFenceCmd activates a drained assignment without unavailable
 	// replicas, after their bounded delivery permits have expired.
 	ConsumerFenceCmd
+	// ConsumerHeartbeatCmd records a quorum-backed liveness observation without
+	// changing the delivery assignment. ConsumerProbeCmd starts a drain barrier
+	// for an active epoch whose serving replicas may have stopped responding.
+	ConsumerHeartbeatCmd
+	ConsumerProbeCmd
 )
 
 // ShardTopology describes the current state of a single Raft shard.

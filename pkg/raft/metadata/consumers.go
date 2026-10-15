@@ -16,11 +16,12 @@ type ConsumerMember struct {
 // ConsumerState is replicated by the metadata Raft group. Members are sorted
 // by node ID, then by registration order within a node.
 type ConsumerState struct {
-	Groups   map[string]map[string][]ConsumerMember `json:"groups"`
-	Epoch    uint64                                 `json:"epoch"`
-	Pending  bool                                   `json:"pending"`
-	Required []uint64                               `json:"required"`
-	Acked    map[uint64]bool                        `json:"acked"`
+	Groups     map[string]map[string][]ConsumerMember `json:"groups"`
+	Epoch      uint64                                 `json:"epoch"`
+	Pending    bool                                   `json:"pending"`
+	Required   []uint64                               `json:"required"`
+	Acked      map[uint64]bool                        `json:"acked"`
+	Heartbeats map[uint64]uint64                      `json:"heartbeats,omitempty"`
 }
 
 type consumerChange struct {

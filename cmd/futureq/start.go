@@ -90,6 +90,11 @@ func startRun(cmd *cobra.Command, _ []string) {
 	wakeCh := make(chan struct{}, 1)
 	strategy := dispatcher.NewRoundRobinStrategy()
 	hub := dispatcher.NewHub(strategy, logger, wakeCh)
+	if !cfg.Cluster.Enabled {
+		if err := hub.RestoreStandaloneEpoch(a.DB); err != nil {
+			logger.Fatal("failed to restore standalone delivery epoch", zap.Error(err))
+		}
+	}
 
 	inFlightTimeout := cfg.Delivery.InFlightTimeout
 	deleteInterval := cfg.Delivery.DeleteBatchInterval
