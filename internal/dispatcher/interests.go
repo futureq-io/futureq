@@ -4,6 +4,7 @@ import (
 	"time"
 
 	"github.com/futureq-io/futureq/internal/metrics"
+	raft "github.com/futureq-io/futureq/internal/raft/event"
 	"github.com/futureq-io/futureq/pkg/raft/metadata"
 	pb "github.com/futureq-io/protocol/proto/go"
 )
@@ -188,11 +189,61 @@ func (h *Hub) RejectQueuedAttempt(consumerID string, msg *pb.QueueMessage) {
 	}
 }
 
+// MarkAcknowledgedSent accepts a successful ACK once, retaining the delivery
+// record until persistence completes (or the normal timeout/disconnect).
+func (h *Hub) MarkAcknowledgedSent(consumerID string, key []byte) bool {
+	h.inFlightMu.Lock()
+	defer h.inFlightMu.Unlock()
+	record, exists := h.deliveryRecords[consumerID][string(key)]
+	if !exists || !record.sending || record.ackPending {
+		return false
+	}
+	record.ackPending = true
+	h.deliveryRecords[consumerID][string(key)] = record
+	return true
+}
+
+// RemoveAcknowledgedBatch releases only the recipients whose ACKs committed.
+// Other recipients may still need the same payload.
+func (h *Hub) RemoveAcknowledgedBatch(acks []raft.DeliveryAck) {
+	completed := make(map[string]map[string]bool)
+	for _, ack := range acks {
+		if completed[ack.Recipient] == nil {
+			completed[ack.Recipient] = make(map[string]bool)
+		}
+		completed[ack.Recipient][string(ack.Key)] = true
+	}
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	h.inFlightMu.Lock()
+	defer h.inFlightMu.Unlock()
+	for id, keys := range h.inFlightByConsumer {
+		consumer := h.byID[id]
+		if consumer == nil {
+			continue
+		}
+		done := completed[metadata.DeliveryRecipient(consumer.Group, id)]
+		if len(done) == 0 {
+			continue
+		}
+		kept := keys[:0]
+		for _, key := range keys {
+			if done[string(key)] {
+				delete(h.deliveryRecords[id], string(key))
+			} else {
+				kept = append(kept, key)
+			}
+		}
+		h.inFlightByConsumer[id] = kept
+	}
+}
+
+// AcknowledgeSent releases a sent delivery immediately for a NACK.
 func (h *Hub) AcknowledgeSent(consumerID string, key []byte) bool {
 	h.inFlightMu.Lock()
 	defer h.inFlightMu.Unlock()
 	record, exists := h.deliveryRecords[consumerID][string(key)]
-	if !exists || !record.sending {
+	if !exists || !record.sending || record.ackPending {
 		return false
 	}
 	delete(h.deliveryRecords[consumerID], string(key))

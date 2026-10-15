@@ -15,10 +15,11 @@ import (
 const ConsumerReadPermit = time.Second
 
 type deliveryRecord struct {
-	message *pb.QueueMessage
-	expires time.Time
-	epoch   uint64
-	sending bool // true only after the sender authorizes an actual stream send
+	message    *pb.QueueMessage
+	expires    time.Time
+	epoch      uint64
+	sending    bool // true only after the sender authorizes an actual stream send
+	ackPending bool // ACK received, but persistence has not completed
 }
 
 func (h *Hub) SetDeliveryTimeout(timeout time.Duration) {

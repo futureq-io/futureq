@@ -238,14 +238,19 @@ func (h *ConsumerHandler) receiver(
 			init.Topic, init.GroupId, boolToStr(success),
 		).Inc()
 
-		if !h.hub.AcknowledgeSent(consumerID, ackReq.DeliveryTag) {
+		accepted := false
+		if success {
+			accepted = h.hub.MarkAcknowledgedSent(consumerID, ackReq.DeliveryTag)
+		} else {
+			accepted = h.hub.AcknowledgeSent(consumerID, ackReq.DeliveryTag)
+		}
+		if !accepted {
 			h.logger.Warn("ignoring ACK for a delivery not sent to this consumer", zap.String("consumer_id", consumerID))
 			continue
 		}
 		if success {
-			// ACK completes this delivery immediately. Rebalancing may proceed
-			// while the replicated delete is pending; a replica can redeliver
-			// the message in that window under at-least-once semantics.
+			// Keep this recipient in flight until the batched ACK commits.
+			// Persistence failures retain the record while the deleter retries.
 			if !h.deleter.TryMarkAcknowledged(ackReq.DeliveryTag, metadata.DeliveryRecipient(init.GroupId, consumerID)) {
 				errCh <- status.Error(codes.ResourceExhausted, "durable ACK queue full; retry subscription")
 				return

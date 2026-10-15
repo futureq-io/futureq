@@ -138,6 +138,7 @@ func startRun(cmd *cobra.Command, _ []string) {
 	}
 	deleter := dispatcher.NewDeleter(ledger, deleteInterval, logger)
 	deleter.AcknowledgeBatch = ledger.Acknowledge
+	deleter.OnAcknowledged = hub.RemoveAcknowledgedBatch
 	disp := dispatcher.NewDispatcher(
 		a.DB, hub, deleter,
 		dispatchInterval, inFlightTimeout,
