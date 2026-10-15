@@ -51,6 +51,7 @@ func (s *ConfigSuite) TestPartialFileAndEnvironmentOverrides() {
 	s.T().Setenv("FUTUREQ_CLUSTER_NODEID", "7")
 	s.T().Setenv("FUTUREQ_DELIVERY_INFLIGHTTIMEOUT", "11s")
 	s.T().Setenv("FUTUREQ_STORAGE_PEBBLE_CACHESIZE", "32MiB")
+	s.T().Setenv("FUTUREQ_STORAGE_PEBBLE_COMPACTIONCONCURRENCY", "3")
 
 	cfg, err := Load(path)
 	s.Require().NoError(err)
@@ -58,6 +59,7 @@ func (s *ConfigSuite) TestPartialFileAndEnvironmentOverrides() {
 	s.Equal(uint64(7), cfg.Cluster.NodeID)
 	s.Equal(11*time.Second, cfg.Delivery.InFlightTimeout)
 	s.Equal(Size("32MiB"), cfg.Storage.Pebble.CacheSize)
+	s.Equal(3, cfg.Storage.Pebble.CompactionConcurrency)
 	s.Equal(time.Millisecond, cfg.Delivery.TimeBucket)
 }
 
@@ -104,6 +106,8 @@ func (s *ConfigSuite) TestRejectsUnknownAndInvalidValues() {
 		{"bootstrap and join", "cluster:\n  enabled: true\n  joinSeeds: ['node2.example:8443']\n  raft:\n    advertise: 'node1.example:50005'\n    initialMembers: {1: 'node1.example:50005'}\napi:\n  grpc:\n    advertise: 'node1.example:8443'\n", "cannot both be set"},
 		{"missing bolt file", "storage:\n  engine: bolt\n  bolt:\n    file: ''\n", "storage.bolt.file"},
 		{"zero dispatch interval", "delivery:\n  dispatchPollInterval: 0s\n", "delivery intervals"},
+		{"zero compaction concurrency", "storage:\n  pebble:\n    compactionConcurrency: 0\n", "compactionConcurrency"},
+		{"negative compaction concurrency", "storage:\n  pebble:\n    compactionConcurrency: -1\n", "compactionConcurrency"},
 	}
 	for _, tt := range tests {
 		s.Run(tt.name, func() {

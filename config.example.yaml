@@ -41,6 +41,7 @@ storage:
     walEnabled: true
     cacheSize: 16MiB
     memtableSize: 64MiB
+    compactionConcurrency: 1 # Normal and upper compaction concurrency; delete-only compactions may exceed it.
   # Used only when engine is bolt. Bolt always writes a file.
   bolt:
     file: "./data/futureq.db"

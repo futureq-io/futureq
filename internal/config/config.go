@@ -70,11 +70,12 @@ type Storage struct {
 }
 
 type Pebble struct {
-	Mode         string `mapstructure:"mode" yaml:"mode"`
-	DataDir      string `mapstructure:"dataDir" yaml:"dataDir"`
-	WALEnabled   bool   `mapstructure:"walEnabled" yaml:"walEnabled"`
-	CacheSize    Size   `mapstructure:"cacheSize" yaml:"cacheSize"`
-	MemtableSize Size   `mapstructure:"memtableSize" yaml:"memtableSize"`
+	Mode                  string `mapstructure:"mode" yaml:"mode"`
+	DataDir               string `mapstructure:"dataDir" yaml:"dataDir"`
+	WALEnabled            bool   `mapstructure:"walEnabled" yaml:"walEnabled"`
+	CacheSize             Size   `mapstructure:"cacheSize" yaml:"cacheSize"`
+	MemtableSize          Size   `mapstructure:"memtableSize" yaml:"memtableSize"`
+	CompactionConcurrency int    `mapstructure:"compactionConcurrency" yaml:"compactionConcurrency"`
 }
 
 type Bolt struct {
@@ -297,6 +298,9 @@ func (c *Config) validateStorage() error {
 	switch c.Storage.Engine {
 	case "pebble":
 		p := c.Storage.Pebble
+		if p.CompactionConcurrency < 1 {
+			return fmt.Errorf("storage.pebble.compactionConcurrency must be at least 1")
+		}
 		if p.Mode != "disk" && p.Mode != "memory" {
 			return fmt.Errorf("storage.pebble.mode must be disk or memory")
 		}
