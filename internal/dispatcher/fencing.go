@@ -85,7 +85,7 @@ func (h *Hub) CanSend(consumerID string, msg *pb.QueueMessage) bool {
 	h.inFlightMu.Lock()
 	defer h.inFlightMu.Unlock()
 	record, exists := h.deliveryRecords[consumerID][string(msg.DeliveryTag)]
-	return exists && record.message == msg && time.Now().Before(record.expires) && (h.version == nil || record.epoch == h.permitEpoch)
+	return exists && !record.ackPending && record.message == msg && time.Now().Before(record.expires) && (h.version == nil || record.epoch == h.permitEpoch)
 }
 
 // ExpireInFlight runs even while dispatch is frozen. Stalled consumers cannot

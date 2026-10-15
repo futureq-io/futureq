@@ -57,7 +57,8 @@ func TestAckRetainsInFlightUntilPersistenceSucceeds(t *testing.T) {
 			hub.Register("consumer", "orders", "workers", queue)
 			key := []byte("delivery-tag")
 			require.Equal(t, []string{"workers"}, hub.DispatchToTopic("orders", &pb.QueueMessage{}, key))
-			require.True(t, hub.BeginSend("consumer", <-queue))
+			message := <-queue
+			require.True(t, hub.BeginSend("consumer", message))
 			backend := &retryDeleteBackend{fail: true}
 			deleter := dispatcher.NewDeleter(backend, time.Hour, zap.NewNop())
 			deleter.OnDelete = func(key []byte) { hub.RemoveDeletedBatch([][]byte{key}) }
@@ -84,6 +85,8 @@ func TestAckRetainsInFlightUntilPersistenceSucceeds(t *testing.T) {
 			handler.receiver(stream, "consumer", &pb.SubscribeInit{Topic: "orders", GroupId: "workers"}, errCh)
 			require.NoError(t, <-errCh)
 			require.Equal(t, 1, hub.GroupInFlightCount())
+			require.False(t, hub.CanSend("consumer", message), "ACKed attempts cannot be sent again while persistence is pending")
+			require.False(t, hub.BeginSend("consumer", message))
 			require.Empty(t, hub.DispatchToTopic("orders", &pb.QueueMessage{}, key), "queued ACK must suppress redispatch")
 			require.Empty(t, backend.keys)
 			require.Empty(t, persisted)
