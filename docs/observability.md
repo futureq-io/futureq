@@ -23,7 +23,7 @@ Metrics are exposed in Prometheus format at `observability.metrics.listen` (defa
 | Metric                        | Type      | Labels | Meaning |
 | ----------------------------- | --------- | ------ | ------- |
 | `messages_dispatched_total`   | counter   | —      | Messages handed to consumers |
-| `messages_in_flight`          | gauge     | —      | Currently dispatched-but-unacked messages |
+| `messages_in_flight`          | gauge     | topic, group_id | Active delivery attempts, including queued sends and successful ACKs awaiting persistence. Each group/key counts once; each universal recipient/key counts separately. |
 | `dispatch_pass_duration_ms`   | histogram | —      | Duration of a dispatcher scan pass |
 | `delivery_latency_ms`         | histogram | —      | Now − enqueue time (clamped at 0 for clock skew) |
 | `delivery_overhead_ms`        | histogram | —      | Now − scheduled fire time (clamped at 0) |
