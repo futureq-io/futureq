@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"time"
 
+	"github.com/futureq-io/futureq/internal/metrics"
 	raft "github.com/futureq-io/futureq/internal/raft/event"
 	"github.com/futureq-io/futureq/internal/storage"
 	"github.com/futureq-io/futureq/pkg/utils"
@@ -89,6 +90,11 @@ func (d *Dispatcher) collectScheduledTopic(topic string, nowMs int64) deliveryCh
 func (d *Dispatcher) collectPreloaded(topic string, p *topicPreload, view InterestView, nowMs int64) deliveryChunk {
 	started := time.Now()
 	chunk := deliveryChunk{topic: topic, scanStarted: nowMs, started: started}
+	defer func() {
+		observeCollection("preload_ready", started)
+		metrics.DeliveryCandidatesTotal.WithLabelValues("preload").Add(float64(len(chunk.items)))
+		d.observePreload()
+	}()
 	commandBytes, examined := 3, 0
 	for len(p.items) > 0 && p.items[0].due <= nowMs {
 		if examined >= d.Limits.Examined || len(chunk.items) >= d.Limits.Candidates || (examined > 0 && time.Since(started) >= d.Limits.WorkTime) || !d.hub.DeliveryPermitted() {
@@ -136,10 +142,19 @@ func (d *Dispatcher) collectPreloaded(topic string, p *topicPreload, view Intere
 // reads, while live due scans continue independently. Coarse buckets require
 // checking the exact message due time before retaining a candidate.
 func (d *Dispatcher) preloadTopic(topic string, p *topicPreload, view InterestView, nowMs int64) {
+	defer d.observePreload()
 	if d.preloadCount >= d.PreloadMaxMessages {
 		return
 	}
 	started := time.Now()
+	loaded, scanned, filtered := 0, 0, 0
+	defer func() {
+		observeCollection("preload_scan", started)
+		metrics.DeliveryPreloadLoadedTotal.Add(float64(loaded))
+		metrics.DeliveryPreloadScannedKeysTotal.Add(float64(scanned))
+		metrics.DeliveryScannedKeysTotal.Add(float64(scanned))
+		metrics.DeliveryOwnershipFilteredTotal.Add(float64(filtered))
+	}()
 	horizon := nowMs + d.PreloadLookahead.Milliseconds()
 	if horizon < nowMs { // saturate rather than wrap a very large configured duration
 		horizon = int64(^uint64(0) >> 1)
@@ -165,7 +180,13 @@ func (d *Dispatcher) preloadTopic(topic string, p *topicPreload, view InterestVi
 		examined++
 		bytesRead += len(key) + len(value)
 		p.after = append(append([]byte(nil), key...), 0)
-		if len(key) == 24 && len(view.localOwners(key)) > 0 {
+		if len(key) == 24 {
+			scanned++
+			if len(view.localOwners(key)) == 0 {
+				filtered++
+				valid = iter.Next()
+				continue
+			}
 			candidate := preloadCandidate{key: [24]byte(key)}
 			if !p.keys[candidate.key] {
 				var msg storagepb.StoredMessage
@@ -178,6 +199,7 @@ func (d *Dispatcher) preloadTopic(topic string, p *topicPreload, view InterestVi
 						heap.Push(&p.items, candidate)
 						p.keys[candidate.key] = true
 						d.preloadCount++
+						loaded++
 					}
 				}
 			}
@@ -194,6 +216,7 @@ func (d *Dispatcher) dropPreload(topic string) {
 		d.preloadCount -= len(p.items)
 		delete(d.preloads, topic)
 	}
+	d.observePreload()
 }
 
 func (d *Dispatcher) prunePreloads(live map[string]bool) {

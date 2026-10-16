@@ -90,7 +90,16 @@ func (d *Dispatcher) runPipeline(ctx context.Context) {
 			}
 		}()
 	}
-	defer func() { cancel(); workers.Wait(); metrics.DeliveryQueueDepth.WithLabelValues("prepare").Set(0) }()
+	d.observePreload()
+	defer func() {
+		cancel()
+		workers.Wait()
+		d.preloads, d.preloadCount = nil, 0
+		metrics.DeliveryQueueDepth.WithLabelValues("preload").Set(0)
+		metrics.DeliveryPreloadCapacity.Set(0)
+		metrics.DeliveryQueueDepth.WithLabelValues("prepare").Set(0)
+		metrics.DeliveryOldestPreparationLatenessMs.Set(0)
+	}()
 	ticker := time.NewTicker(d.interval)
 	defer ticker.Stop()
 	preloadTimer := time.NewTimer(time.Hour)
@@ -102,16 +111,19 @@ func (d *Dispatcher) runPipeline(ctx context.Context) {
 	nextMaintenance := time.Now()
 	permitReady := false
 	schedule := func() {
+		defer func() {
+			metrics.DeliveryQueueDepth.WithLabelValues("prepare").Set(float64(len(busy)))
+			oldest := int64(0)
+			for _, due := range busyDue {
+				if due > 0 {
+					oldest = max(oldest, time.Now().UnixMilli()-due)
+				}
+			}
+			metrics.DeliveryOldestPreparationLatenessMs.Set(float64(oldest))
+		}()
 		permitReady = false
 		d.hub.ExpireInFlight(time.Now())
 		d.hub.ObserveQueues()
-		oldest := int64(0)
-		for _, due := range busyDue {
-			if due > 0 {
-				oldest = max(oldest, time.Now().UnixMilli()-due)
-			}
-		}
-		metrics.DeliveryOldestPreparationLatenessMs.Set(float64(oldest))
 		if len(busy) >= d.Limits.Workers {
 			return
 		}
@@ -161,7 +173,6 @@ func (d *Dispatcher) runPipeline(ctx context.Context) {
 			busyDue[topic] = chunk.oldestDueMs
 			jobs <- chunk
 		}
-		metrics.DeliveryQueueDepth.WithLabelValues("prepare").Set(float64(len(busy)))
 	}
 	schedule()
 	for {
@@ -224,8 +235,11 @@ func (d *Dispatcher) refreshPermit(ctx context.Context) bool {
 // Every examined key consumes work, including remote owners and in-flight keys.
 func (d *Dispatcher) collectTopic(topic string, nowMs int64) deliveryChunk {
 	started := time.Now()
-	defer func() { metrics.DeliveryScanDurationMs.Observe(float64(time.Since(started).Microseconds()) / 1000) }()
 	chunk := deliveryChunk{topic: topic, scanStarted: nowMs, started: started}
+	defer func() {
+		observeCollection("due_scan", started)
+		metrics.DeliveryCandidatesTotal.WithLabelValues("scan").Add(float64(len(chunk.items)))
+	}()
 	view := d.hub.InterestView(topic)
 	if !view.Active {
 		return chunk
@@ -283,8 +297,7 @@ func (d *Dispatcher) collectTopic(topic string, nowMs int64) deliveryChunk {
 		}
 		now := time.Now().UnixMilli()
 		if d.isExpired(&msg, now) {
-			d.deleter.MarkDeleted(append([]byte(nil), key...))
-			metrics.MessagesExpiredTotal.WithLabelValues(topic, "dispatcher").Inc()
+			d.deleter.MarkExpired(key, topic, "dispatcher")
 			valid = iter.Next()
 			continue
 		}
@@ -325,7 +338,7 @@ func (d *Dispatcher) collectTopic(topic string, nowMs int64) deliveryChunk {
 // release their payloads without freezing new recipients for remote messages.
 func (d *Dispatcher) collectMaintenance() deliveryChunk {
 	started := time.Now()
-	defer func() { metrics.DeliveryScanDurationMs.Observe(float64(time.Since(started).Microseconds()) / 1000) }()
+	defer func() { observeCollection("maintenance", started) }()
 	chunk := deliveryChunk{topic: maintenanceTopic, maintenance: true, scanStarted: started.UnixMilli(), started: started}
 	epochNow, activeNow := d.hub.DeliveryEpoch()
 	if !activeNow {
@@ -462,7 +475,7 @@ func (d *Dispatcher) deliverChunk(chunk deliveryChunk, states map[string]*raft.D
 		}
 		now := time.Now().UnixMilli()
 		if d.isExpired(&msg, now) {
-			d.deleter.MarkDeleted(item.Key)
+			d.deleter.MarkExpired(item.Key, chunk.topic, "dispatcher")
 			continue
 		}
 		if now < msg.EnqueuedAtUnixMs+msg.DelayMs {
