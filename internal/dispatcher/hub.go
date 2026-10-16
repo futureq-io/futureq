@@ -160,6 +160,14 @@ func (ts *TopicSubscription) universalSnapshot() []*ConsumerEntry {
 
 // ─── Hub ─────────────────────────────────────────────────────────────────────
 
+// groupDeliveryKey reserves one logical group delivery across all its members.
+// Separate fields avoid collisions between arbitrary topic and group names.
+type groupDeliveryKey struct {
+	topic string
+	group string
+	key   string
+}
+
 // Hub manages consumer connections indexed by topic.
 //
 // Delivery semantics:
@@ -190,6 +198,7 @@ type Hub struct {
 	inFlightByConsumer map[string][][]byte
 	inFlightMu         sync.Mutex
 	deliveryRecords    map[string]map[string]deliveryRecord
+	groupInFlight      map[groupDeliveryKey]string // reservation → consumer ID; guarded by inFlightMu
 
 	strategy DispatchStrategy
 	logger   *zap.Logger
@@ -244,6 +253,7 @@ func NewHub(strategy DispatchStrategy, logger *zap.Logger, wakeCh chan struct{})
 		byID:               make(map[string]*ConsumerEntry),
 		inFlightByConsumer: make(map[string][][]byte),
 		deliveryRecords:    make(map[string]map[string]deliveryRecord),
+		groupInFlight:      make(map[groupDeliveryKey]string),
 		inFlightTimeout:    5 * time.Second,
 		strategy:           strategy,
 		logger:             logger.Named("hub"),
@@ -417,6 +427,12 @@ func deliveryOrdinal(tag []byte) uint64 {
 func (h *Hub) trySend(c *ConsumerEntry, msg *pb.QueueMessage, deliveryTag []byte) bool {
 	h.inFlightMu.Lock()
 	defer h.inFlightMu.Unlock()
+	reservation := groupDeliveryKey{topic: c.Topic, group: c.Group, key: string(deliveryTag)}
+	if c.Group != "" {
+		if _, exists := h.groupInFlight[reservation]; exists {
+			return false
+		}
+	}
 	if h.deliveryRecords[c.ID] == nil {
 		h.deliveryRecords[c.ID] = make(map[string]deliveryRecord)
 	}
@@ -443,6 +459,9 @@ func (h *Hub) trySend(c *ConsumerEntry, msg *pb.QueueMessage, deliveryTag []byte
 		metrics.DeliverySenderEnqueueLatenessMs.WithLabelValues(msg.Topic).Observe(float64(queuedAt.UnixNano())/1e6 - float64(msg.EnqueuedAtUnixMs+msg.DelayMs))
 		h.inFlightByConsumer[c.ID] = append(h.inFlightByConsumer[c.ID], deliveryTag)
 		h.deliveryRecords[c.ID][string(deliveryTag)] = deliveryRecord{message: queued, topic: c.Topic, group: c.Group, expires: time.Now().Add(h.inFlightTimeout), epoch: h.permitEpoch}
+		if c.Group != "" {
+			h.groupInFlight[reservation] = c.ID
+		}
 		metrics.MessagesInFlight.WithLabelValues(c.Topic, c.Group).Inc()
 		return true
 	default:
@@ -462,6 +481,12 @@ func (h *Hub) trySend(c *ConsumerEntry, msg *pb.QueueMessage, deliveryTag []byte
 func (h *Hub) removeDeliveryRecordLocked(consumerID, key string) {
 	if record, exists := h.deliveryRecords[consumerID][key]; exists {
 		delete(h.deliveryRecords[consumerID], key)
+		if record.group != "" {
+			reservation := groupDeliveryKey{topic: record.topic, group: record.group, key: key}
+			if h.groupInFlight[reservation] == consumerID {
+				delete(h.groupInFlight, reservation)
+			}
+		}
 		metrics.MessagesInFlight.WithLabelValues(record.topic, record.group).Dec()
 	}
 }

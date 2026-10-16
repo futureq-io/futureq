@@ -113,6 +113,12 @@ func (h *Hub) hasReadyOwner(owners []*ConsumerEntry, key []byte) bool {
 	h.inFlightMu.Lock()
 	defer h.inFlightMu.Unlock()
 	for _, owner := range owners {
+		if owner.Group != "" {
+			reservation := groupDeliveryKey{topic: owner.Topic, group: owner.Group, key: string(key)}
+			if _, exists := h.groupInFlight[reservation]; exists {
+				continue
+			}
+		}
 		if _, exists := h.deliveryRecords[owner.ID][string(key)]; !exists {
 			return true
 		}
@@ -156,13 +162,16 @@ func (h *Hub) BeginSend(consumerID string, msg *pb.QueueMessage) bool {
 	h.inFlightMu.Lock()
 	defer h.inFlightMu.Unlock()
 	record, exists := h.deliveryRecords[consumerID][string(msg.DeliveryTag)]
-	if !exists || record.ackPending || record.message != msg || !time.Now().Before(record.expires) || (h.version != nil && record.epoch != h.permitEpoch) {
+	if !exists || record.sending || record.ackPending || record.message != msg || !time.Now().Before(record.expires) || (h.version != nil && record.epoch != h.permitEpoch) {
 		return false
 	}
 	if time.Now().UnixMilli() < msg.EnqueuedAtUnixMs+msg.DelayMs {
 		return false
 	}
 	record.sending = true
+	// The queue has its own bounded lifetime. Once a send starts, grant a full
+	// ACK window so time buffered behind another send does not shorten it.
+	record.expires = time.Now().Add(h.inFlightTimeout)
 	h.deliveryRecords[consumerID][string(msg.DeliveryTag)] = record
 	return true
 }

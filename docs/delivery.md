@@ -32,8 +32,9 @@ Different groups each get an independent copy of each message. Delivery to a cha
 
 ## In-flight tracking & redelivery
 
-- Once a message is actually sent to at least one consumer, the dispatcher records it in an in-flight map keyed by the raw storage key with the dispatch time.
-- An in-flight message blocks re-dispatch until `delivery.inFlightTimeout` (default 5s) elapses — then the entry is dropped and the message is re-dispatched on the next pass, possibly to a different consumer in the group.
+- Queueing a message reserves its topic, group, and storage key across every member of that group. Universal consumers each retain their own independent in-flight tracking. Repeated scans cannot send a reserved message to another member of the same group.
+- Buffered attempts expire after `delivery.inFlightTimeout` (default 5s) if sending never starts. When the gRPC sender begins a valid attempt, it starts a fresh timeout for sending and acknowledgement, so queue waiting does not consume the ACK window.
+- An in-flight delivery blocks re-dispatch to its group until the timeout elapses — then the reservation is released and the message can be re-dispatched on the next pass, possibly to a different member.
 - Removal paths:
     - Consumer ACK persistence succeeds (only that recipient's tracking is released; failed batches retain tracking while they retry, subject to the normal timeout and disconnect behavior).
     - Consumer NACK (the gRPC handler releases the entry immediately, making the message re-dispatchable).
