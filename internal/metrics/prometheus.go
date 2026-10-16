@@ -168,7 +168,7 @@ var (
 	// source = "dispatcher" or "janitor".
 	MessagesExpiredTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "futureq_messages_expired_total",
-		Help: "TTL deletion requests accepted on this node, by first detecting source; deduplicated while deletion is pending, including failed flush retries. Not committed deletes or a cluster-wide unique-message count.",
+		Help: "TTL deletion requests accepted on this node, attributed to the source that queued each request; deduplicated while deletion is pending, including failed flush retries. Not committed deletes or a cluster-wide unique-message count.",
 	}, []string{"topic", "source"})
 
 	// ─── Deleter ─────────────────────────────────────────────────────────────

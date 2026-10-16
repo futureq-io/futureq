@@ -44,7 +44,7 @@ lateness histograms use milliseconds.
 | `delivery_preload_capacity` | gauge | — | Configured maximum retained candidates on this node. Zero when preloading is disabled or the scheduler stops. |
 | `delivery_preload_loaded_total` | counter | — | New entries retained in the preload cache; duplicate scans do not increment it. Reloading after invalidation counts again. |
 | `delivery_preload_scanned_keys_total` | counter | — | Speculative preload event-key observations; a subset of `delivery_scanned_keys_total`, not additional work to sum with it. |
-| `messages_expired_total`     | counter   | topic, source (`dispatcher\|janitor`) | Accepted TTL deletion requests on this node, attributed to the first source. Repeated scans and failed flush retries are deduplicated while a deletion is pending. Not committed deletes or globally unique messages. |
+| `messages_expired_total`     | counter   | topic, source (`dispatcher\|janitor`) | Accepted TTL deletion requests on this node, attributed to the source that queued each request. Repeated scans and failed flush retries are deduplicated while a deletion is pending. Not committed deletes or globally unique messages. |
 | `active_consumers`            | gauge     | topic, group_id | Connected consumers |
 | `consumer_ack_total`          | counter   | topic, group_id, success | ACK/NACK frames received |
 | `delete_batch_size`           | histogram | —      | Keys per delete flush |
