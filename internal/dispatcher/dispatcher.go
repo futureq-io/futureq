@@ -47,6 +47,10 @@ type Dispatcher struct {
 	Limits                ScanLimits
 	TimeBucket            time.Duration
 	cursors               map[string]*scanCursor // owned by the scheduler
+	PreloadLookahead      time.Duration
+	PreloadMaxMessages    int
+	preloads              map[string]*topicPreload // owned by the scheduler
+	preloadCount          int
 }
 
 // NewDispatcher constructs a Dispatcher.
@@ -113,7 +117,7 @@ func (d *Dispatcher) dispatchAll() int {
 }
 
 func (d *Dispatcher) dispatchTopic(topic string, nowMs int64) int {
-	chunk := d.collectTopic(topic, nowMs)
+	chunk := d.collectScheduledTopic(topic, nowMs)
 	if len(chunk.items) == 0 {
 		return 0
 	}

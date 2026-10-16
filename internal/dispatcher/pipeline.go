@@ -93,6 +93,9 @@ func (d *Dispatcher) runPipeline(ctx context.Context) {
 	defer func() { cancel(); workers.Wait(); metrics.DeliveryQueueDepth.WithLabelValues("prepare").Set(0) }()
 	ticker := time.NewTicker(d.interval)
 	defer ticker.Stop()
+	preloadTimer := time.NewTimer(time.Hour)
+	preloadTimer.Stop()
+	defer preloadTimer.Stop()
 	busy := make(map[string]bool)
 	busyDue := make(map[string]int64)
 	rotation := 0
@@ -122,6 +125,7 @@ func (d *Dispatcher) runPipeline(ctx context.Context) {
 		for _, topic := range topics {
 			live[topic] = true
 		}
+		d.prunePreloads(live)
 		for topic := range d.cursors {
 			if topic != maintenanceTopic && !live[topic] && !busy[topic] {
 				delete(d.cursors, topic)
@@ -144,7 +148,7 @@ func (d *Dispatcher) runPipeline(ctx context.Context) {
 				chunk = d.collectMaintenance()
 				nextMaintenance = time.Now().Add(d.interval)
 			} else {
-				chunk = d.collectTopic(topic, time.Now().UnixMilli())
+				chunk = d.collectScheduledTopic(topic, time.Now().UnixMilli())
 			}
 			rotation = (start + offset + 1) % len(topics)
 			if len(chunk.items) == 0 {
@@ -158,12 +162,23 @@ func (d *Dispatcher) runPipeline(ctx context.Context) {
 	}
 	schedule()
 	for {
+		// Busy topics wake on their worker result. Arming an overdue timer for
+		// one of them (or when all workers are busy) would spin the scheduler.
+		var preloadC <-chan time.Time
+		if len(busy) < d.Limits.Workers && d.hub.DeliveryPermitted() {
+			if due := d.nextPreloadDue(busy); due > 0 {
+				preloadTimer.Reset(time.Until(time.UnixMilli(due)))
+				preloadC = preloadTimer.C
+			}
+		}
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
 			schedule()
 		case <-d.wakeCh:
+			schedule()
+		case <-preloadC:
 			schedule()
 		case result := <-results:
 			delete(busy, result.chunk.topic)

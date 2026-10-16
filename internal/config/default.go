@@ -26,6 +26,8 @@ var defaultConfig = Config{
 		ConsumerQueueSize:    1024,
 		TimeBucket:           time.Millisecond,
 		DispatchPollInterval: 5 * time.Millisecond,
+		PreloadLookahead:     100 * time.Millisecond,
+		PreloadMaxMessages:   4096,
 		InFlightTimeout:      5 * time.Second,
 		DeleteBatchInterval:  500 * time.Millisecond,
 		TTLSweepInterval:     time.Minute,

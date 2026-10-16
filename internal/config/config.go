@@ -92,6 +92,8 @@ type Delivery struct {
 	ConsumerQueueSize    int           `mapstructure:"consumerQueueSize" yaml:"consumerQueueSize"`
 	TimeBucket           time.Duration `mapstructure:"timeBucket" yaml:"timeBucket"`
 	DispatchPollInterval time.Duration `mapstructure:"dispatchPollInterval" yaml:"dispatchPollInterval"`
+	PreloadLookahead     time.Duration `mapstructure:"preloadLookahead" yaml:"preloadLookahead"`
+	PreloadMaxMessages   int           `mapstructure:"preloadMaxMessages" yaml:"preloadMaxMessages"`
 	InFlightTimeout      time.Duration `mapstructure:"inFlightTimeout" yaml:"inFlightTimeout"`
 	DeleteBatchInterval  time.Duration `mapstructure:"deleteBatchInterval" yaml:"deleteBatchInterval"`
 	TTLSweepInterval     time.Duration `mapstructure:"ttlSweepInterval" yaml:"ttlSweepInterval"`
@@ -335,6 +337,12 @@ func (c *Config) validatePublishAndDelivery() error {
 		return fmt.Errorf("publish.proposalTimeout must be positive")
 	}
 	d := c.Delivery
+	if d.PreloadLookahead < 0 || d.PreloadLookahead%time.Millisecond != 0 {
+		return fmt.Errorf("delivery.preloadLookahead must be zero or a positive whole number of milliseconds")
+	}
+	if d.PreloadMaxMessages < 0 || d.PreloadMaxMessages > 1048576 {
+		return fmt.Errorf("delivery.preloadMaxMessages must be 0..1048576")
+	}
 	if d.ConsumerQueueSize < 1 || d.ConsumerQueueSize > 65536 {
 		return fmt.Errorf("delivery.consumerQueueSize must be 1..65536")
 	}
