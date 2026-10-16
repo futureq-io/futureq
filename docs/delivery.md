@@ -20,32 +20,32 @@ The live due-message scan uses a snapshot and an independent cyclic cursor.
 Wrapping the cursor revisits older insertions, failed preparations, full consumer
 queues, NACKs, and timeout retries. Iterators close before preparation begins.
 
-### Preloading upcoming candidates
+### Caching upcoming messages
 
-When no due chunk is found, the scheduler scans ahead by
-`delivery.preloadLookahead` (default `100ms`) and retains up to
-`delivery.preloadMaxMessages` candidates (default `4096`, shared across topics).
-Each retained candidate contains a 24-byte key and its exact due timestamp;
-payloads stay in storage. Setting either option to zero disables preloading.
-Speculative scans have the same key, byte, and work-time budgets as live scans.
+Two bounded discovery workers load owned full-message data into per-topic heaps.
+The scheduler selects exact due times independently of scans and quorum work.
+`delivery.preloadLookahead` controls future discovery (default disabled; opt-in trial: 100 ms), and
+`delivery.preloadMaxMessages` bounds future messages across topics (default 512).
+A separate bounded due allowance keeps ordinary delivery working when either
+future setting is zero and when the future cache is full.
 
-A timer wakes scheduling at the earliest retained due timestamp, avoiding a full
-poll-interval wait. Cached collection can skip the range scan and payload decode
-at that instant. The earlier preload scan adds work, so the benefit depends on
-the scheduled workload and storage costs; it does not remove preparation or
-quorum-read latency.
+A timer wakes at eligible cached deadlines. Recipients are captured when due,
+using current ownership and epoch. Delivery workers prepare receipts, perform the
+post-preparation read barrier, validate payload versions, read current committed
+ACK state, recheck exact due time/TTL and enqueue through the existing Hub.
+Valid cached data avoids a second full-payload Get/decode in final delivery;
+uncertain/invalidated data uses a counted fresh-read fallback. Preparation still
+performs existence reads. The original permit and actual-send fences remain.
 
-Cached chunks alternate with live due scans. The future cursor never replaces
-the due cursor or acts as a completion watermark: a newly arriving overdue
-message is eligible even if it was never preloaded or the buffer is full.
-Subscription epoch changes and inactive topics discard their cached candidates.
-Recipients are captured only when a candidate is due, using the current view.
+Due and future cursors are independent cyclic scan positions, never completion
+watermarks. Late arrivals, retries, rejected admission and stale results recover
+through due scans even without arrival hints. Failed jobs evict their payloads
+and retry after bounded backoff. Topic generations reject stale scan/delivery
+results after subscription changes. Storage batch invalidation covers deletion,
+replay, overwrite and snapshot replacement before old data can validate.
 
-Preparation, post-preparation read barriers, and send authorization are unchanged
-in both standalone and Raft mode. Before queueing, delivery re-reads the payload
-and checks existence, TTL, exact due time, current epoch, and delivery permission.
-A stale cache entry cannot resurrect a deleted message or authorize early
-delivery. Failed candidates remain discoverable by the ordinary cyclic scan.
+See the [scheduler design](heap-scheduler.md) for the validity proof, lifecycle,
+count sizing, resource table and [measured tradeoffs](heap-scheduler-evaluation.md).
 
 ## Hub & consumer groups
 

@@ -31,6 +31,8 @@ type inFlightEntry struct {
 //   - Performs TTL checks at dispatch time; expired messages are batched for deletion
 //   - Snapshot-based iteration (never blocks concurrent writes)
 type Dispatcher struct {
+	skipKeys        map[[24]byte]bool // immutable snapshot, isolated discovery adapter only
+	scanOnly        bool              // isolated worker adapter never publishes scheduler gauges
 	db              storage.DB
 	hub             *Hub
 	deleter         *Deleter
@@ -51,6 +53,7 @@ type Dispatcher struct {
 	PreloadMaxMessages    int
 	preloads              map[string]*topicPreload // owned by the scheduler
 	preloadCount          int
+	readyCount            int // scheduler-owned due admission, separate from future cap
 }
 
 // NewDispatcher constructs a Dispatcher.

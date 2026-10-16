@@ -82,8 +82,8 @@ export FUTUREQ_CLUSTER_RAFT_INITIALMEMBERS='{1: "10.0.0.1:50005"}'
 | ----------------------------------- | ------- | ----------- |
 | `delivery.timeBucket`               | `1ms`   | Granularity of the key scheme's time buckets. `0` = raw-millisecond buckets (maximum precision). Otherwise must be ≥1ms. |
 | `delivery.dispatchPollInterval`     | `5ms`   | Periodic live due-message scan interval, also used when preloading is enabled. |
-| `delivery.preloadLookahead`         | `100ms` | How far ahead the scheduler scans for upcoming messages. Must be a nonnegative whole number of milliseconds. `0` disables preloading. |
-| `delivery.preloadMaxMessages`       | `4096`  | Maximum retained preload candidates across all topics on this node, `0..1048576`. `0` disables preloading. Candidates retain keys and exact due times, not payloads. |
+| `delivery.preloadLookahead`         | `0s`    | How far ahead the scheduler scans for upcoming messages. Must be a nonnegative whole number of milliseconds. `0` disables preloading. |
+| `delivery.preloadMaxMessages`       | `512`   | Maximum retained/reserved full-message future entries across topics, `0..1048576`. `0` disables future caching; bounded due delivery continues. Payload sizes determine memory use. |
 | `delivery.inFlightTimeout`          | `5s`    | How long an unacknowledged delivery blocks redelivery; after it expires the message is re-dispatched (at-least-once). |
 | `delivery.deleteBatchInterval`      | `500ms` | How often the deleter flushes its batch of keys to delete (one Raft proposal per batch in clustered mode). |
 | `delivery.ttlsweepInterval`         | `60s`   | How often the TTL janitor sweeps the whole database for expired messages. |
@@ -95,14 +95,16 @@ preparation batch sizes and quorum reads:
 
 ```yaml
 delivery:
-  preloadLookahead: 100ms
-  preloadMaxMessages: 4096
+  preloadLookahead: 0s # opt-in trial: 100ms
+  preloadMaxMessages: 512
 ```
 
 The corresponding environment variables are `FUTUREQ_DELIVERY_PRELOADLOOKAHEAD`
 and `FUTUREQ_DELIVERY_PRELOADMAXMESSAGES`. Either setting can be zero to disable
 preloading. Increasing the lookahead or count does not change the scheduled due
-time, freeze recipients early, or bypass a delivery read barrier.
+time, freeze recipients early, or bypass a delivery read barrier. See the
+[full-message cache sizing and resource budget](heap-scheduler.md#count-sizing-and-resource-budget)
+before retaining an existing large count: this cache now owns payload data.
 
 ## observability
 

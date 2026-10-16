@@ -33,7 +33,7 @@ lateness histograms use milliseconds.
 | `delivery_sender_enqueue_lateness_ms` | histogram | topic | Actual sender-enqueue time minus the individual due time, per successfully queued recipient attempt. Includes preparation; excludes sender-queue waiting. |
 | `delivery_send_lateness_ms` | histogram | topic | Time immediately before each authorized gRPC Send attempt minus the individual due time. Includes sender-queue waiting, retries, and failed send attempts. |
 | `delivery_grpc_sends_total` | counter | topic | Successful gRPC sends, including retries and fan-out. Not client acknowledgements. |
-| `delivery_queue_depth` | gauge | queue | `consumer`: queued sender attempts across local subscriptions; `prepare`: outstanding jobs, not messages; `preload`: retained candidate keys, including future or stale entries. Not persistent backlog. |
+| `delivery_queue_depth` | gauge | queue | `consumer`: queued sender attempts across local subscriptions; `prepare`: outstanding jobs, not messages; `preload`: retained full-message entries charged to the future allowance, including overdue or stale entries; `ready`: due-scan entries waiting in heaps; `discovery`: outstanding scan jobs/results. Ready entries exclude assigned preparation jobs. Not persistent backlog. |
 | `delivery_oldest_queued_lateness_ms` | gauge | — | Oldest unsent tracked attempt's lateness, sampled by the scheduler. Excludes preload candidates. |
 | `delivery_oldest_preparation_lateness_ms` | gauge | — | Oldest candidate due time in outstanding preparation jobs, sampled after scheduling. Zero when no due preparation job remains. |
 | `delivery_scan_duration_ms` | histogram | — | Aggregate local duration of bounded collection operations across all four paths below, including empty operations. Excludes read barriers, preparation, and time resident in the preload cache. |
@@ -41,14 +41,30 @@ lateness histograms use milliseconds.
 | `delivery_scanned_keys_total` | counter | — | Event-key observations in live and speculative preload storage scans, including repeated reads. Excludes cache-only selection and maintenance receipt scans. |
 | `delivery_ownership_filtered_total` | counter | — | Event-key observations rejected for having no local owner, in live or speculative preload storage scans. |
 | `delivery_candidates_total` | counter | source (`scan\|preload`) | Due candidates selected for preparation, including retries. Excludes future loads and maintenance. `source="preload"` counts cached candidate hits, not successful deliveries. |
-| `delivery_preload_capacity` | gauge | — | Configured maximum retained candidates on this node. Zero when preloading is disabled or the scheduler stops. |
-| `delivery_preload_loaded_total` | counter | — | New entries retained in the preload cache; duplicate scans do not increment it. Reloading after invalidation counts again. |
+| `delivery_preload_capacity` | gauge | — | Configured maximum future-message entries on this node. Due work has a separate bounded allowance. Zero when preloading is disabled or the scheduler stops. |
+| `delivery_preload_loaded_total` | counter | — | New full-message entries loaded into reserved future discovery/cache slots; known-key scans do not increment it. A stale result can be rejected before heap admission. Reloading after invalidation counts again. |
 | `delivery_preload_scanned_keys_total` | counter | — | Speculative preload event-key observations; a subset of `delivery_scanned_keys_total`, not additional work to sum with it. |
 | `messages_expired_total`     | counter   | topic, source (`dispatcher\|janitor`) | Accepted TTL deletion requests on this node, attributed to the source that queued each request. Repeated scans and failed flush retries are deduplicated while a deletion is pending. Not committed deletes or globally unique messages. |
 | `active_consumers`            | gauge     | topic, group_id | Connected consumers |
 | `consumer_ack_total`          | counter   | topic, group_id, success | ACK/NACK frames received |
 | `delete_batch_size`           | histogram | —      | Keys per delete flush |
 | `delete_failures_total`      | counter   | —      | Failed delete flushes (retried) |
+
+The full-message scheduler adds these bounded-label metrics. Storage scans and
+heap selection stay in the existing duration series; do not sum a subset with
+its aggregate. The cache counters describe validation, not successful sends.
+
+| Metric (prefix `futureq_`) | Type | Labels | Meaning |
+| --- | --- | --- | --- |
+| `delivery_payload_cache_total` | counter | source (`cache`, `fallback`) | Final payload validations using retained data or a fresh read fallback. |
+| `delivery_payload_reads_total` | counter | — | Final-delivery payload Get calls. Preparation existence reads and maintenance payload reads are separate storage work, excluded here. |
+| `delivery_payload_decodes_total` | counter | stage (`discovery`, `delivery`) | Full-message decode attempts in normal discovery or the final read fallback. Excludes maintenance receipt repair. |
+| `delivery_discovery_bytes_total` | counter | — | Key/value bytes examined in due/future discovery, including known keys and filtered keys. A scan observation is counted once; not physical device bytes. |
+| `delivery_repair_scans_total` | counter | — | Bounded cyclic due passes, including startup/ordinary discovery, late-arrival and retry repair. |
+| `delivery_worker_outcomes_total` | counter | outcome (`queued`, `not-ready`, `permission-lost`, `prepare-failed`) | Delivery job outcomes. `queued` means at least one message enqueued, not a gRPC send or committed ACK. Zero-send work remains recoverable. |
+
+[Scheduler design and resource bounds](heap-scheduler.md) describes payload
+validity, current-receipt reads, retry recovery and count-based sizing.
 
 ### Interpreting preloading and readiness
 
@@ -67,7 +83,7 @@ The aggregate collection histogram now includes preload scanning and cached
 selection. For comparisons across this change, use the path histogram to
 separate work; a lower live-scan rate alone does not establish lower total cost.
 Gauges are node-local snapshots updated at scheduler boundaries. A retained
-preload entry can be future-due or stale, so occupancy is not a count of messages
+preload entry includes an owned decoded payload and can be future-due or stale, so occupancy is not a count of messages
 currently authorized to send.
 
 For example, preload occupancy as a fraction of enabled capacity is:
