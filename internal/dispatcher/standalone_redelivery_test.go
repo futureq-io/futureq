@@ -8,6 +8,7 @@ import (
 	"time"
 
 	raft "github.com/futureq-io/futureq/internal/raft/event"
+	"github.com/futureq-io/futureq/internal/storage"
 	pb "github.com/futureq-io/protocol/proto/go"
 	"github.com/stretchr/testify/require"
 )
@@ -198,4 +199,131 @@ func TestBeginSendGrantsFullAckWindowAfterQueueWait(t *testing.T) {
 	require.False(t, sendDeadline.Before(started.Add(time.Minute)))
 	h.ExpireInFlight(sendDeadline.Add(time.Nanosecond))
 	require.Empty(t, h.groupInFlight, "sent attempts must still time out")
+}
+
+// Inject at the storage commit boundary, after the ledger has built its real
+// ACK/delete batch. Successful attempts still commit to the underlying DB.
+type standaloneAckCommitDB struct {
+	storage.DB
+	beforeCommit func(storage.SyncMode) error
+}
+
+func (db *standaloneAckCommitDB) NewBatch() storage.Batch {
+	return &standaloneAckCommitBatch{Batch: db.DB.NewBatch(), beforeCommit: db.beforeCommit}
+}
+
+type standaloneAckCommitBatch struct {
+	storage.Batch
+	beforeCommit func(storage.SyncMode) error
+}
+
+func (b *standaloneAckCommitBatch) Commit(mode storage.SyncMode) error {
+	if err := b.beforeCommit(mode); err != nil {
+		return err
+	}
+	return b.Batch.Commit(mode)
+}
+
+func TestStandaloneFinalAckCommitsBeforeDeletingTracking(t *testing.T) {
+	d, ledger := newPipelineTest(t)
+	h := d.hub
+	topic := t.Name()
+	h.SetDeliveryTimeout(time.Minute)
+	first, second := make(chan *pb.QueueMessage, 1), make(chan *pb.QueueMessage, 1)
+	h.Register("first", topic, "workers", first)
+	h.Register("second", topic, "workers", second)
+	t.Cleanup(func() { h.Unregister("first"); h.Unregister("second") })
+	key := putPipelineEvent(t, d, topic, 1, time.Now().Add(-time.Second).UnixMilli())
+	require.Equal(t, 1, d.dispatchAll())
+	require.True(t, h.BeginSend("first", <-first))
+	require.True(t, h.MarkAcknowledgedSent("first", key))
+
+	assertStored := func(present bool) {
+		t.Helper()
+		for _, storedKey := range [][]byte{key, raft.DeliveryStateKey(key)} {
+			_, closer, err := d.db.Get(storedKey)
+			if present {
+				require.NoError(t, err)
+				require.NoError(t, closer.Close())
+			} else {
+				require.ErrorIs(t, err, storage.ErrNotFound)
+			}
+		}
+	}
+	assertTracked := func() {
+		t.Helper()
+		require.True(t, h.HasInFlightForConsumer("first", key))
+		require.Len(t, h.groupInFlight, 1)
+		require.Equal(t, float64(1), inFlightGaugeValue(t, topic, "workers"))
+	}
+	assertCleared := func() {
+		t.Helper()
+		require.False(t, h.HasInFlightForConsumer("first", key))
+		require.Empty(t, h.deliveryRecords["first"])
+		require.Empty(t, h.groupInFlight)
+		require.Zero(t, inFlightGaugeValue(t, topic, "workers"))
+	}
+	var callbacks []string
+	// Match startRun's production wiring, with observations around the calls.
+	ledger.OnDelete = func(keys [][]byte) {
+		require.Equal(t, []string{"commit"}, callbacks)
+		require.Equal(t, [][]byte{key}, keys)
+		assertStored(false) // Both deletes must be visible before this callback.
+		assertTracked()
+		d.RemoveInFlightBatch(keys)
+		h.RemoveDeletedBatch(keys)
+		assertCleared()
+		callbacks = append(callbacks, "delete")
+	}
+	d.deleter.AcknowledgeBatch = ledger.Acknowledge
+	d.deleter.OnAcknowledged = func(acks []raft.DeliveryAck) {
+		require.Equal(t, []string{"commit", "delete"}, callbacks)
+		require.Equal(t, []raft.DeliveryAck{{Key: key, Recipient: "g:workers"}}, acks)
+		assertStored(false)
+		assertCleared()
+		h.RemoveAcknowledgedBatch(acks)
+		assertCleared() // The second cleanup must not decrement the gauge again.
+		callbacks = append(callbacks, "acknowledged")
+	}
+	d.deleter.OnDelete = func(key []byte) {
+		d.RemoveInFlight(key)
+		h.RemoveDeletedBatch([][]byte{key})
+	}
+	commitAttempts := 0
+	ledger.db = &standaloneAckCommitDB{DB: d.db, beforeCommit: func(mode storage.SyncMode) error {
+		commitAttempts++
+		require.Equal(t, storage.Sync, mode)
+		assertStored(true)
+		assertTracked()
+		if commitAttempts == 1 {
+			return errors.New("injected storage batch commit failure")
+		}
+		callbacks = append(callbacks, "commit")
+		return nil
+	}}
+	require.True(t, d.deleter.TryMarkAcknowledged(key, "g:workers"))
+	d.deleter.flush()
+	require.Equal(t, 1, commitAttempts)
+	require.Empty(t, callbacks, "failed storage commits must not run completion callbacks")
+	assertStored(true)
+	assertTracked()
+	state, err := raft.ReadDeliveryState(d.db, key)
+	require.NoError(t, err)
+	require.True(t, state.Needs("g:workers"), "the failed final ACK must not persist a completion")
+	require.Len(t, d.deleter.acks, 1, "the final ACK must remain queued for retry")
+	require.Zero(t, d.dispatchAll(), "the second member cannot acquire the reserved message")
+	require.Empty(t, second)
+
+	d.deleter.flush()
+	require.Equal(t, 2, commitAttempts)
+	require.Equal(t, []string{"commit", "delete", "acknowledged"}, callbacks)
+	assertStored(false)
+	assertCleared()
+	require.Empty(t, d.deleter.acks)
+	require.Empty(t, d.deleter.ackKeys)
+	d.deleter.flush()
+	require.Equal(t, 2, commitAttempts, "completed ACKs must not commit again")
+	require.Zero(t, d.dispatchAll())
+	require.Empty(t, second)
+	assertCleared()
 }
