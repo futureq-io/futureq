@@ -119,6 +119,14 @@ func (d *Dispatcher) collectPreloaded(topic string, p *topicPreload, view Intere
 	}
 	if len(p.items) == 0 {
 		p.items, p.keys = nil, nil // release capacity when a topic drains
+	} else if len(p.items) <= cap(p.items)/4 {
+		items := make(candidateHeap, len(p.items))
+		copy(items, p.items)
+		p.items = items
+		p.keys = make(map[[24]byte]bool, len(items))
+		for _, candidate := range items {
+			p.keys[candidate.key] = true
+		}
 	}
 	return chunk
 }
