@@ -10,14 +10,42 @@
 
 ## Dispatcher
 
-A timer-driven loop (`delivery.dispatchPollInterval`, default 50ms):
+A timer-driven loop (`delivery.dispatchPollInterval`, default 5ms) scans topics
+with active local consumers. Each topic has at most one bounded preparation job,
+and a fixed worker pool limits outstanding work. Worker completions and hub wake
+signals also trigger scheduling. Clustered replicas filter candidates using the
+current committed ownership view and delivery permission.
 
-- The hub wakes it immediately when a consumer registers (`wakeCh`).
-- After any pass that dispatched at least one message, the next pass fires immediately (drain without waiting); otherwise the full interval elapses.
-- It iterates **only topics with active consumers** — topics without consumers are never scanned.
-- In Raft mode only the event-shard leader dispatches; standalone always dispatches.
-- Per topic it runs a snapshot-based range scan `[topicHash, dueUpperBound(now))` — future buckets are never touched.
-- For each due key: skip if in-flight (unless timed out); inline TTL check (expired → routed to the deleter); otherwise build a `QueueMessage` whose `delivery_tag` is the 24-byte key and hand it to the hub.
+The live due-message scan uses a snapshot and an independent cyclic cursor.
+Wrapping the cursor revisits older insertions, failed preparations, full consumer
+queues, NACKs, and timeout retries. Iterators close before preparation begins.
+
+### Preloading upcoming candidates
+
+When no due chunk is found, the scheduler scans ahead by
+`delivery.preloadLookahead` (default `100ms`) and retains up to
+`delivery.preloadMaxMessages` candidates (default `4096`, shared across topics).
+Each retained candidate contains a 24-byte key and its exact due timestamp;
+payloads stay in storage. Setting either option to zero disables preloading.
+Speculative scans have the same key, byte, and work-time budgets as live scans.
+
+A timer wakes scheduling at the earliest retained due timestamp, avoiding a full
+poll-interval wait. Cached collection can skip the range scan and payload decode
+at that instant. The earlier preload scan adds work, so the benefit depends on
+the scheduled workload and storage costs; it does not remove preparation or
+quorum-read latency.
+
+Cached chunks alternate with live due scans. The future cursor never replaces
+the due cursor or acts as a completion watermark: a newly arriving overdue
+message is eligible even if it was never preloaded or the buffer is full.
+Subscription epoch changes and inactive topics discard their cached candidates.
+Recipients are captured only when a candidate is due, using the current view.
+
+Preparation, post-preparation read barriers, and send authorization are unchanged
+in both standalone and Raft mode. Before queueing, delivery re-reads the payload
+and checks existence, TTL, exact due time, current epoch, and delivery permission.
+A stale cache entry cannot resurrect a deleted message or authorize early
+delivery. Failed candidates remain discoverable by the ordinary cyclic scan.
 
 ## Hub & consumer groups
 

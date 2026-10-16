@@ -100,7 +100,9 @@ func (d *Dispatcher) runPipeline(ctx context.Context) {
 	busyDue := make(map[string]int64)
 	rotation := 0
 	nextMaintenance := time.Now()
+	permitReady := false
 	schedule := func() {
+		permitReady = false
 		d.hub.ExpireInFlight(time.Now())
 		d.hub.ObserveQueues()
 		oldest := int64(0)
@@ -119,6 +121,7 @@ func (d *Dispatcher) runPipeline(ctx context.Context) {
 		if !d.hub.DeliveryPermitted() {
 			return
 		}
+		permitReady = true
 		topics := d.hub.ActiveTopics()
 		sort.Strings(topics)
 		live := make(map[string]bool, len(topics))
@@ -164,8 +167,10 @@ func (d *Dispatcher) runPipeline(ctx context.Context) {
 	for {
 		// Busy topics wake on their worker result. Arming an overdue timer for
 		// one of them (or when all workers are busy) would spin the scheduler.
+		// A failed permit renewal also waits for a poll or external wake rather
+		// than immediately retrying an overdue cached deadline.
 		var preloadC <-chan time.Time
-		if len(busy) < d.Limits.Workers && d.hub.DeliveryPermitted() {
+		if permitReady && len(busy) < d.Limits.Workers && d.hub.DeliveryPermitted() {
 			if due := d.nextPreloadDue(busy); due > 0 {
 				preloadTimer.Reset(time.Until(time.UnixMilli(due)))
 				preloadC = preloadTimer.C

@@ -81,12 +81,28 @@ export FUTUREQ_CLUSTER_RAFT_INITIALMEMBERS='{1: "10.0.0.1:50005"}'
 | Key                                 | Default | Description |
 | ----------------------------------- | ------- | ----------- |
 | `delivery.timeBucket`               | `1ms`   | Granularity of the key scheme's time buckets. `0` = raw-millisecond buckets (maximum precision). Otherwise must be ≥1ms. |
-| `delivery.dispatchPollInterval`     | `50ms`  | Dispatcher scan interval; passes that dispatched messages trigger an immediate re-scan. |
+| `delivery.dispatchPollInterval`     | `5ms`   | Periodic live due-message scan interval, also used when preloading is enabled. |
+| `delivery.preloadLookahead`         | `100ms` | How far ahead the scheduler scans for upcoming messages. Must be a nonnegative whole number of milliseconds. `0` disables preloading. |
+| `delivery.preloadMaxMessages`       | `4096`  | Maximum retained preload candidates across all topics on this node, `0..1048576`. `0` disables preloading. Candidates retain keys and exact due times, not payloads. |
 | `delivery.inFlightTimeout`          | `5s`    | How long an unacknowledged delivery blocks redelivery; after it expires the message is re-dispatched (at-least-once). |
 | `delivery.deleteBatchInterval`      | `500ms` | How often the deleter flushes its batch of keys to delete (one Raft proposal per batch in clustered mode). |
 | `delivery.ttlsweepInterval`         | `60s`   | How often the TTL janitor sweeps the whole database for expired messages. |
 
 All four intervals and the in-flight timeout must be greater than zero.
+
+Preloading works in standalone and clustered mode. Configure it independently of
+preparation batch sizes and quorum reads:
+
+```yaml
+delivery:
+  preloadLookahead: 100ms
+  preloadMaxMessages: 4096
+```
+
+The corresponding environment variables are `FUTUREQ_DELIVERY_PRELOADLOOKAHEAD`
+and `FUTUREQ_DELIVERY_PRELOADMAXMESSAGES`. Either setting can be zero to disable
+preloading. Increasing the lookahead or count does not change the scheduled due
+time, freeze recipients early, or bypass a delivery read barrier.
 
 ## observability
 
