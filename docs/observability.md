@@ -63,6 +63,12 @@ its aggregate. The cache counters describe validation, not successful sends.
 | `delivery_repair_scans_total` | counter | — | Bounded cyclic due passes, including startup/ordinary discovery, late-arrival and retry repair. |
 | `delivery_worker_outcomes_total` | counter | outcome (`queued`, `not-ready`, `permission-lost`, `prepare-failed`) | Delivery job outcomes. `queued` means at least one message enqueued, not a gRPC send or committed ACK. Zero-send work remains recoverable. |
 
+`delivery_rejected_total{reason="prepare_bytes"}` counts a candidate whose
+current recipient command cannot fit even an empty preparation batch. Selection
+logs the byte limit and topic; the scheduler backs off before rediscovery. An
+unfit command is not a successful preparation or send, and its payload stays in
+storage.
+
 [Scheduler design and resource bounds](heap-scheduler.md) describes payload
 validity, current-receipt reads, retry recovery and count-based sizing.
 

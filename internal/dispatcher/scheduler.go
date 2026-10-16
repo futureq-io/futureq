@@ -20,6 +20,7 @@ import (
 const discoveryWorkers = 2
 
 type discoveryJob struct {
+	repairGeneration      uint64
 	known                 map[[24]byte]bool
 	topic                 string
 	owner                 *topicPreload
@@ -55,7 +56,7 @@ func (d *Dispatcher) discover(job discoveryJob) discoveryResult {
 	var chunk deliveryChunk
 	if job.topic == maintenanceTopic {
 		chunk = scanner.collectMaintenance()
-	} else {
+	} else if job.dueSlots > 0 {
 		metrics.DeliveryRepairScansTotal.Inc()
 		chunk = scanner.collectTopic(job.topic, time.Now().UnixMilli())
 	}
@@ -84,6 +85,7 @@ func (d *Dispatcher) admitCandidate(p *topicPreload, c preloadCandidate) bool {
 	p.keys[c.key] = true
 	heap.Push(&p.items, c)
 	if c.ready {
+		p.readyCount++
 		d.readyCount++
 	} else {
 		d.preloadCount++
@@ -91,7 +93,8 @@ func (d *Dispatcher) admitCandidate(p *topicPreload, c preloadCandidate) bool {
 	return true
 }
 
-func (d *Dispatcher) admitChunk(p *topicPreload, chunk deliveryChunk, assigned map[[24]byte]bool) {
+func (d *Dispatcher) admitChunk(p *topicPreload, chunk deliveryChunk, assigned map[[24]byte]bool) int {
+	admitted := 0
 	for _, item := range chunk.items {
 		key := [24]byte(item.Key)
 		if assigned[key] {
@@ -102,8 +105,11 @@ func (d *Dispatcher) admitChunk(p *topicPreload, chunk deliveryChunk, assigned m
 		if payload.message != nil {
 			due = payload.message.EnqueuedAtUnixMs + payload.message.DelayMs
 		}
-		d.admitCandidate(p, preloadCandidate{key: key, due: due, payload: payload, ready: true})
+		if d.admitCandidate(p, preloadCandidate{key: key, due: due, payload: payload, ready: true}) {
+			admitted++
+		}
 	}
+	return admitted
 }
 
 // runPipeline exclusively owns heaps, deduplication, reservations, cursors,
@@ -230,7 +236,10 @@ func (d *Dispatcher) runPipeline(parent context.Context) {
 	var maintenance *deliveryChunk
 	var maintenanceOwner *topicPreload
 	reservedFuture, reservedDue := 0, 0
-	dueCapacity := discoveryWorkers * d.Limits.Candidates
+	// Each topic can retain/reserve at most one batch. Capacity for every
+	// delivery worker (and at least the discovery pool) leaves a batch available
+	// whenever a worker is idle, even if the other topics are busy.
+	dueCapacity := max(discoveryWorkers, d.Limits.Workers) * d.Limits.Candidates
 	rotation := 0
 	permitReady, renewing := false, false
 	var renewAfter time.Time
@@ -313,6 +322,10 @@ func (d *Dispatcher) runPipeline(parent context.Context) {
 				} else {
 					chunk = d.collectPreloaded(topic, p, d.hub.InterestView(topic), now.UnixMilli())
 				}
+				if chunk.unfit {
+					retryAfter[topic] = time.Now().Add(d.interval)
+					d.releaseReady(topic, p)
+				}
 				if len(chunk.items) > 0 {
 					busy[topic] = p
 					busyDue[topic] = chunk.oldestDueMs
@@ -333,14 +346,17 @@ func (d *Dispatcher) runPipeline(parent context.Context) {
 			if topic == maintenanceTopic && (maintenance != nil || busy[topic] != nil) {
 				continue
 			}
-			dueSlots := min(d.Limits.Candidates, dueCapacity-d.readyCount-reservedDue)
-			if dueSlots <= 0 {
-				continue
-			}
+			// A busy topic may prefetch one batch, never the entire shared
+			// allowance. Already retained entries consume its topic credit.
+			dueSlots := min(max(0, d.Limits.Candidates-p.readyCount), dueCapacity-d.readyCount-reservedDue)
 			futureSlots := 0
 			if topic != maintenanceTopic && d.PreloadLookahead > 0 {
 				futureSlots = min(d.Limits.Candidates, max(0, d.PreloadMaxMessages-d.preloadCount-reservedFuture))
 			}
+			if dueSlots <= 0 && futureSlots <= 0 {
+				continue
+			}
+
 			cursor := scanCursor{epoch: p.epoch}
 			if current := d.cursors[topic]; current != nil {
 				cursor = *current
@@ -356,7 +372,7 @@ func (d *Dispatcher) runPipeline(parent context.Context) {
 			for key := range assigned[topic] {
 				known[key] = true
 			}
-			scanJobs <- discoveryJob{known: known, topic: topic, owner: p, cursor: cursor, futureAfter: append([]byte(nil), p.after...), futureSlots: futureSlots, dueSlots: dueSlots}
+			scanJobs <- discoveryJob{repairGeneration: p.repairGeneration, known: known, topic: topic, owner: p, cursor: cursor, futureAfter: append([]byte(nil), p.after...), futureSlots: futureSlots, dueSlots: dueSlots}
 			rotation = (start + offset + 1) % len(topics)
 		}
 		d.observePreload()
@@ -413,6 +429,8 @@ func (d *Dispatcher) runPipeline(parent context.Context) {
 				delete(assigned, topic)
 				if result.err != nil || result.sent == 0 {
 					retryAfter[topic] = time.Now().Add(d.interval)
+					// Backing-off topics cannot strand ready credits while workers are idle.
+					d.releaseReady(topic, result.job.owner)
 				}
 			}
 			if result.err != nil {
@@ -429,25 +447,38 @@ func (d *Dispatcher) runPipeline(parent context.Context) {
 			if job.topic == maintenanceTopic {
 				current = maintenanceOwner
 			}
+			admitted := 0
 			if current == job.owner {
-				d.cursors[job.topic] = &result.cursor
+				if job.dueSlots > 0 && current.repairGeneration == job.repairGeneration {
+					d.cursors[job.topic] = &result.cursor
+				}
 				if job.topic == maintenanceTopic {
 					if len(result.chunk.items) > 0 {
 						maintenance = &result.chunk
+						admitted = len(result.chunk.items)
 					}
 				} else {
 					current.after = result.after
-					d.admitChunk(current, result.chunk, assigned[job.topic])
+					if !time.Now().Before(retryAfter[job.topic]) {
+						admitted += d.admitChunk(current, result.chunk, assigned[job.topic])
+					} else if len(result.chunk.items) > 0 {
+						// A scan dispatched before failure can finish while the topic is
+						// backing off. Release its reservation and preserve repair.
+						current.repairGeneration++
+						delete(d.cursors, job.topic)
+					}
 					for _, candidate := range result.future {
 						if !assigned[job.topic][candidate.key] {
-							d.admitCandidate(current, candidate)
+							if d.admitCandidate(current, candidate) {
+								admitted++
+							}
 						}
 					}
 				}
 			}
 			// Every range wraps; rejected/duplicate results never certify completion.
 			nextScan[job.topic] = time.Now().Add(d.interval)
-			if len(result.chunk.items) > 0 || len(result.future) > 0 {
+			if admitted > 0 {
 				nextScan[job.topic] = time.Time{}
 			}
 		}

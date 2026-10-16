@@ -98,7 +98,7 @@ uses those same functions. It is not a second sender algorithm.
 
 A scan reserves result slots before dispatch. Future reservations plus retained
 future entries never exceed `preloadMaxMessages`. Due discovery has a separate
-allowance of `2 * prepareBatchSize`, so future entries cannot exclude overdue
+allowance of `max(2, prepareWorkers) * prepareBatchSize`, so future entries cannot exclude overdue
 arrivals. Assigned jobs have the existing `prepareWorkers * prepareBatchSize`
 bound. A heap pop clears its backing slot; sparse heaps/maps rebuild at one-quarter
 occupancy, bounding capacity by a constant factor. Topic removal clears its data
@@ -113,10 +113,28 @@ admission, stale results, keys skipped while assigned and insertions behind a
 cursor are recovered by a subsequent cyclic pass. A cursor is never a completion
 watermark or proof of cache completeness.
 
-Productive scans refill immediately, subject to reservations and fair rotation.
-Empty scans wait for the poll cadence. Full queues, failed proposals and lost
-permission evict the assigned cache reference and wait at least one poll interval
-before retrying. Durable storage and current Hub readiness then drive recovery;
+Only results that actually enter admission trigger immediate refill, subject to
+reservations and fair rotation. A nonempty scan whose entries are stale,
+duplicated or unusable waits for the poll cadence.
+Empty scans wait for the poll cadence. Each topic may retain/reserve at most
+one due batch, including while its preparation job is busy. The global due
+allowance covers at least every preparation worker, so busy topics cannot consume
+all admission while another worker is idle. A scan reserves only the unfilled
+part of its topic's batch allowance. Future-only scans can still refill within
+the independent future allowance; they reserve no shared due credits and do not
+advance the due cursor. Topics backing off release remaining ready entries, and
+a repair generation prevents older scan results from overwriting that rewind.
+A scan already in flight when backoff starts releases its due result rather than
+stranding credits; its future entries can still enter the separate cache.
+This also preserves admission with more delivery workers than discovery workers.
+
+An individual recipient command that cannot fit the preparation-byte limit is
+logged, counted as `delivery_rejected_total{reason="prepare_bytes"}`, and waits
+at least one poll interval before rediscovery. Its other due entries also release
+shared credits while waiting; future entries retain their separate cache charge.
+Full queues, failed proposals and lost permission evict the assigned cache
+reference and wait at least one poll interval before retrying. Durable storage
+and current Hub readiness then drive recovery;
 a send-start ACK-deadline extension cannot be shortened by a cached retry timer.
 Unfinished fan-out interests remain independent in persisted receipts. No completed
 key history grows without bound.
@@ -167,7 +185,7 @@ a consumer's configured channel capacity. With defaults C=512, B=64, W=2:
 | Stage | Bound | Payload ownership after handoff |
 | --- | --- | --- |
 | Retained/reserved future entries | C across heaps, scans and result channels combined | Immutable decoded message |
-| Due scan results and ready entries | 2B combined, independent of C | Same admission representation |
+| Due scan results and ready entries | max(2,W)B combined, independent of C; at most B retained/reserved per topic | Same admission representation |
 | Assigned preparation/delivery jobs | WB total; one/topic | References removed from heap and held by worker |
 | Scanner transients | At most two current decodes plus engine iterators | Released on iterator close/job return |
 | Maintenance | At most two discovery jobs and one pending receipt chunk; uses shared pools | One transient payload read/decode per scanner, no retained payload batch |
@@ -178,7 +196,7 @@ a consumer's configured channel capacity. With defaults C=512, B=64, W=2:
 | Validity metadata | About 48 KiB per engine, 512-byte bitmap per batch, small snapshot token | No per-key unbounded history |
 | Known-key scan filters | At most two copies of relevant bounded heap/assigned key sets | Keys only |
 
-Conservatively, the heap/discovery/worker stages retain at most `C+2B+WB=768`
+Conservatively, the heap/discovery/worker stages retain at most `C+max(2,W)B+WB=768`
 message allocations plus current decoder transients. At 64 KiB this is about
 48 MiB of payload plus bookkeeping, **before** sender queues, in-flight consumers,
 storage caches, publish batches and transient fallback reads. Fan-out shares the

@@ -36,6 +36,7 @@ type scanCursor struct {
 	epoch uint64
 }
 type deliveryChunk struct {
+	unfit       bool // at least one recipient command cannot fit even an empty batch
 	topic       string
 	items       []raft.DeliveryPrepare
 	scanStarted int64

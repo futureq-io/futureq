@@ -63,12 +63,14 @@ func (h *candidateHeap) Pop() any {
 }
 
 type topicPreload struct {
-	valid    *atomic.Bool // optional generation fence, set by the production owner
-	epoch    uint64
-	after    []byte // independent of the live due cursor; never a watermark
-	items    candidateHeap
-	keys     map[[24]byte]bool
-	scanNext bool
+	readyCount       int          // scheduler-owned due credits; future entries are charged separately
+	repairGeneration uint64       // fences cursor resets against older scan results
+	valid            *atomic.Bool // optional generation fence, set by the production owner
+	epoch            uint64
+	after            []byte // independent of the live due cursor; never a watermark
+	items            candidateHeap
+	keys             map[[24]byte]bool
+	scanNext         bool
 }
 
 // collectScheduledTopic alternates cached chunks with live due scans. Even a
@@ -127,13 +129,17 @@ func (d *Dispatcher) collectPreloaded(topic string, p *topicPreload, view Intere
 		heap.Pop(&p.items)
 		delete(p.keys, candidate.key)
 		if candidate.ready {
+			p.readyCount--
 			d.readyCount--
 		} else {
 			d.preloadCount--
 		}
 		examined++
 		if err != nil || commandBytes+len(encoded)+1 > d.Limits.Bytes {
-			continue // ordinary scanning reports an oversized recipient set
+			chunk.unfit = true
+			d.logger.Error("delivery interests exceed preparation byte limit", zap.String("topic", topic), zap.Int("limit", d.Limits.Bytes))
+			metrics.DeliveryRejectedTotal.WithLabelValues("prepare_bytes").Inc()
+			break // retry on bounded backoff with a fresh recipient view
 		}
 		owners := view.localOwners(item.Key)
 		if len(owners) == 0 || !d.hub.hasReadyOwner(owners, item.Key) {
@@ -151,17 +157,7 @@ func (d *Dispatcher) collectPreloaded(topic string, p *topicPreload, view Intere
 			chunk.oldestDueMs = candidate.due
 		}
 	}
-	if len(p.items) == 0 {
-		p.items, p.keys = nil, nil // release capacity when a topic drains
-	} else if len(p.items) <= cap(p.items)/4 {
-		items := make(candidateHeap, len(p.items))
-		copy(items, p.items)
-		p.items = items
-		p.keys = make(map[[24]byte]bool, len(items))
-		for _, candidate := range items {
-			p.keys[candidate.key] = true
-		}
-	}
+	p.compact()
 	return chunk
 }
 
@@ -255,6 +251,7 @@ func (d *Dispatcher) dropPreload(topic string) {
 			}
 		}
 		p.items, p.keys = nil, nil
+		p.readyCount = 0
 		delete(d.preloads, topic)
 	}
 	d.observePreload()
@@ -290,4 +287,46 @@ func (d *Dispatcher) observePreload() {
 		capacity = d.PreloadMaxMessages
 	}
 	metrics.DeliveryPreloadCapacity.Set(float64(capacity))
+}
+
+// compact bounds backing capacity and clears drained maps without keeping
+// payload references in unused heap slots.
+func (p *topicPreload) compact() {
+	if len(p.items) == 0 {
+		p.items, p.keys = nil, nil // release capacity when a topic drains
+	} else if len(p.items) <= cap(p.items)/4 {
+		items := make(candidateHeap, len(p.items))
+		copy(items, p.items)
+		p.items = items
+		p.keys = make(map[[24]byte]bool, len(items))
+		for _, candidate := range items {
+			p.keys[candidate.key] = true
+		}
+	}
+}
+
+// releaseReady frees shared due credits when a topic cannot currently assign
+// another job. Future entries keep their separate cache allowance. Rewind the
+// repair cursor so evicted payloads remain recoverable without waiting for an
+// entire forward pass, and fence older cursor results against that rewind.
+func (d *Dispatcher) releaseReady(topic string, p *topicPreload) {
+	if p.readyCount == 0 {
+		return
+	}
+	kept := p.items[:0]
+	for _, candidate := range p.items {
+		if candidate.ready {
+			delete(p.keys, candidate.key)
+			d.readyCount--
+			p.readyCount--
+		} else {
+			kept = append(kept, candidate)
+		}
+	}
+	clear(p.items[len(kept):])
+	p.items = kept
+	heap.Init(&p.items)
+	p.compact()
+	p.repairGeneration++
+	delete(d.cursors, topic)
 }

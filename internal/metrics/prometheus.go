@@ -129,7 +129,7 @@ var (
 		Name: "futureq_delivery_ownership_filtered_total", Help: "Event keys without a locally owned interest.",
 	})
 	DeliveryRejectedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
-		Name: "futureq_delivery_rejected_total", Help: "Delivery attempts rejected by permission, queue capacity, or fencing.",
+		Name: "futureq_delivery_rejected_total", Help: "Delivery attempts rejected by preparation bounds, permission, queue capacity, or fencing.",
 	}, []string{"reason"})
 	DeliveryQueueDepth = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "futureq_delivery_queue_depth", Help: "Local bounded work: consumer counts queued delivery attempts, prepare counts outstanding jobs, and preload counts retained candidate keys including future or stale entries. Not persistent backlog or readiness to send.",

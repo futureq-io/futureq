@@ -195,3 +195,53 @@ reviewed head. GitNexus reports critical graph impact across the storage and
 delivery flows; it is an affected-path audit, not a proof of interface completeness.
 
 Raw measurements: [all 216 workload runs](heap-scheduler-workloads.csv).
+
+
+## Admission and backoff regression follow-up
+
+The 216-run matrix above measured `3ca7ae2`; it did not cover the two later
+review reproductions. Green CI at that head likewise missed those cases:
+
+- One blocked topic could fill all shared ready slots and prevent a newly
+  inserted message on another topic from being discovered despite a free worker.
+- An oversized recipient command was discarded at selection, then immediately
+  rediscovered because a nonempty scan was incorrectly treated as progress.
+  Both engine reproductions made over 1000 iterator calls in 150 ms.
+
+The fixes limit each topic to one retained/reserved due batch, provide global due
+capacity for at least all delivery workers, release prefetch during backoff, and
+refill immediately only after actual admission. Future-only work still uses its
+own cache budget without advancing the due cursor. Rewinds carry a repair
+generation so older results cannot overwrite recovery progress. An unfit batch
+logs its topic/limit, increments the `prepare_bytes` rejection reason, and backs
+off without deleting durable data.
+
+The new tests cover Pebble and Bolt, two and four delivery workers, late scan
+results arriving during preparation, recovery of every unsent message, failure
+backoff with full prefetch, future-only discovery, payload-reference cleanup and
+unchanged future-cache count. The oversized case now opens two iterators in its
+150 ms window, with a one-second poll interval, and submits no preparation.
+
+A focused before/fixed comparison uses the same workload harness at `3ca7ae2`
+and at the corrected source: Pebble memory, 1200 messages at offered 5000/s,
+three repetitions per case in due-only and future-enabled modes (36 runs).
+These are small local pipeline checks, not a rerun of the complete engine matrix.
+
+| Mode | Case | Before/fixed messages/s | Before/fixed send p99 ms | Before/fixed CPU seconds |
+| --- | --- | ---: | ---: | ---: |
+| due-only | immediate | 5031 / 5030 | 10.04 / 8.65 | 0.106 / 0.098 |
+| due-only | large | 3516 / 3429 | 13.50 / 13.87 | 0.301 / 0.250 |
+| due-only | slow-prepare | 3775 / 3845 | 38.28 / 35.87 | 0.122 / 0.118 |
+| preload | immediate | 5029 / 4893 | 8.49 / 9.50 | 0.081 / 0.159 |
+| preload | large | 3518 / 3467 | 13.45 / 10.17 | 0.309 / 0.263 |
+| preload | slow-prepare | 3950 / 3990 | 22.56 / 22.05 | 0.108 / 0.083 |
+
+Raw follow-up data: [36 focused workload runs](heap-scheduler-fix-workloads.csv).
+Future caching remains opt-in; these checks do not override the earlier rollout
+caution. The original baseline and full-message matrix remain preserved above.
+
+```sh
+go test -race ./internal/dispatcher \
+  -run '^TestScheduler(BusyTopic|UnfitBatch|LateScan|FailedTopics)|^TestReleaseReady|^TestFutureOnlyDiscovery' \
+  -count=10 -v
+```
