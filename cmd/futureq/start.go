@@ -131,6 +131,7 @@ func startRun(cmd *cobra.Command, _ []string) {
 		}
 	}
 	ledger := dispatcher.NewDeliveryLedger(a.DB, recipients, deleteBackend, proposeDelivery)
+	ledger.AckNoSync = cfg.Delivery.AckNoSync
 	if cfg.Cluster.Enabled {
 		ledger.ProposeContext = func(ctx context.Context, cmd []byte) (statemachine.Result, error) {
 			return a.NodeHost.SyncPropose(ctx, a.NodeHost.GetNoOPSession(cfg.Cluster.ShardID), cmd)

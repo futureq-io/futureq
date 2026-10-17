@@ -90,6 +90,7 @@ type Publish struct {
 }
 
 type Delivery struct {
+	AckNoSync            bool          `mapstructure:"ackNoSync" yaml:"ackNoSync"`
 	ConsumerQueueSize    int           `mapstructure:"consumerQueueSize" yaml:"consumerQueueSize"`
 	TimeBucket           time.Duration `mapstructure:"timeBucket" yaml:"timeBucket"`
 	DispatchPollInterval time.Duration `mapstructure:"dispatchPollInterval" yaml:"dispatchPollInterval"`
@@ -341,6 +342,9 @@ func (c *Config) validatePublishAndDelivery() error {
 		return fmt.Errorf("publish.proposalTimeout must be positive")
 	}
 	d := c.Delivery
+	if d.AckNoSync && (c.Cluster.Enabled || c.Storage.Engine != "pebble") {
+		return fmt.Errorf("delivery.ackNoSync requires standalone mode with storage.engine pebble")
+	}
 	if d.PreloadLookahead < 0 || d.PreloadLookahead%time.Millisecond != 0 {
 		return fmt.Errorf("delivery.preloadLookahead must be zero or a positive whole number of milliseconds")
 	}
