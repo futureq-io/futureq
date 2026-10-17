@@ -34,6 +34,7 @@ cluster:
 
 storage:
   engine: pebble
+  payloadCacheSlots: 4096 # freshness tracker slots per DB; power of two, 64..1048576; restart to change
   pebble:
     # memory uses a virtual filesystem and discards data on exit.
     mode: disk

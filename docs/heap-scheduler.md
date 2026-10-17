@@ -56,8 +56,13 @@ released with the iterator, rather than cached alongside decoded messages.
 
 Both built-in engines implement optional `storage.CachedIterator`. A token records
 an engine identity, a bounded hash slot of the event key, and the sequence captured
-**before** opening the engine snapshot. The engine has 4096 version slots and
-pending counts. Every batch stages a fixed bitmap of touched 24-byte event keys.
+**before** opening the engine snapshot. `storage.payloadCacheSlots` sets the number
+of version slots and pending counts per engine (default 4096, power of two from
+64 to 1048576). The count is fixed when opening the engine and requires restart
+to change; both engines and both standalone/Raft use it. Slot indexes are
+`uint32`, and hashing uses a mask because the count is a power of two. Every batch
+that touches 24-byte event keys lazily allocates a bitmap sized to that count;
+metadata-only batches allocate none.
 Before committing any such batch, under a short tracker lock, it advances the
 sequence, stamps affected slots and marks them pending. After storage commit
 returns (including failure), it advances/stamps again and clears its pending
@@ -193,7 +198,7 @@ a consumer's configured channel capacity. With defaults C=512, B=64, W=2:
 | Heap/map backing capacity | Heap <4 times live entries after drain; maps rebuilt with it | Popped slots zeroed; removed topics clear arrays/maps |
 | Sender queues and tracked attempts | Per consumer: Q buffered + at most max(1024,Q) records | Shared immutable payload; expired buffered attempts may outlive tracking |
 | Delete/ACK buffers | Existing 8192-key limits per completion kind | Keys/recipient metadata, no payload cache |
-| Validity metadata | About 48 KiB per engine, 512-byte bitmap per batch, small snapshot token | No per-key unbounded history |
+| Validity metadata | At `S` configured slots, about `12*S` bytes per engine plus an `S/8`-byte bitmap per batch touching message keys; defaults: 48 KiB and 512 bytes. Small snapshot token. | No per-key unbounded history; commit bitmap traversal grows with `S` |
 | Known-key scan filters | At most two copies of relevant bounded heap/assigned key sets | Keys only |
 
 Conservatively, the heap/discovery/worker stages retain at most `C+max(2,W)B+WB=768`

@@ -35,14 +35,18 @@ type BoltConfig struct {
 
 // boltDB wraps *bolt.DB and implements storage.DB.
 type boltDB struct {
-	versions cacheVersions
+	versions *cacheVersions
 	db       *bolt.DB
 	bucket   []byte
 }
 
 // NewBoltDB opens a bbolt database at cfg.File and returns it as a
 // storage.DB. The database file is created if it does not exist.
-func NewBoltDB(cfg config.Bolt) (DB, error) {
+func NewBoltDB(cfg config.Bolt, options ...Options) (DB, error) {
+	versions, err := newCacheVersions(options...)
+	if err != nil {
+		return nil, err
+	}
 	if err := os.MkdirAll(filepath.Dir(cfg.File), 0700); err != nil {
 		return nil, fmt.Errorf("bbolt: failed to create parent directory for %q: %w", cfg.File, err)
 	}
@@ -65,7 +69,7 @@ func NewBoltDB(cfg config.Bolt) (DB, error) {
 		return nil, fmt.Errorf("bbolt: failed to create bucket %q: %w", bname, err)
 	}
 
-	return &boltDB{db: db, bucket: []byte(bname)}, nil
+	return &boltDB{db: db, bucket: []byte(bname), versions: versions}, nil
 }
 
 // Get retrieves the value for key using a short-lived read-only transaction.
@@ -91,7 +95,7 @@ func (b *boltDB) Get(key []byte) ([]byte, io.Closer, error) {
 // NewBatch returns a boltBatch that accumulates Set/Delete operations and
 // applies them in a single read-write transaction on Commit.
 func (b *boltDB) NewBatch() Batch {
-	return &boltBatch{db: b.db, bucket: b.bucket, versions: &b.versions}
+	return &boltBatch{db: b.db, bucket: b.bucket, versions: b.versions}
 }
 
 // NewIter opens a read-only transaction and returns an iterator over the bucket.
@@ -192,7 +196,7 @@ type boltOp struct {
 }
 
 func (bb *boltBatch) Set(key, value []byte) error {
-	bb.mutations.add(key)
+	bb.mutations.add(key, bb.versions)
 	k := make([]byte, len(key))
 	copy(k, key)
 	v := make([]byte, len(value))
@@ -202,7 +206,7 @@ func (bb *boltBatch) Set(key, value []byte) error {
 }
 
 func (bb *boltBatch) Delete(key []byte) error {
-	bb.mutations.add(key)
+	bb.mutations.add(key, bb.versions)
 	k := make([]byte, len(key))
 	copy(k, key)
 	bb.ops = append(bb.ops, boltOp{del: true, key: k})

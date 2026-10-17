@@ -51,16 +51,17 @@ func TestCacheValidityTracksCommittedMutationsAndOldSnapshots(t *testing.T) {
 }
 
 func TestCacheValidityRejectsPendingAndFailedCommitSnapshots(t *testing.T) {
-	var versions cacheVersions
+	versions, err := newCacheVersions()
+	require.NoError(t, err)
 	key := []byte("012345678901234567890123")
 	old := versions.snapshot()
 	var mutations cacheMutations
-	mutations.add(key)
+	mutations.add(key, versions)
 	done := versions.begin(&mutations)
 	require.False(t, old.token(key).Valid(), "invalidate before storage work begins")
 	require.False(t, versions.snapshot().token(key).Valid(), "no proof can be issued for a key racing a pending commit")
 	other := []byte("112345678901234567890123")
-	require.NotEqual(t, cacheSlot(key), cacheSlot(other))
+	require.NotEqual(t, cacheSlot(key, versions.mask), cacheSlot(other, versions.mask))
 	require.True(t, versions.snapshot().token(other).Valid(), "unrelated writes do not disable caching")
 	overlapping := versions.snapshot()
 	done() // even if the storage commit failed, old proofs stay invalid

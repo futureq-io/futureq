@@ -13,13 +13,17 @@ import (
 
 // Pebble holds an open pebble database and implements storage.DB.
 type Pebble struct {
-	versions cacheVersions
+	versions *cacheVersions
 	db       *pebble.DB
 	logger   *zap.Logger
 }
 
 // NewPebble opens a Pebble database using the given config.
-func NewPebble(cfg config.Pebble, logger *zap.Logger) (*Pebble, error) {
+func NewPebble(cfg config.Pebble, logger *zap.Logger, options ...Options) (*Pebble, error) {
+	versions, err := newCacheVersions(options...)
+	if err != nil {
+		return nil, err
+	}
 	concurrency := cfg.CompactionConcurrency
 	if concurrency < 0 {
 		return nil, fmt.Errorf("pebble compaction concurrency must be positive")
@@ -69,7 +73,7 @@ func NewPebble(cfg config.Pebble, logger *zap.Logger) (*Pebble, error) {
 		return nil, err
 	}
 
-	return &Pebble{db: db, logger: pebbleLogger}, nil
+	return &Pebble{db: db, logger: pebbleLogger, versions: versions}, nil
 }
 
 // ── storage.DB implementation ─────────────────────────────────────────────────
@@ -84,7 +88,7 @@ func (p *Pebble) Get(key []byte) ([]byte, io.Closer, error) {
 }
 
 func (p *Pebble) NewBatch() Batch {
-	return &pebbleBatch{b: p.db.NewBatch(), versions: &p.versions}
+	return &pebbleBatch{b: p.db.NewBatch(), versions: p.versions}
 }
 
 // NewIter opens a snapshot internally and returns an iterator scoped to it.
@@ -151,11 +155,14 @@ type pebbleBatch struct {
 }
 
 func (pb *pebbleBatch) Set(key, value []byte) error {
-	pb.mutations.add(key)
+	pb.mutations.add(key, pb.versions)
 	return pb.b.Set(key, value, nil)
 }
-func (pb *pebbleBatch) Delete(key []byte) error { pb.mutations.add(key); return pb.b.Delete(key, nil) }
-func (pb *pebbleBatch) Close() error            { return pb.b.Close() }
+func (pb *pebbleBatch) Delete(key []byte) error {
+	pb.mutations.add(key, pb.versions)
+	return pb.b.Delete(key, nil)
+}
+func (pb *pebbleBatch) Close() error { return pb.b.Close() }
 
 func (pb *pebbleBatch) Commit(mode SyncMode) error {
 	if pb.versions != nil {

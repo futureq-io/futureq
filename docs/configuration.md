@@ -61,6 +61,7 @@ export FUTUREQ_CLUSTER_RAFT_INITIALMEMBERS='{1: "10.0.0.1:50005"}'
 | Key                            | Default      | Description |
 | ------------------------------ | ------------ | ----------- |
 | `storage.engine`               | `pebble`     | `pebble` (LSM) or `bolt` (single-file B+-tree). |
+| `storage.payloadCacheSlots`    | `4096`       | Shared payload freshness slots per DB, for both engines and standalone/Raft. Power of two from `64` to `1048576`; requires restart. Larger counts reduce conservative cache invalidations from hash collisions. |
 | `storage.pebble.mode`          | `disk`       | `disk` or `memory` (Pebble over an in-memory FS; nothing persists). |
 | `storage.pebble.dataDir`       | `./data`     | Pebble data directory. |
 | `storage.pebble.walEnabled`    | `true`       | Pebble WAL toggle. Automatically disabled in memory mode and in clustered mode (the Raft log is the WAL); may only be set `false` explicitly for clustered disk nodes. |
@@ -68,6 +69,16 @@ export FUTUREQ_CLUSTER_RAFT_INITIALMEMBERS='{1: "10.0.0.1:50005"}'
 | `storage.pebble.memtableSize`  | `64MiB`      | Memtable size. |
 | `storage.bolt.file`            | `./data/futureq.db` | bbolt database file (engine `bolt`). |
 | `storage.bolt.bucket`          | `futureq`    | Single bbolt bucket holding the flat ordered keyspace. |
+
+For example, set `storage.payloadCacheSlots: 16384` or
+`FUTUREQ_STORAGE_PAYLOADCACHESLOTS=16384`. This changes freshness tracking, not the
+number of cached messages or Pebble's block cache. At `S` slots the tracking
+arrays use approximately `12*S` bytes per DB, plus an `S/8`-byte bitmap per batch
+that touches message keys. Metadata-only batches allocate no bitmap. The current
+commit path scans that bitmap, so larger counts also increase CPU work and time
+under the tracker lock. Benchmark the cache-hit rate and delivery latency before
+increasing it substantially. Nodes may use different counts; this setting changes
+no stored records or wire format.
 
 ## publish
 

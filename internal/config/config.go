@@ -64,9 +64,10 @@ type Raft struct {
 }
 
 type Storage struct {
-	Engine string `mapstructure:"engine" yaml:"engine"`
-	Pebble Pebble `mapstructure:"pebble" yaml:"pebble"`
-	Bolt   Bolt   `mapstructure:"bolt" yaml:"bolt"`
+	Engine            string `mapstructure:"engine" yaml:"engine"`
+	PayloadCacheSlots int    `mapstructure:"payloadCacheSlots" yaml:"payloadCacheSlots"`
+	Pebble            Pebble `mapstructure:"pebble" yaml:"pebble"`
+	Bolt              Bolt   `mapstructure:"bolt" yaml:"bolt"`
 }
 
 type Pebble struct {
@@ -297,6 +298,9 @@ func (c *Config) validateCluster() error {
 }
 
 func (c *Config) validateStorage() error {
+	if err := ValidatePayloadCacheSlots(c.Storage.PayloadCacheSlots); err != nil {
+		return err
+	}
 	switch c.Storage.Engine {
 	case "pebble":
 		p := c.Storage.Pebble
