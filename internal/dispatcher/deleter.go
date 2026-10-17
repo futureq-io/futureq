@@ -128,17 +128,34 @@ func (d *Deleter) MarkDeleted(key []byte) {
 const MaxPendingCompletions = 8192
 
 func (d *Deleter) TryMarkDeleted(key []byte) bool {
+	accepted, _ := d.tryMarkDeleted(key)
+	return accepted
+}
+
+// MarkExpired counts only a newly accepted TTL deletion request. Explicit
+// deletes, repeated scans, and retries of the same pending key do not inflate
+// expiration metrics. Durability still belongs to the ordinary delete backend.
+func (d *Deleter) MarkExpired(key []byte, topic, source string) {
+	accepted, added := d.tryMarkDeleted(key)
+	if !accepted {
+		d.logger.Warn("delete queue full; expired key will be revisited by scan or TTL sweep")
+	} else if added {
+		metrics.MessagesExpiredTotal.WithLabelValues(topic, source).Inc()
+	}
+}
+
+func (d *Deleter) tryMarkDeleted(key []byte) (accepted, added bool) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if d.deleteKeys[string(key)] {
-		return true
+		return true, false
 	}
 	if len(d.deleteKeys) >= MaxPendingCompletions {
-		return false
+		return false, false
 	}
 	d.deleteKeys[string(key)] = true
 	d.pending = append(d.pending, append([]byte(nil), key...))
-	return true
+	return true, true
 }
 
 // MarkAcknowledged queues recipient persistence and retries asynchronously.

@@ -167,9 +167,24 @@ func (c *replicaTestCluster) subscribe(nodeID uint64, id, group string) chan *pb
 	ch := make(chan *pb.QueueMessage, 16)
 	require.NoError(c.t, node.hub.WithConsumerRegistry(func() error {
 		node.hub.Register(id, "orders", group, ch)
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		return node.svc.ChangeConsumer(ctx, replicaTestShard, "orders", group, metadata.ConsumerMember{ID: id, NodeID: nodeID}, true)
+		// A membership read or proposal issued during an election can time out
+		// even after a new leader is elected. Retry the same idempotent add,
+		// without registering the local consumer more than once.
+		for {
+			attemptCtx, stop := context.WithTimeout(ctx, 300*time.Millisecond)
+			err := node.svc.ChangeConsumer(attemptCtx, replicaTestShard, "orders", group, metadata.ConsumerMember{ID: id, NodeID: nodeID}, true)
+			stop()
+			if err == nil || !dragonboat.IsTempError(err) {
+				return err
+			}
+			select {
+			case <-ctx.Done():
+				return err
+			case <-time.After(20 * time.Millisecond):
+			}
+		}
 	}))
 	return ch
 }
@@ -285,6 +300,23 @@ func TestReplicaClusterTimeoutOfflineRebalanceAndRestart(t *testing.T) {
 	staleMessage := receiveReplicaMessage(t, remote)
 	dispatch(1, 1)
 	firstAttempt := receiveReplicaMessage(t, old) // remains unacknowledged
+	// Always stop the event-shard leader so registration exercises an election,
+	// rather than depending on which replica happened to win at startup.
+	leaderID, _, valid, err := c.nodes[3].nh.GetLeaderID(replicaTestShard)
+	require.NoError(t, err)
+	require.True(t, valid)
+	if leaderID != 3 {
+		require.NoError(t, c.nodes[leaderID].nh.RequestLeaderTransfer(replicaTestShard, 3))
+	}
+	require.Eventually(t, func() bool {
+		for _, node := range c.nodes {
+			leaderID, _, valid, err := node.nh.GetLeaderID(replicaTestShard)
+			if err != nil || !valid || leaderID != 3 {
+				return false
+			}
+		}
+		return true
+	}, 5*time.Second, 20*time.Millisecond)
 	c.stop(3)
 	joined := c.subscribe(2, "joined", "workers")
 	c.publish(3)

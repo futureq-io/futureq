@@ -34,6 +34,7 @@ cluster:
 
 storage:
   engine: pebble
+  payloadCacheSlots: 4096 # freshness tracker slots per DB; power of two, 64..1048576; restart to change
   pebble:
     # memory uses a virtual filesystem and discards data on exit.
     mode: disk
@@ -55,6 +56,8 @@ delivery:
   consumerQueueSize: 1024 # 1..65536 messages per consumer sender queue
   timeBucket: 1ms
   dispatchPollInterval: 5ms
+  preloadLookahead: 0s # future caching is opt-in; try 100ms after workload evaluation
+  preloadMaxMessages: 512 # global full-message future-cache cap; 0 disables future caching
   inFlightTimeout: 5s
   deleteBatchInterval: 500ms
   ttlSweepInterval: 1m0s

@@ -93,7 +93,22 @@ var (
 		Name: "futureq_delivery_read_barrier_duration_ms", Help: "Duration of quorum delivery read barriers in milliseconds.", Buckets: deliveryBuckets,
 	})
 	DeliveryScanDurationMs = promauto.NewHistogram(prometheus.HistogramOpts{
-		Name: "futureq_delivery_scan_duration_ms", Help: "Local scan work per bounded chunk, excluding preparation and read barriers.", Buckets: deliveryBuckets,
+		Name: "futureq_delivery_scan_duration_ms", Help: "Local work per bounded collection operation, including live scans, maintenance scans, preload scans, and cached selection; excludes preparation, read barriers, and waiting for due time.", Buckets: deliveryBuckets,
+	})
+	DeliveryCollectionDurationMs = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name: "futureq_delivery_collection_duration_ms", Help: "Local collection duration in milliseconds by path: due_scan, maintenance, preload_scan, or preload_ready; includes empty operations and excludes preparation, read barriers, and waiting for due time.", Buckets: deliveryBuckets,
+	}, []string{"path"})
+	DeliveryCandidatesTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "futureq_delivery_candidates_total", Help: "Due candidates selected for preparation from live scans or preload caches; includes retries, not successful sends or unique messages. Excludes maintenance.",
+	}, []string{"source"})
+	DeliveryPreloadCapacity = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "futureq_delivery_preload_capacity", Help: "Configured maximum retained preload candidates on this node; zero when preloading is disabled or the scheduler stops.",
+	})
+	DeliveryPreloadLoadedTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "futureq_delivery_preload_loaded_total", Help: "Candidates newly retained in the preload cache; reloading after invalidation counts again. Loading is not delivery or readiness to send.",
+	})
+	DeliveryPreloadScannedKeysTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "futureq_delivery_preload_scanned_keys_total", Help: "Event-key observations in speculative preload scans, including cached, remote-owned, and skipped keys; a subset of delivery_scanned_keys_total.",
 	})
 	DeliveryPrepareDurationMs = promauto.NewHistogramVec(prometheus.HistogramOpts{
 		Name: "futureq_delivery_prepare_duration_ms", Help: "Preparation wait in milliseconds per batch or candidate (including existing manifests).", Buckets: deliveryBuckets,
@@ -108,16 +123,16 @@ var (
 		Name: "futureq_delivery_manifest_hits_total", Help: "Preparation candidates with an existing manifest in the requested epoch.",
 	})
 	DeliveryScannedKeysTotal = promauto.NewCounter(prometheus.CounterOpts{
-		Name: "futureq_delivery_scanned_keys_total", Help: "Event keys examined by bounded delivery scans.",
+		Name: "futureq_delivery_scanned_keys_total", Help: "Event-key observations in bounded live and speculative preload storage scans; repeated reads count again. Excludes cached selection and maintenance receipt scans.",
 	})
 	DeliveryOwnershipFilteredTotal = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "futureq_delivery_ownership_filtered_total", Help: "Event keys without a locally owned interest.",
 	})
 	DeliveryRejectedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
-		Name: "futureq_delivery_rejected_total", Help: "Delivery attempts rejected by permission, queue capacity, or fencing.",
+		Name: "futureq_delivery_rejected_total", Help: "Delivery attempts rejected by preparation bounds, permission, queue capacity, or fencing.",
 	}, []string{"reason"})
 	DeliveryQueueDepth = promauto.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "futureq_delivery_queue_depth", Help: "Current bounded queue depth, summed across local subscriptions or preparation jobs.",
+		Name: "futureq_delivery_queue_depth", Help: "Local bounded work: consumer counts queued delivery attempts, prepare counts outstanding jobs, and preload counts retained candidate keys including future or stale entries. Not persistent backlog or readiness to send.",
 	}, []string{"queue"})
 	DeliveryOldestQueuedLatenessMs = promauto.NewGauge(prometheus.GaugeOpts{
 		Name: "futureq_delivery_oldest_queued_lateness_ms", Help: "Lateness of the oldest pending local delivery attempt in milliseconds.",
@@ -135,30 +150,25 @@ var (
 		Name: "futureq_delivery_grpc_sends_total", Help: "Successful gRPC delivery sends.",
 	}, []string{"topic"})
 
-	// DeliveryLatencyMs measures the total time from when the producer enqueued
-	// the message to when the dispatcher handed it to a consumer. Includes any
-	// intentional DelayMs the producer requested.
+	// DeliveryLatencyMs preserves the legacy candidate-selection timestamp.
 	DeliveryLatencyMs = promauto.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    "futureq_delivery_latency_ms",
-		Help:    "Enqueue-to-dispatch latency in milliseconds (includes producer-requested delay).",
+		Help:    "Enqueue-to-candidate-selection age in milliseconds, observed for successfully queued messages; includes producer-requested delay and excludes preparation and sender queue time.",
 		Buckets: prometheus.ExponentialBuckets(1, 2, 16), // 1ms..~65s
 	}, []string{"topic"})
 
-	// DeliveryOverheadMs measures how late the dispatch was relative to the
-	// message's scheduled delivery time (EnqueuedAt + DelayMs). For messages
-	// with no delay this equals DeliveryLatencyMs. A rising p99 here means the
-	// dispatcher is falling behind.
+	// DeliveryOverheadMs also uses selection time, before preparation/queueing.
 	DeliveryOverheadMs = promauto.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    "futureq_delivery_overhead_ms",
-		Help:    "Scan-start lateness past scheduled delivery time in milliseconds; excludes preparation and sender queue time.",
+		Help:    "Candidate-selection-start lateness past scheduled delivery time in milliseconds, observed for successfully queued messages; excludes preparation and sender queue time.",
 		Buckets: deliveryBuckets,
 	}, []string{"topic"})
 
-	// MessagesExpiredTotal counts messages discarded because their TTL elapsed.
+	// MessagesExpiredTotal counts accepted TTL deletion requests on this node.
 	// source = "dispatcher" or "janitor".
 	MessagesExpiredTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "futureq_messages_expired_total",
-		Help: "Total number of messages discarded due to TTL expiry.",
+		Help: "TTL deletion requests accepted on this node, attributed to the source that queued each request; deduplicated while deletion is pending, including failed flush retries. Not committed deletes or a cluster-wide unique-message count.",
 	}, []string{"topic", "source"})
 
 	// ─── Deleter ─────────────────────────────────────────────────────────────

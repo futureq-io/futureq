@@ -17,7 +17,7 @@ var defaultConfig = Config{
 		},
 	},
 	Storage: Storage{
-		Engine: "pebble",
+		Engine: "pebble", PayloadCacheSlots: DefaultPayloadCacheSlots,
 		Pebble: Pebble{Mode: "disk", DataDir: "./data", WALEnabled: true, CacheSize: "16MiB", MemtableSize: "64MiB", CompactionConcurrency: 1},
 		Bolt:   Bolt{File: "./data/futureq.db", Bucket: "futureq"},
 	},
@@ -26,6 +26,8 @@ var defaultConfig = Config{
 		ConsumerQueueSize:    1024,
 		TimeBucket:           time.Millisecond,
 		DispatchPollInterval: 5 * time.Millisecond,
+		PreloadLookahead:     0,
+		PreloadMaxMessages:   512,
 		InFlightTimeout:      5 * time.Second,
 		DeleteBatchInterval:  500 * time.Millisecond,
 		TTLSweepInterval:     time.Minute,

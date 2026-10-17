@@ -4,8 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"sort"
-	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/futureq-io/futureq/internal/app"
@@ -37,148 +36,18 @@ type scanCursor struct {
 	epoch uint64
 }
 type deliveryChunk struct {
+	unfit       bool // at least one recipient command cannot fit even an empty batch
 	topic       string
 	items       []raft.DeliveryPrepare
 	scanStarted int64
 	maintenance bool
 	started     time.Time
 	oldestDueMs int64
-}
-type preparedChunk struct {
-	chunk  deliveryChunk
-	states map[string]*raft.DeliveryState
-	err    error
+	payloads    map[string]cachedPayload
+	generation  *atomic.Bool
 }
 
 const maintenanceTopic = "\x00delivery-maintenance"
-
-// runPipeline owns the cursors. At most one job per topic and Workers jobs
-// overall can exist. A slow proposal occupies one worker, while another topic
-// can scan and prepare. Results and candidate keys are bounded by those same
-// slots; no goroutine or retained payload is allocated per event.
-func (d *Dispatcher) runPipeline(ctx context.Context) {
-	ctx, cancel := context.WithCancel(ctx)
-	jobs := make(chan deliveryChunk, d.Limits.Workers)
-	results := make(chan preparedChunk, d.Limits.Workers)
-	var workers sync.WaitGroup
-	for i := 0; i < d.Limits.Workers; i++ {
-		workers.Add(1)
-		go func() {
-			defer workers.Done()
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case chunk := <-jobs:
-					if !d.hub.DeliveryPermitted() {
-						select {
-						case results <- preparedChunk{chunk: chunk, err: errors.New("delivery permission expired before preparation")}:
-						case <-ctx.Done():
-							return
-						}
-						continue
-					}
-					callCtx, stop := context.WithTimeout(ctx, d.Limits.PrepareTimeout)
-					states, err := d.prepareChunk(callCtx, chunk)
-					stop()
-					select {
-					case results <- preparedChunk{chunk, states, err}:
-					case <-ctx.Done():
-						return
-					}
-				}
-			}
-		}()
-	}
-	defer func() { cancel(); workers.Wait(); metrics.DeliveryQueueDepth.WithLabelValues("prepare").Set(0) }()
-	ticker := time.NewTicker(d.interval)
-	defer ticker.Stop()
-	busy := make(map[string]bool)
-	busyDue := make(map[string]int64)
-	rotation := 0
-	nextMaintenance := time.Now()
-	schedule := func() {
-		d.hub.ExpireInFlight(time.Now())
-		d.hub.ObserveQueues()
-		oldest := int64(0)
-		for _, due := range busyDue {
-			if due > 0 {
-				oldest = max(oldest, time.Now().UnixMilli()-due)
-			}
-		}
-		metrics.DeliveryOldestPreparationLatenessMs.Set(float64(oldest))
-		if len(busy) >= d.Limits.Workers {
-			return
-		}
-		if d.hub.PermitNeedsRenewal(d.Limits.PrepareTimeout+d.Limits.WorkTime) && !d.refreshPermit(ctx) {
-			return
-		}
-		if !d.hub.DeliveryPermitted() {
-			return
-		}
-		topics := d.hub.ActiveTopics()
-		sort.Strings(topics)
-		live := make(map[string]bool, len(topics))
-		for _, topic := range topics {
-			live[topic] = true
-		}
-		for topic := range d.cursors {
-			if topic != maintenanceTopic && !live[topic] && !busy[topic] {
-				delete(d.cursors, topic)
-			}
-		}
-		if d.MaintenanceRecipients != nil && !time.Now().Before(nextMaintenance) {
-			topics = append(topics, maintenanceTopic)
-		}
-		if len(topics) == 0 {
-			return
-		}
-		start := rotation % len(topics)
-		for offset := 0; offset < len(topics) && len(busy) < d.Limits.Workers; offset++ {
-			topic := topics[(start+offset)%len(topics)]
-			if busy[topic] {
-				continue
-			}
-			var chunk deliveryChunk
-			if topic == maintenanceTopic {
-				chunk = d.collectMaintenance()
-				nextMaintenance = time.Now().Add(d.interval)
-			} else {
-				chunk = d.collectTopic(topic, time.Now().UnixMilli())
-			}
-			rotation = (start + offset + 1) % len(topics)
-			if len(chunk.items) == 0 {
-				continue
-			}
-			busy[topic] = true
-			busyDue[topic] = chunk.oldestDueMs
-			jobs <- chunk
-		}
-		metrics.DeliveryQueueDepth.WithLabelValues("prepare").Set(float64(len(busy)))
-	}
-	schedule()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			schedule()
-		case <-d.wakeCh:
-			schedule()
-		case result := <-results:
-			delete(busy, result.chunk.topic)
-			delete(busyDue, result.chunk.topic)
-			if result.err != nil {
-				d.logger.Warn("delivery preparation failed; cyclic scan will retry", zap.Error(result.err))
-			} else if d.refreshPermit(ctx) {
-				// SyncRead catches a follower up after a remotely committed
-				// preparation and revalidates metadata before accessing payloads.
-				d.deliverChunk(result.chunk, result.states)
-			}
-			schedule()
-		}
-	}
-}
 
 func (d *Dispatcher) refreshPermit(ctx context.Context) bool {
 	if err := ctx.Err(); err != nil {
@@ -204,8 +73,10 @@ func (d *Dispatcher) refreshPermit(ctx context.Context) bool {
 // Every examined key consumes work, including remote owners and in-flight keys.
 func (d *Dispatcher) collectTopic(topic string, nowMs int64) deliveryChunk {
 	started := time.Now()
-	defer func() { metrics.DeliveryScanDurationMs.Observe(float64(time.Since(started).Microseconds()) / 1000) }()
-	chunk := deliveryChunk{topic: topic, scanStarted: nowMs, started: started}
+	chunk := deliveryChunk{topic: topic, scanStarted: nowMs, started: started, payloads: make(map[string]cachedPayload)}
+	defer func() {
+		observeCollection("due_scan", started)
+	}()
 	view := d.hub.InterestView(topic)
 	if !view.Active {
 		return chunk
@@ -237,6 +108,7 @@ func (d *Dispatcher) collectTopic(topic string, nowMs int64) deliveryChunk {
 		key, value := iter.Key(), iter.Value()
 		examined++
 		bytesRead += len(key) + len(value)
+		metrics.DeliveryDiscoveryBytesTotal.Add(float64(len(key) + len(value)))
 		// Appending zero is the inclusive lower bound strictly after this
 		// fixed-length event key, without assuming IDs are consecutive.
 		cursor.after = append(append([]byte(nil), key...), 0)
@@ -245,6 +117,10 @@ func (d *Dispatcher) collectTopic(topic string, nowMs int64) deliveryChunk {
 			continue
 		}
 		metrics.DeliveryScannedKeysTotal.Inc()
+		if d.skipKeys[[24]byte(key)] {
+			valid = iter.Next()
+			continue
+		}
 		owners := view.localOwners(key)
 		if len(owners) == 0 {
 			metrics.DeliveryOwnershipFilteredTotal.Inc()
@@ -255,16 +131,16 @@ func (d *Dispatcher) collectTopic(topic string, nowMs int64) deliveryChunk {
 			valid = iter.Next()
 			continue
 		}
-		var msg storagepb.StoredMessage
-		if err := proto.Unmarshal(value, &msg); err != nil {
+		payload, err := cachePayload(iter, key, value)
+		if err != nil {
 			d.logger.Error("invalid stored message", zap.Error(err))
 			valid = iter.Next()
 			continue
 		}
+		msg := payload.message
 		now := time.Now().UnixMilli()
-		if d.isExpired(&msg, now) {
-			d.deleter.MarkDeleted(append([]byte(nil), key...))
-			metrics.MessagesExpiredTotal.WithLabelValues(topic, "dispatcher").Inc()
+		if d.isExpired(msg, now) {
+			d.deleter.MarkExpired(key, topic, "dispatcher")
 			valid = iter.Next()
 			continue
 		}
@@ -273,18 +149,25 @@ func (d *Dispatcher) collectTopic(topic string, nowMs int64) deliveryChunk {
 			continue
 		}
 		item := raft.DeliveryPrepare{Key: append([]byte(nil), key...), Epoch: view.Epoch, Recipients: view.Recipients}
-		encoded, err := json.Marshal(item)
-		if err != nil || commandBytes+len(encoded)+1 > d.Limits.Bytes {
-			// Revisit this item next chunk rather than advancing past a byte
-			// boundary. A single oversized interest set is reported explicitly.
-			cursor.after = append([]byte(nil), key...)
-			if len(chunk.items) == 0 {
-				d.logger.Error("delivery interests exceed preparation byte limit", zap.String("topic", topic))
+		// Discovery only loads owned data. The scheduler captures current
+		// recipients and enforces preparation command bytes when selecting due
+		// entries; avoid serialising a speculative recipient set twice.
+		if !d.scanOnly {
+			encoded, err := json.Marshal(item)
+			if err != nil || commandBytes+len(encoded)+1 > d.Limits.Bytes {
+				// Revisit this item next chunk rather than advancing past a byte
+				// boundary. A single oversized interest set is reported explicitly.
+				cursor.after = append([]byte(nil), key...)
+				if len(chunk.items) == 0 {
+					d.logger.Error("delivery interests exceed preparation byte limit", zap.String("topic", topic))
+				}
+				break
 			}
-			break
+			commandBytes += len(encoded) + 1
 		}
-		commandBytes += len(encoded) + 1
+
 		chunk.items = append(chunk.items, item)
+		chunk.payloads[string(item.Key)] = payload
 		if due := msg.EnqueuedAtUnixMs + msg.DelayMs; chunk.oldestDueMs == 0 || due < chunk.oldestDueMs {
 			chunk.oldestDueMs = due
 		}
@@ -305,7 +188,7 @@ func (d *Dispatcher) collectTopic(topic string, nowMs int64) deliveryChunk {
 // release their payloads without freezing new recipients for remote messages.
 func (d *Dispatcher) collectMaintenance() deliveryChunk {
 	started := time.Now()
-	defer func() { metrics.DeliveryScanDurationMs.Observe(float64(time.Since(started).Microseconds()) / 1000) }()
+	defer func() { observeCollection("maintenance", started) }()
 	chunk := deliveryChunk{topic: maintenanceTopic, maintenance: true, scanStarted: started.UnixMilli(), started: started}
 	epochNow, activeNow := d.hub.DeliveryEpoch()
 	if !activeNow {
@@ -414,6 +297,9 @@ func (d *Dispatcher) deliverChunk(chunk deliveryChunk, states map[string]*raft.D
 	}()
 	delivered := 0
 	for _, item := range chunk.items {
+		if chunk.generation != nil && !chunk.generation.Load() {
+			break
+		}
 		if !d.hub.DeliveryPermitted() {
 			metrics.DeliveryRejectedTotal.WithLabelValues("permit").Inc()
 			break
@@ -426,29 +312,51 @@ func (d *Dispatcher) deliverChunk(chunk deliveryChunk, states map[string]*raft.D
 		if (d.PrepareBatch != nil || d.PrepareDelivery != nil) && manifest == nil {
 			continue
 		}
-		value, closer, err := d.db.Get(item.Key)
-		if errors.Is(err, storage.ErrNotFound) {
-			continue
+		payload := chunk.payloads[string(item.Key)]
+		msg := payload.message
+		if msg != nil && payload.validity.Valid() {
+			metrics.DeliveryPayloadCacheTotal.WithLabelValues("cache").Inc()
+		} else {
+			metrics.DeliveryPayloadCacheTotal.WithLabelValues("fallback").Inc()
+			metrics.DeliveryPayloadReadsTotal.Inc()
+			value, closer, err := d.db.Get(item.Key)
+			if errors.Is(err, storage.ErrNotFound) {
+				continue
+			}
+			if err != nil {
+				d.logger.Warn("prepared payload read failed", zap.Error(err))
+				continue
+			}
+			msg = &storagepb.StoredMessage{}
+			metrics.DeliveryPayloadDecodesTotal.WithLabelValues("delivery").Inc()
+			err = proto.Unmarshal(value, msg)
+			_ = closer.Close()
+			if err != nil {
+				continue
+			}
 		}
-		if err != nil {
-			d.logger.Warn("prepared payload read failed", zap.Error(err))
-			continue
+		// ACK bits remain authoritative after a slow preparation/barrier. A
+		// snapshot can replace receipts while retaining the same event key.
+		if d.PrepareBatch != nil || d.PrepareDelivery != nil {
+			current, err := raft.ReadDeliveryState(d.db, item.Key)
+			if err != nil || current == nil || current.Epoch != item.Epoch {
+				continue
+			}
+			manifest = current
 		}
-		var msg storagepb.StoredMessage
-		err = proto.Unmarshal(value, &msg)
-		_ = closer.Close()
-		if err != nil {
-			continue
-		}
+
 		now := time.Now().UnixMilli()
-		if d.isExpired(&msg, now) {
-			d.deleter.MarkDeleted(item.Key)
+		if d.isExpired(msg, now) {
+			d.deleter.MarkExpired(item.Key, chunk.topic, "dispatcher")
 			continue
 		}
 		if now < msg.EnqueuedAtUnixMs+msg.DelayMs {
 			continue
 		}
 		queued := &pb.QueueMessage{Topic: msg.Topic, Payload: msg.Payload, DeliveryTag: item.Key, EnqueuedAtUnixMs: msg.EnqueuedAtUnixMs, DelayMs: msg.DelayMs}
+		if chunk.generation != nil && !chunk.generation.Load() {
+			break
+		}
 		sentTo := d.hub.DispatchPrepared(chunk.topic, queued, item.Key, manifest)
 		if len(sentTo) == 0 {
 			continue

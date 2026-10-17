@@ -10,14 +10,42 @@
 
 ## Dispatcher
 
-A timer-driven loop (`delivery.dispatchPollInterval`, default 50ms):
+A timer-driven loop (`delivery.dispatchPollInterval`, default 5ms) scans topics
+with active local consumers. Each topic has at most one bounded preparation job,
+and a fixed worker pool limits outstanding work. Worker completions and hub wake
+signals also trigger scheduling. Clustered replicas filter candidates using the
+current committed ownership view and delivery permission.
 
-- The hub wakes it immediately when a consumer registers (`wakeCh`).
-- After any pass that dispatched at least one message, the next pass fires immediately (drain without waiting); otherwise the full interval elapses.
-- It iterates **only topics with active consumers** — topics without consumers are never scanned.
-- In Raft mode only the event-shard leader dispatches; standalone always dispatches.
-- Per topic it runs a snapshot-based range scan `[topicHash, dueUpperBound(now))` — future buckets are never touched.
-- For each due key: skip if in-flight (unless timed out); inline TTL check (expired → routed to the deleter); otherwise build a `QueueMessage` whose `delivery_tag` is the 24-byte key and hand it to the hub.
+The live due-message scan uses a snapshot and an independent cyclic cursor.
+Wrapping the cursor revisits older insertions, failed preparations, full consumer
+queues, NACKs, and timeout retries. Iterators close before preparation begins.
+
+### Caching upcoming messages
+
+Two bounded discovery workers load owned full-message data into per-topic heaps.
+The scheduler selects exact due times independently of scans and quorum work.
+`delivery.preloadLookahead` controls future discovery (default disabled; opt-in trial: 100 ms), and
+`delivery.preloadMaxMessages` bounds future messages across topics (default 512).
+A separate bounded due allowance keeps ordinary delivery working when either
+future setting is zero and when the future cache is full.
+
+A timer wakes at eligible cached deadlines. Recipients are captured when due,
+using current ownership and epoch. Delivery workers prepare receipts, perform the
+post-preparation read barrier, validate payload versions, read current committed
+ACK state, recheck exact due time/TTL and enqueue through the existing Hub.
+Valid cached data avoids a second full-payload Get/decode in final delivery;
+uncertain/invalidated data uses a counted fresh-read fallback. Preparation still
+performs existence reads. The original permit and actual-send fences remain.
+
+Due and future cursors are independent cyclic scan positions, never completion
+watermarks. Late arrivals, retries, rejected admission and stale results recover
+through due scans even without arrival hints. Failed jobs evict their payloads
+and retry after bounded backoff. Topic generations reject stale scan/delivery
+results after subscription changes. Storage batch invalidation covers deletion,
+replay, overwrite and snapshot replacement before old data can validate.
+
+See the [scheduler design](heap-scheduler.md) for the validity proof, lifecycle,
+count sizing, resource table and [measured tradeoffs](heap-scheduler-evaluation.md).
 
 ## Hub & consumer groups
 
