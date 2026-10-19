@@ -22,6 +22,12 @@ const (
 	NoAck  AckLevel = "noAck"
 )
 
+const (
+	DefaultPayloadCacheSlots = 4096
+	MinPayloadCacheSlots     = 64
+	MaxPayloadCacheSlots     = 1 << 20
+)
+
 type Config struct {
 	ConfigVersion int           `mapstructure:"configVersion" yaml:"configVersion"`
 	API           API           `mapstructure:"api" yaml:"api"`
@@ -299,7 +305,7 @@ func (c *Config) validateCluster() error {
 }
 
 func (c *Config) validateStorage() error {
-	if err := ValidatePayloadCacheSlots(c.Storage.PayloadCacheSlots); err != nil {
+	if err := c.validatePayloadCacheSlots(); err != nil {
 		return err
 	}
 	switch c.Storage.Engine {
@@ -328,6 +334,14 @@ func (c *Config) validateStorage() error {
 		}
 	default:
 		return fmt.Errorf("storage.engine must be pebble or bolt")
+	}
+	return nil
+}
+
+func (c *Config) validatePayloadCacheSlots() error {
+	slots := c.Storage.PayloadCacheSlots
+	if slots < MinPayloadCacheSlots || slots > MaxPayloadCacheSlots || slots&(slots-1) != 0 {
+		return fmt.Errorf("storage.payloadCacheSlots must be a power of two from %d to %d", MinPayloadCacheSlots, MaxPayloadCacheSlots)
 	}
 	return nil
 }

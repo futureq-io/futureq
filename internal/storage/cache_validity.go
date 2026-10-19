@@ -65,9 +65,7 @@ func newCacheVersions(options ...Options) (*cacheVersions, error) {
 	if len(options) == 1 && options[0].PayloadCacheSlots != 0 {
 		slots = options[0].PayloadCacheSlots
 	}
-	if err := config.ValidatePayloadCacheSlots(slots); err != nil {
-		return nil, err
-	}
+
 	return &cacheVersions{
 		slots: make([]uint64, slots), pending: make([]uint32, slots), mask: uint32(slots - 1),
 	}, nil
