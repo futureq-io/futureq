@@ -73,7 +73,9 @@ func (d *Dispatcher) discover(job discoveryJob) discoveryResult {
 // A popped candidate is fenced by the per-topic delivery job and Hub recipient
 // reservations, not by an unbounded history of previously discovered keys.
 func (d *Dispatcher) admitCandidate(p *topicPreload, c preloadCandidate) bool {
-	if c.payload.validity.Invalidated() {
+	// Due candidates are revalidated by the delivery worker, which can reread
+	// uncertain proofs immediately. Keep speculative future admission conservative.
+	if !c.ready && c.payload.validity.Invalidated() {
 		return false
 	}
 	if p.keys[c.key] {

@@ -276,25 +276,28 @@ func (d *Dispatcher) prepareChunk(ctx context.Context, chunk deliveryChunk) (map
 				return nil, err
 			}
 			payload := chunk.payloads[string(item.Key)]
-			// Overwrites and snapshot replacement can move the exact due time
-			// within a bucket. Evict obsolete proofs and let cyclic discovery
-			// capture the replacement and its recipient view when actually due.
-			if payload.validity.Invalidated() {
-				continue
-			}
+			// An invalid proof can be a tracker collision or a pending write,
+			// not a changed message. Read current bytes on this attempt rather
+			// than dropping otherwise eligible work into cyclic repair/backoff.
 			msg := payload.message
 			if msg == nil || !payload.validity.Valid() {
-				// Unsupported iterator wrappers have no freshness proof.
+				metrics.DeliveryPreparePayloadCacheTotal.WithLabelValues("fallback").Inc()
 				value, closer, err := d.db.Get(item.Key)
-				if err != nil {
+				if errors.Is(err, storage.ErrNotFound) {
 					continue
 				}
+				if err != nil {
+					return nil, err
+				}
 				msg = &storagepb.StoredMessage{}
+				metrics.DeliveryPayloadDecodesTotal.WithLabelValues("preparation").Inc()
 				err = proto.Unmarshal(value, msg)
 				_ = closer.Close()
 				if err != nil {
 					continue
 				}
+			} else {
+				metrics.DeliveryPreparePayloadCacheTotal.WithLabelValues("cache").Inc()
 			}
 			now := time.Now().UnixMilli()
 			if now < msg.EnqueuedAtUnixMs+msg.DelayMs || d.isExpired(msg, now) {

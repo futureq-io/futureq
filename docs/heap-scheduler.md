@@ -80,9 +80,13 @@ is no later than the token's snapshot sequence. Therefore:
    Recovery uses the same batch APIs, including its intermediate clear commit.
 3. Metadata-only preparation/partial ACK updates do not invalidate payloads.
    Hash collisions invalidate conservatively and require a fresh payload read.
-4. Discovery rejects a result already known obsolete when admitted. A later
-   mutation still invalidates the worker's copy. Unsupported iterator wrappers
-   receive a zero token and use the fresh Get/unmarshal fallback.
+4. Future admission rejects invalidated speculative results. Due admission
+   retains uncertain proofs for worker validation: an invalid token can reflect
+   a hash collision or pending mutation rather than a changed message. Before
+   committing a new receipt, the worker rereads an invalid/unsupported payload
+   and checks its current exact due time and TTL. Eligible messages prepare on
+   that attempt; deleted, expired or future replacements cannot freeze recipients.
+   Final delivery independently validates or rereads after the read barrier.
 5. A successful token validation is the payload freshness point corresponding to
    the old final Get. A delete starting afterwards can race enqueue just as it
    could after that Get; the change does not claim atomic delivery versus delete.

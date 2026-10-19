@@ -56,9 +56,10 @@ its aggregate. The cache counters describe validation, not successful sends.
 
 | Metric (prefix `futureq_`) | Type | Labels | Meaning |
 | --- | --- | --- | --- |
+| `delivery_prepare_payload_cache_total` | counter | source (`cache`, `fallback`) | Preparation payload validations; fallback counts full payload Get attempts, including missing, expired or not-yet-due messages. These attempts are excluded from the final-delivery cache-hit ratio. |
 | `delivery_payload_cache_total` | counter | source (`cache`, `fallback`) | Final payload validations using retained data or a fresh read fallback. |
 | `delivery_payload_reads_total` | counter | — | Final-delivery payload Get calls. Preparation existence reads and maintenance payload reads are separate storage work, excluded here. |
-| `delivery_payload_decodes_total` | counter | stage (`discovery`, `delivery`) | Full-message decode attempts in normal discovery or the final read fallback. Excludes maintenance receipt repair. |
+| `delivery_payload_decodes_total` | counter | stage (`discovery`, `preparation`, `delivery`) | Full-message decode attempts in normal discovery, preparation fallback or final delivery fallback. Excludes maintenance receipt repair. |
 | `delivery_discovery_bytes_total` | counter | — | Key/value bytes examined in due/future discovery, including known keys and filtered keys. A scan observation is counted once; not physical device bytes. |
 | `delivery_repair_scans_total` | counter | — | Bounded cyclic due passes, including startup/ordinary discovery, late-arrival and retry repair. |
 | `delivery_worker_outcomes_total` | counter | outcome (`queued`, `not-ready`, `permission-lost`, `prepare-failed`) | Delivery job outcomes. `queued` means at least one message enqueued, not a gRPC send or committed ACK. Zero-send work remains recoverable. |

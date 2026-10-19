@@ -153,7 +153,13 @@ func (l *DeliveryLedger) apply(cmd []byte) (statemachine.Result, error) {
 		return statemachine.Result{}, err
 	}
 
-	if err := batch.Commit(storage.NoSync); err != nil {
+	// Preparation must be durable before delivery; only ACK persistence may
+	// trade crash durability for throughput (duplicates remain permissible).
+	mode := storage.Sync
+	if raft.CommandType(cmd[0]) == raft.AckDeliveryBatchCmd {
+		mode = storage.NoSync
+	}
+	if err := batch.Commit(mode); err != nil {
 		return statemachine.Result{}, err
 	}
 	if len(deleted) > 0 && l.OnDelete != nil {
