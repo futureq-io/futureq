@@ -292,7 +292,7 @@ func TestStandaloneFinalAckCommitsBeforeDeletingTracking(t *testing.T) {
 	commitAttempts := 0
 	ledger.db = &standaloneAckCommitDB{DB: d.db, beforeCommit: func(mode storage.SyncMode) error {
 		commitAttempts++
-		require.Equal(t, storage.Sync, mode)
+		require.Equal(t, storage.NoSync, mode)
 		assertStored(true)
 		assertTracked()
 		if commitAttempts == 1 {

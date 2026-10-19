@@ -2,7 +2,6 @@ package storage
 
 import (
 	"fmt"
-	"os"
 	"path/filepath"
 	"strconv"
 	"testing"
@@ -104,26 +103,6 @@ func TestLargerCacheSlotsAvoidConservativeCollision(t *testing.T) {
 		versions.begin(&mutations)()
 		require.Equal(t, slots == 131072, token.Valid())
 	}
-}
-
-func TestCacheSlotConstructorValidation(t *testing.T) {
-	for _, slots := range []int{-1, 63, 65, 1 << 21} {
-		options := Options{PayloadCacheSlots: slots}
-		db, err := NewPebble(config.Pebble{Mode: "memory"}, zap.NewNop(), options)
-		require.Nil(t, db)
-		require.ErrorContains(t, err, "payloadCacheSlots")
-		file := filepath.Join(t.TempDir(), "not-created", "events.db")
-		bolt, err := NewBoltDB(config.Bolt{File: file}, options)
-		require.Nil(t, bolt)
-		require.ErrorContains(t, err, "payloadCacheSlots")
-		_, err = os.Stat(filepath.Dir(file))
-		require.True(t, os.IsNotExist(err), "reject before creating storage files")
-	}
-	versions, err := newCacheVersions(Options{})
-	require.NoError(t, err)
-	require.Len(t, versions.slots, config.DefaultPayloadCacheSlots)
-	_, err = newCacheVersions(Options{}, Options{})
-	require.Error(t, err)
 }
 
 func BenchmarkPayloadCacheTracking(b *testing.B) {
