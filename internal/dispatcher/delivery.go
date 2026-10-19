@@ -17,8 +17,6 @@ import (
 // or an atomic local batch in standalone mode. A manifest is committed before
 // the first send, so an early ACK cannot erase another replica's interest.
 type DeliveryLedger struct {
-	// AckNoSync skips WAL synchronization for standalone ACK commands only.
-	AckNoSync  bool
 	db         storage.DB
 	recipients func(string) (uint64, []string, bool)
 	propose    func([]byte) (statemachine.Result, error)
@@ -154,11 +152,8 @@ func (l *DeliveryLedger) apply(cmd []byte) (statemachine.Result, error) {
 	if err != nil {
 		return statemachine.Result{}, err
 	}
-	mode := storage.Sync
-	if l.AckNoSync && len(cmd) > 0 && raft.CommandType(cmd[0]) == raft.AckDeliveryBatchCmd {
-		mode = storage.NoSync
-	}
-	if err := batch.Commit(mode); err != nil {
+
+	if err := batch.Commit(storage.NoSync); err != nil {
 		return statemachine.Result{}, err
 	}
 	if len(deleted) > 0 && l.OnDelete != nil {

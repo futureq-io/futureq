@@ -95,17 +95,11 @@ no stored records or wire format.
 | `delivery.dispatchPollInterval`     | `5ms`   | Periodic live due-message scan interval, also used when preloading is enabled. |
 | `delivery.preloadLookahead`         | `0s`    | How far ahead the scheduler scans for upcoming messages. Must be a nonnegative whole number of milliseconds. `0` disables preloading. |
 | `delivery.preloadMaxMessages`       | `512`   | Maximum retained/reserved full-message future entries across topics, `0..1048576`. `0` disables future caching; bounded due delivery continues. Payload sizes determine memory use. |
-| `delivery.ackNoSync` | `false` | Standalone Pebble only. Skip WAL synchronization for consumer ACK batches. Preparation and publication remain synchronous. Rejected for clustered mode and Bolt. |
 | `delivery.inFlightTimeout`          | `5s`    | How long an unacknowledged delivery blocks redelivery; after it expires the message is re-dispatched (at-least-once). |
 | `delivery.deleteBatchInterval`      | `500ms` | How often the deleter flushes its batch of keys to delete (one Raft proposal per batch in clustered mode). |
 | `delivery.ttlsweepInterval`         | `60s`   | How often the TTL janitor sweeps the whole database for expired messages. |
 
 All four intervals and the in-flight timeout must be greater than zero.
-
-Set `delivery.ackNoSync: true` or `FUTUREQ_DELIVERY_ACKNOSYNC=true` to opt in.
-ACK updates still commit atomically, but do not wait for a WAL sync. An OS or
-machine crash may lose recent ACK completion and cause additional redeliveries.
-The default remains synchronous; preparation and producer commits are unchanged.
 
 Preloading works in standalone and clustered mode. Configure it independently of
 preparation batch sizes and quorum reads:

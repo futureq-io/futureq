@@ -23,7 +23,6 @@ var defaultConfig = Config{
 	},
 	Publish: Publish{MinAckLevel: Quorum, ProposalTimeout: 5 * time.Second},
 	Delivery: Delivery{
-		AckNoSync:            false,
 		ConsumerQueueSize:    1024,
 		TimeBucket:           time.Millisecond,
 		DispatchPollInterval: 5 * time.Millisecond,
