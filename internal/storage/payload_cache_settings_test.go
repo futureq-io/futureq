@@ -114,7 +114,7 @@ func BenchmarkPayloadCacheTracking(b *testing.B) {
 			}
 			keys := make([][]byte, 64)
 			for i := range keys {
-				keys[i] = []byte(fmt.Sprintf("%024d", i))
+				keys[i] = fmt.Appendf(nil, "%024d", i)
 			}
 			b.ReportAllocs()
 			b.ResetTimer()

@@ -271,11 +271,16 @@ func (d *Dispatcher) runPipeline(parent context.Context) {
 				delete(d.cursors, topic)
 			}
 		}
-		if d.hub.PermitNeedsRenewal(d.Limits.PrepareTimeout + d.Limits.WorkTime) {
+		// Preparation can outlast a permit and has its own post-preparation
+		// barrier. Never require its entire budget to fit in a fresh permit.
+		budget := min(d.Limits.PrepareTimeout+d.Limits.WorkTime, ConsumerReadPermit/2)
+		if d.hub.PermitNeedsRenewal(budget) {
 			if !renewing && !now.Before(renewAfter) {
 				renew <- struct{}{}
 				renewing = true
-				permitReady = false
+				if !d.hub.DeliveryPermitted() {
+					permitReady = false
+				}
 			}
 		} else if !renewing {
 			permitReady = true

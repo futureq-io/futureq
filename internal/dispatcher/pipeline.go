@@ -269,6 +269,44 @@ func (d *Dispatcher) collectMaintenance() deliveryChunk {
 }
 
 func (d *Dispatcher) prepareChunk(ctx context.Context, chunk deliveryChunk) (map[string]*raft.DeliveryState, error) {
+	if !chunk.maintenance {
+		items := make([]raft.DeliveryPrepare, 0, len(chunk.items))
+		for _, item := range chunk.items {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			payload := chunk.payloads[string(item.Key)]
+			// Overwrites and snapshot replacement can move the exact due time
+			// within a bucket. Evict obsolete proofs and let cyclic discovery
+			// capture the replacement and its recipient view when actually due.
+			if payload.validity.Invalidated() {
+				continue
+			}
+			msg := payload.message
+			if msg == nil || !payload.validity.Valid() {
+				// Unsupported iterator wrappers have no freshness proof.
+				value, closer, err := d.db.Get(item.Key)
+				if err != nil {
+					continue
+				}
+				msg = &storagepb.StoredMessage{}
+				err = proto.Unmarshal(value, msg)
+				_ = closer.Close()
+				if err != nil {
+					continue
+				}
+			}
+			now := time.Now().UnixMilli()
+			if now < msg.EnqueuedAtUnixMs+msg.DelayMs || d.isExpired(msg, now) {
+				continue
+			}
+			items = append(items, item)
+		}
+		chunk.items = items
+	}
+	if len(chunk.items) == 0 {
+		return nil, nil
+	}
 	if d.PrepareBatch != nil {
 		return d.PrepareBatch(ctx, chunk.items)
 	}
