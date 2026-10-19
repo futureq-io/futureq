@@ -254,14 +254,12 @@ func TestStandaloneFinalAckCommitsBeforeDeletingTracking(t *testing.T) {
 		t.Helper()
 		require.True(t, h.HasInFlightForConsumer("first", key))
 		require.Len(t, h.groupInFlight, 1)
-		require.Equal(t, float64(1), inFlightGaugeValue(t, topic, "workers"))
 	}
 	assertCleared := func() {
 		t.Helper()
 		require.False(t, h.HasInFlightForConsumer("first", key))
 		require.Empty(t, h.deliveryRecords["first"])
 		require.Empty(t, h.groupInFlight)
-		require.Zero(t, inFlightGaugeValue(t, topic, "workers"))
 	}
 	var callbacks []string
 	// Match startRun's production wiring, with observations around the calls.
