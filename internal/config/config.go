@@ -26,6 +26,9 @@ const (
 	DefaultPayloadCacheSlots = 4096
 	MinPayloadCacheSlots     = 64
 	MaxPayloadCacheSlots     = 1 << 20
+	PayloadCacheHashFNV      = "fnv"
+	PayloadCacheHashXXHash64 = "xxhash64"
+	DefaultPayloadCacheHash  = PayloadCacheHashFNV
 )
 
 type Config struct {
@@ -72,6 +75,7 @@ type Raft struct {
 type Storage struct {
 	Engine            string `mapstructure:"engine" yaml:"engine"`
 	PayloadCacheSlots int    `mapstructure:"payloadCacheSlots" yaml:"payloadCacheSlots"`
+	PayloadCacheHash  string `mapstructure:"payloadCacheHash" yaml:"payloadCacheHash"`
 	Pebble            Pebble `mapstructure:"pebble" yaml:"pebble"`
 	Bolt              Bolt   `mapstructure:"bolt" yaml:"bolt"`
 }
@@ -308,6 +312,11 @@ func (c *Config) validateCluster() error {
 func (c *Config) validateStorage() error {
 	if err := c.validatePayloadCacheSlots(); err != nil {
 		return err
+	}
+	switch c.Storage.PayloadCacheHash {
+	case PayloadCacheHashFNV, PayloadCacheHashXXHash64:
+	default:
+		return fmt.Errorf("storage.payloadCacheHash must be fnv or xxhash64")
 	}
 	switch c.Storage.Engine {
 	case "pebble":

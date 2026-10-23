@@ -74,7 +74,7 @@ func TestConfiguredCacheSlotsFenceOverlappingWrites(t *testing.T) {
 			mutations.add(key, versions)
 			old := versions.snapshot().token(key)
 			finishFirst := versions.begin(&mutations)
-			require.Len(t, mutations, 1, "each touched slot is tracked once")
+			require.Len(t, mutations, slots/64, "bitmap size depends on slots, not mutation count")
 			finishSecond := versions.begin(&mutations)
 			require.Equal(t, uint32(2), versions.pending[old.slot], "one pending count per batch, even with duplicate keys")
 			overlap := versions.snapshot().token(key)

@@ -35,6 +35,7 @@ cluster:
 storage:
   engine: pebble
   payloadCacheSlots: 4096 # freshness tracker slots per DB; power of two, 64..1048576; restart to change
+  payloadCacheHash: fnv # fnv (FNV-1a 64-bit) or xxhash64; restart to change
   pebble:
     # memory uses a virtual filesystem and discards data on exit.
     mode: disk
@@ -44,6 +45,7 @@ storage:
     memtableSize: 64MiB
     compactionConcurrency: 1 # Normal and upper compaction concurrency; delete-only compactions may exceed it.
   # Used only when engine is bolt. Bolt always writes a file.
+  # BOLT IS FOR INTERNAL EXPERIMENTAL TESTING AND NOT PRODUCTION READY
   bolt:
     file: "./data/futureq.db"
     bucket: futureq

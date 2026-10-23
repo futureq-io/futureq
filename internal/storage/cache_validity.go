@@ -3,16 +3,18 @@ package storage
 import (
 	"fmt"
 	"io"
-	"slices"
+	"math/bits"
 	"sync"
 
+	"github.com/cespare/xxhash/v2"
 	"github.com/futureq-io/futureq/internal/config"
 )
 
 // Options configures tracking shared by both built-in storage engines.
-// A zero PayloadCacheSlots uses the default for direct constructor callers.
+// Zero slots and an empty hash use the defaults for direct constructor callers.
 type Options struct {
 	PayloadCacheSlots int
+	PayloadCacheHash  string
 }
 
 // CacheToken proves a value from a snapshot has not been changed since that
@@ -69,6 +71,7 @@ type cacheVersions struct {
 	pending  []uint32
 	sequence uint64
 	mask     uint32
+	slotHash func([]byte, uint32) uint32 // selected once at open; shared by reads and writes
 }
 
 func newCacheVersions(options ...Options) (*cacheVersions, error) {
@@ -76,16 +79,29 @@ func newCacheVersions(options ...Options) (*cacheVersions, error) {
 		return nil, fmt.Errorf("storage accepts at most one Options value")
 	}
 	slots := config.DefaultPayloadCacheSlots
+	algorithm := config.DefaultPayloadCacheHash
 	if len(options) == 1 && options[0].PayloadCacheSlots != 0 {
 		slots = options[0].PayloadCacheSlots
+	}
+	if len(options) == 1 && options[0].PayloadCacheHash != "" {
+		algorithm = options[0].PayloadCacheHash
 	}
 
 	if slots < config.MinPayloadCacheSlots || slots > config.MaxPayloadCacheSlots || slots&(slots-1) != 0 {
 		return nil, fmt.Errorf("payload cache slots must be a power of two from %d to %d", config.MinPayloadCacheSlots, config.MaxPayloadCacheSlots)
 	}
+	slotHash := cacheSlot
+	switch algorithm {
+	case config.PayloadCacheHashFNV:
+	case config.PayloadCacheHashXXHash64:
+		slotHash = cacheSlotXXHash64
+	default:
+		return nil, fmt.Errorf("payload cache hash must be fnv or xxhash64, got %q", algorithm)
+	}
 
 	return &cacheVersions{
 		slots: make([]uint64, slots), pending: make([]uint32, slots), mask: uint32(slots - 1),
+		slotHash: slotHash,
 	}, nil
 }
 
@@ -108,7 +124,7 @@ func (s *cacheSnapshot) token(key []byte) CacheToken {
 	if s == nil || len(key) != 24 {
 		return CacheToken{}
 	}
-	return CacheToken{versions: s.owner, slot: cacheSlot(key, s.owner.mask), sequence: s.sequence}
+	return CacheToken{versions: s.owner, slot: s.owner.slotHash(key, s.owner.mask), sequence: s.sequence}
 }
 
 func cacheSlot(key []byte, mask uint32) uint32 {
@@ -119,23 +135,21 @@ func cacheSlot(key []byte, mask uint32) uint32 {
 	return uint32(h) & mask
 }
 
-// Batches collect only touched slots. Sorting and deduplication happen before
-// acquiring the tracker lock, so commit work does not scan the version table.
-type cacheMutations []uint32
+func cacheSlotXXHash64(key []byte, mask uint32) uint32 {
+	return uint32(xxhash.Sum64(key)) & mask
+}
+
+// A lazily allocated bitmap bounds batch metadata to one bit per slot.
+// Repeated keys and hash collisions set the same bit without sorting.
+type cacheMutations []uint64
 
 func (m *cacheMutations) add(key []byte, versions *cacheVersions) {
 	if len(key) == 24 && versions != nil {
-		if *m == nil {
-			// One small allocation covers typical batches; this is an allocation
-			// hint, not a limit on batch size or configured version slots.
-			*m = make(cacheMutations, 0, 64)
-		} else if len(*m) == cap(*m) {
-			// Deduplicate before growing so repeated keys cannot grow tracking
-			// memory beyond a constant factor of the configured slot count.
-			slices.Sort(*m)
-			*m = slices.Compact(*m)
+		if len(*m) == 0 {
+			*m = make(cacheMutations, len(versions.slots)/64)
 		}
-		*m = append(*m, cacheSlot(key, versions.mask))
+		slot := versions.slotHash(key, versions.mask)
+		(*m)[slot/64] |= uint64(1) << (slot % 64)
 	}
 }
 
@@ -143,21 +157,27 @@ func (v *cacheVersions) begin(m *cacheMutations) func() {
 	if len(*m) == 0 {
 		return func() {}
 	}
-	slices.Sort(*m)
-	*m = slices.Compact(*m)
 	v.mu.Lock()
 	v.sequence++
-	for _, slot := range *m {
-		v.slots[slot] = v.sequence
-		v.pending[slot]++
+	for i, word := range *m {
+		for word != 0 {
+			slot := i*64 + bits.TrailingZeros64(word)
+			v.slots[slot] = v.sequence
+			v.pending[slot]++
+			word &= word - 1
+		}
 	}
 	v.mu.Unlock()
 	return func() {
 		v.mu.Lock()
 		v.sequence++
-		for _, slot := range *m {
-			v.pending[slot]--
-			v.slots[slot] = v.sequence
+		for i, word := range *m {
+			for word != 0 {
+				slot := i*64 + bits.TrailingZeros64(word)
+				v.pending[slot]--
+				v.slots[slot] = v.sequence
+				word &= word - 1
+			}
 		}
 		v.mu.Unlock()
 	}

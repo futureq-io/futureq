@@ -62,6 +62,7 @@ export FUTUREQ_CLUSTER_RAFT_INITIALMEMBERS='{1: "10.0.0.1:50005"}'
 | ------------------------------ | ------------ | ----------- |
 | `storage.engine`               | `pebble`     | `pebble` (LSM) or `bolt` (single-file B+-tree). |
 | `storage.payloadCacheSlots`    | `4096`       | Shared payload freshness slots per DB, for both engines and standalone/Raft. Power of two from `64` to `1048576`; requires restart. Larger counts reduce conservative cache invalidations from hash collisions. |
+| `storage.payloadCacheHash`     | `fnv`        | Slot hash: `fnv` (FNV-1a 64-bit) or `xxhash64` (XXH64). Fixed when the DB opens; requires restart. Applies to both engines and standalone/Raft. |
 | `storage.pebble.mode`          | `disk`       | `disk` or `memory` (Pebble over an in-memory FS; nothing persists). |
 | `storage.pebble.dataDir`       | `./data`     | Pebble data directory. |
 | `storage.pebble.walEnabled`    | `true`       | Pebble WAL toggle. Automatically disabled in memory mode and in clustered mode (the Raft log is the WAL); may only be set `false` explicitly for clustered disk nodes. |
@@ -74,11 +75,19 @@ For example, set `storage.payloadCacheSlots: 16384` or
 `FUTUREQ_STORAGE_PAYLOADCACHESLOTS=16384`. This changes freshness tracking, not the
 number of cached messages or Pebble's block cache. At `S` slots the tracking
 arrays use approximately `12*S` bytes per DB. Batches touching message keys
-collect a sparse list of `uint32` slots, sorted and deduplicated before taking the
-tracker lock. Commit traversal depends on touched slots rather than table size;
-metadata-only batches allocate no tracking list. Benchmark the cache-hit rate and delivery latency before
-increasing it substantially. Nodes may use different counts; this setting changes
-no stored records or wire format.
+allocate a bitmap of `S/8` bytes (512 bytes at the default count), setting one bit
+per touched slot. Duplicate keys and collisions need no sorting. Each commit pass
+checks `S/64` bitmap words and visits their set bits; metadata-only batches allocate
+no bitmap. There is no bitmap pool. At the maximum slot count, each payload batch
+allocates 128 KiB for its bitmap. Benchmark cache-hit rates and delivery latency
+before increasing the slot count substantially.
+
+Set `storage.payloadCacheHash: xxhash64` or
+`FUTUREQ_STORAGE_PAYLOADCACHEHASH=xxhash64` to select XXH64. FNV remains the default;
+changing the hash changes collision patterns as well as hashing cost. Nodes may
+use different slot counts and algorithms because these settings affect only
+local freshness proofs, not stored keys, records, or the wire format. Wider hash
+output does not increase the number of freshness slots; XXH128 is not supported.
 
 ## publish
 

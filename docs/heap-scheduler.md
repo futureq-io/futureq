@@ -62,11 +62,13 @@ of version slots and pending counts per engine (default 4096, power of two from
 64 to 1048576). The count is fixed when opening the engine and requires restart
 to change; both engines and both standalone/Raft use it. Slot indexes are
 `uint32`, and hashing uses a mask because the count is a power of two. Every batch
-that touches 24-byte event keys lazily collects a sparse list of `uint32` slots;
-metadata-only batches allocate none. The list is sorted and deduplicated before
-the tracker lock is acquired. Duplicate slots are also compacted before growing
-its backing array, bounding capacity by a constant factor of the slot count.
-Both commit passes visit only the touched slots.
+that touches 24-byte event keys lazily allocates an `S/8`-byte bitmap; metadata-only
+batches allocate none. Repeated keys and collisions set the same bit, requiring
+no sorting. Both commit passes check `S/64` words and visit their set bits.
+`storage.payloadCacheHash` selects `fnv` (FNV-1a 64-bit, default) or `xxhash64`
+(XXH64) once at DB open, with the same hash used for token creation and mutations.
+Changing it requires restart and changes only local collision patterns, not
+stored event keys or the wire format. No bitmap pool is used.
 Before committing any such batch, under a short tracker lock, it advances the
 sequence, stamps affected slots and marks them pending. After storage commit
 returns (including failure), it advances/stamps again and clears its pending
@@ -215,7 +217,7 @@ a consumer's configured channel capacity. With defaults C=512, B=64, W=2, D=2:
 | Heap/map backing capacity | Heap <4 times live entries after drain; maps rebuilt with it | Popped slots zeroed; removed topics clear arrays/maps |
 | Sender queues and tracked attempts | Per consumer: Q buffered + at most max(1024,Q) records | Shared immutable payload; expired buffered attempts may outlive tracking |
 | Delete/ACK buffers | Existing 8192-key limits per completion kind | Keys/recipient metadata, no payload cache |
-| Validity metadata | At `S` configured slots, about `12*S` bytes per engine plus a sparse `uint32` list per batch touching message keys; default arrays: 48 KiB. Small snapshot token. | No per-key unbounded history; commit traversal visits touched slots only |
+| Validity metadata | At `S` configured slots, about `12*S` bytes per engine plus an `S/8`-byte bitmap per batch touching message keys; defaults: 48 KiB and 512 bytes. Small snapshot token. | No per-key unbounded history; commit traversal checks `S/64` words and their set bits |
 | Known-key scan filters | At most D copies of relevant bounded heap/assigned key sets | Keys only |
 
 Conservatively, the heap/discovery/worker stages retain at most `C+max(D,W)B+WB=768`
