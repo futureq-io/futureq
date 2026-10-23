@@ -8,6 +8,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/futureq-io/futureq/internal/app"
+	"github.com/futureq-io/futureq/internal/config"
 	raft "github.com/futureq-io/futureq/internal/raft/event"
 	"github.com/futureq-io/futureq/internal/storage"
 
@@ -31,6 +32,8 @@ type inFlightEntry struct {
 //   - Performs TTL checks at dispatch time; expired messages are batched for deletion
 //   - Snapshot-based iteration (never blocks concurrent writes)
 type Dispatcher struct {
+	skipKeys        map[[24]byte]bool // immutable snapshot, isolated discovery adapter only
+	scanOnly        bool              // isolated worker adapter never publishes scheduler gauges
 	db              storage.DB
 	hub             *Hub
 	deleter         *Deleter
@@ -40,13 +43,20 @@ type Dispatcher struct {
 	wakeCh          chan struct{}
 	inFlight        sync.Map // key: string(pebbleKey) → *inFlightEntry
 	// Installed before Run. Cluster reads also refresh the bounded metadata permit.
-	ReadBarrier           func() error
-	PrepareDelivery       func(string, []byte) (*raft.DeliveryState, error) // legacy single-key hook
-	PrepareBatch          func(context.Context, []raft.DeliveryPrepare) (map[string]*raft.DeliveryState, error)
-	MaintenanceRecipients func(string) (uint64, []string, bool)
-	Limits                ScanLimits
-	TimeBucket            time.Duration
-	cursors               map[string]*scanCursor // owned by the scheduler
+	ReadBarrier                func() error
+	PrepareDelivery            func(string, []byte) (*raft.DeliveryState, error) // legacy single-key hook
+	PrepareBatch               func(context.Context, []raft.DeliveryPrepare) (map[string]*raft.DeliveryState, error)
+	MaintenanceRecipients      func(string) (uint64, []string, bool)
+	Limits                     ScanLimits
+	TimeBucket                 time.Duration
+	cursors                    map[string]*scanCursor // owned by the scheduler
+	DiscoveryWorkers           int
+	PreloadScanIdleMaxInterval time.Duration
+	PreloadLookahead           time.Duration
+	PreloadMaxMessages         int
+	preloads                   map[string]*topicPreload // owned by the scheduler
+	preloadCount               int
+	readyCount                 int // scheduler-owned due admission, separate from future cap
 }
 
 // NewDispatcher constructs a Dispatcher.
@@ -64,17 +74,20 @@ func NewDispatcher(
 	if app.A != nil {
 		bucket = app.A.Config().Delivery.TimeBucket
 	}
+	defaults := config.DefaultDelivery()
 	return &Dispatcher{
-		db:              db,
-		hub:             hub,
-		deleter:         deleter,
-		logger:          logger.Named("dispatcher"),
-		interval:        interval,
-		inFlightTimeout: inFlightTimeout,
-		wakeCh:          wakeCh,
-		Limits:          DefaultScanLimits(),
-		TimeBucket:      bucket,
-		cursors:         make(map[string]*scanCursor),
+		DiscoveryWorkers:           defaults.DiscoveryWorkers,
+		PreloadScanIdleMaxInterval: defaults.PreloadScanIdleMaxInterval,
+		db:                         db,
+		hub:                        hub,
+		deleter:                    deleter,
+		logger:                     logger.Named("dispatcher"),
+		interval:                   interval,
+		inFlightTimeout:            inFlightTimeout,
+		wakeCh:                     wakeCh,
+		Limits:                     DefaultScanLimits(),
+		TimeBucket:                 bucket,
+		cursors:                    make(map[string]*scanCursor),
 	}
 }
 
@@ -113,7 +126,7 @@ func (d *Dispatcher) dispatchAll() int {
 }
 
 func (d *Dispatcher) dispatchTopic(topic string, nowMs int64) int {
-	chunk := d.collectTopic(topic, nowMs)
+	chunk := d.collectScheduledTopic(topic, nowMs)
 	if len(chunk.items) == 0 {
 		return 0
 	}

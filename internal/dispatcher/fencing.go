@@ -63,8 +63,12 @@ func (h *Hub) GrantDeliveryPermit(epoch uint64, readStarted time.Time) {
 	defer h.deliveryMu.Unlock()
 	current, active := h.version()
 	if current == epoch && active {
+		until := readStarted.Add(ConsumerReadPermit)
+		if h.permitEpoch == epoch && !until.After(h.permitUntil) {
+			return // a slower, older read cannot shorten a newer same-epoch grant
+		}
 		h.permitEpoch = epoch
-		h.permitUntil = readStarted.Add(ConsumerReadPermit)
+		h.permitUntil = until
 	}
 }
 

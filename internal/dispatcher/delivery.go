@@ -144,16 +144,34 @@ func (l *DeliveryLedger) apply(cmd []byte) (statemachine.Result, error) {
 	if l.propose != nil {
 		return l.propose(cmd)
 	}
+	stage := "prepare"
+	if raft.CommandType(cmd[0]) == raft.AckDeliveryBatchCmd {
+		stage = "ack"
+	}
+	lockStarted := time.Now()
 	l.mu.Lock()
+	metrics.DeliveryPrepareDurationMs.WithLabelValues(stage + "_lock_wait").Observe(float64(time.Since(lockStarted).Nanoseconds()) / 1e6)
 	defer l.mu.Unlock()
 	batch := l.db.NewBatch()
 	defer batch.Close() //nolint:errcheck
+	applyStarted := time.Now()
 	result, deleted, err := raft.NewDeliveryBatch(l.db, batch).Apply(cmd)
+	metrics.DeliveryPrepareDurationMs.WithLabelValues(stage + "_apply").Observe(float64(time.Since(applyStarted).Nanoseconds()) / 1e6)
 	if err != nil {
 		return statemachine.Result{}, err
 	}
-	if err := batch.Commit(storage.Sync); err != nil {
-		return statemachine.Result{}, err
+
+	// Preparation must be durable before delivery; only ACK persistence may
+	// trade crash durability for throughput (duplicates remain permissible).
+	mode := storage.Sync
+	if raft.CommandType(cmd[0]) == raft.AckDeliveryBatchCmd {
+		mode = storage.NoSync
+	}
+	commitStarted := time.Now()
+	commitErr := batch.Commit(mode)
+	metrics.DeliveryPrepareDurationMs.WithLabelValues(stage + "_commit").Observe(float64(time.Since(commitStarted).Nanoseconds()) / 1e6)
+	if commitErr != nil {
+		return statemachine.Result{}, commitErr
 	}
 	if len(deleted) > 0 && l.OnDelete != nil {
 		l.OnDelete(deleted)

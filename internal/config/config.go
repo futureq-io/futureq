@@ -22,6 +22,15 @@ const (
 	NoAck  AckLevel = "noAck"
 )
 
+const (
+	DefaultPayloadCacheSlots = 4096
+	MinPayloadCacheSlots     = 64
+	MaxPayloadCacheSlots     = 1 << 20
+	PayloadCacheHashFNV      = "fnv"
+	PayloadCacheHashXXHash64 = "xxhash64"
+	DefaultPayloadCacheHash  = PayloadCacheHashFNV
+)
+
 type Config struct {
 	ConfigVersion int           `mapstructure:"configVersion" yaml:"configVersion"`
 	API           API           `mapstructure:"api" yaml:"api"`
@@ -64,9 +73,11 @@ type Raft struct {
 }
 
 type Storage struct {
-	Engine string `mapstructure:"engine" yaml:"engine"`
-	Pebble Pebble `mapstructure:"pebble" yaml:"pebble"`
-	Bolt   Bolt   `mapstructure:"bolt" yaml:"bolt"`
+	Engine            string `mapstructure:"engine" yaml:"engine"`
+	PayloadCacheSlots int    `mapstructure:"payloadCacheSlots" yaml:"payloadCacheSlots"`
+	PayloadCacheHash  string `mapstructure:"payloadCacheHash" yaml:"payloadCacheHash"`
+	Pebble            Pebble `mapstructure:"pebble" yaml:"pebble"`
+	Bolt              Bolt   `mapstructure:"bolt" yaml:"bolt"`
 }
 
 type Pebble struct {
@@ -89,18 +100,22 @@ type Publish struct {
 }
 
 type Delivery struct {
-	ConsumerQueueSize    int           `mapstructure:"consumerQueueSize" yaml:"consumerQueueSize"`
-	TimeBucket           time.Duration `mapstructure:"timeBucket" yaml:"timeBucket"`
-	DispatchPollInterval time.Duration `mapstructure:"dispatchPollInterval" yaml:"dispatchPollInterval"`
-	InFlightTimeout      time.Duration `mapstructure:"inFlightTimeout" yaml:"inFlightTimeout"`
-	DeleteBatchInterval  time.Duration `mapstructure:"deleteBatchInterval" yaml:"deleteBatchInterval"`
-	TTLSweepInterval     time.Duration `mapstructure:"ttlSweepInterval" yaml:"ttlSweepInterval"`
-	PrepareBatchSize     int           `mapstructure:"prepareBatchSize" yaml:"prepareBatchSize"`
-	PrepareBatchBytes    Size          `mapstructure:"prepareBatchBytes" yaml:"prepareBatchBytes"`
-	ScanMaxKeys          int           `mapstructure:"scanMaxKeys" yaml:"scanMaxKeys"`
-	ScanWorkBudget       time.Duration `mapstructure:"scanWorkBudget" yaml:"scanWorkBudget"`
-	PrepareTimeout       time.Duration `mapstructure:"prepareTimeout" yaml:"prepareTimeout"`
-	PrepareWorkers       int           `mapstructure:"prepareWorkers" yaml:"prepareWorkers"`
+	DiscoveryWorkers           int           `mapstructure:"discoveryWorkers" yaml:"discoveryWorkers"`
+	PreloadScanIdleMaxInterval time.Duration `mapstructure:"preloadScanIdleMaxInterval" yaml:"preloadScanIdleMaxInterval"`
+	ConsumerQueueSize          int           `mapstructure:"consumerQueueSize" yaml:"consumerQueueSize"`
+	TimeBucket                 time.Duration `mapstructure:"timeBucket" yaml:"timeBucket"`
+	DispatchPollInterval       time.Duration `mapstructure:"dispatchPollInterval" yaml:"dispatchPollInterval"`
+	PreloadLookahead           time.Duration `mapstructure:"preloadLookahead" yaml:"preloadLookahead"`
+	PreloadMaxMessages         int           `mapstructure:"preloadMaxMessages" yaml:"preloadMaxMessages"`
+	InFlightTimeout            time.Duration `mapstructure:"inFlightTimeout" yaml:"inFlightTimeout"`
+	DeleteBatchInterval        time.Duration `mapstructure:"deleteBatchInterval" yaml:"deleteBatchInterval"`
+	TTLSweepInterval           time.Duration `mapstructure:"ttlSweepInterval" yaml:"ttlSweepInterval"`
+	PrepareBatchSize           int           `mapstructure:"prepareBatchSize" yaml:"prepareBatchSize"`
+	PrepareBatchBytes          Size          `mapstructure:"prepareBatchBytes" yaml:"prepareBatchBytes"`
+	ScanMaxKeys                int           `mapstructure:"scanMaxKeys" yaml:"scanMaxKeys"`
+	ScanWorkBudget             time.Duration `mapstructure:"scanWorkBudget" yaml:"scanWorkBudget"`
+	PrepareTimeout             time.Duration `mapstructure:"prepareTimeout" yaml:"prepareTimeout"`
+	PrepareWorkers             int           `mapstructure:"prepareWorkers" yaml:"prepareWorkers"`
 }
 
 type Observability struct {
@@ -295,6 +310,14 @@ func (c *Config) validateCluster() error {
 }
 
 func (c *Config) validateStorage() error {
+	if err := c.validatePayloadCacheSlots(); err != nil {
+		return err
+	}
+	switch c.Storage.PayloadCacheHash {
+	case PayloadCacheHashFNV, PayloadCacheHashXXHash64:
+	default:
+		return fmt.Errorf("storage.payloadCacheHash must be fnv or xxhash64")
+	}
 	switch c.Storage.Engine {
 	case "pebble":
 		p := c.Storage.Pebble
@@ -325,6 +348,14 @@ func (c *Config) validateStorage() error {
 	return nil
 }
 
+func (c *Config) validatePayloadCacheSlots() error {
+	slots := c.Storage.PayloadCacheSlots
+	if slots < MinPayloadCacheSlots || slots > MaxPayloadCacheSlots || slots&(slots-1) != 0 {
+		return fmt.Errorf("storage.payloadCacheSlots must be a power of two from %d to %d", MinPayloadCacheSlots, MaxPayloadCacheSlots)
+	}
+	return nil
+}
+
 func (c *Config) validatePublishAndDelivery() error {
 	switch c.Publish.MinAckLevel {
 	case Quorum, Leader, NoAck:
@@ -334,7 +365,20 @@ func (c *Config) validatePublishAndDelivery() error {
 	if c.Publish.ProposalTimeout <= 0 {
 		return fmt.Errorf("publish.proposalTimeout must be positive")
 	}
+
 	d := c.Delivery
+	if d.DiscoveryWorkers < 1 || d.DiscoveryWorkers > 16 {
+		return fmt.Errorf("delivery.discoveryWorkers must be 1..16")
+	}
+	if d.PreloadScanIdleMaxInterval < 0 {
+		return fmt.Errorf("delivery.preloadScanIdleMaxInterval must be nonnegative")
+	}
+	if d.PreloadLookahead < 0 || d.PreloadLookahead%time.Millisecond != 0 {
+		return fmt.Errorf("delivery.preloadLookahead must be zero or a positive whole number of milliseconds")
+	}
+	if d.PreloadMaxMessages < 0 || d.PreloadMaxMessages > 1048576 {
+		return fmt.Errorf("delivery.preloadMaxMessages must be 0..1048576")
+	}
 	if d.ConsumerQueueSize < 1 || d.ConsumerQueueSize > 65536 {
 		return fmt.Errorf("delivery.consumerQueueSize must be 1..65536")
 	}
@@ -344,8 +388,8 @@ func (c *Config) validatePublishAndDelivery() error {
 	if d.DispatchPollInterval <= 0 || d.InFlightTimeout <= 0 || d.DeleteBatchInterval <= 0 || d.TTLSweepInterval <= 0 {
 		return fmt.Errorf("delivery intervals and timeout must be positive")
 	}
-	if d.PrepareBatchSize < 1 || d.PrepareBatchSize > 64 || d.ScanMaxKeys < d.PrepareBatchSize || d.ScanMaxKeys > 65536 {
-		return fmt.Errorf("delivery.prepareBatchSize must be 1..64 and scanMaxKeys must be between batch size and 65536")
+	if d.PrepareBatchSize < 1 || d.PrepareBatchSize > 256 || d.ScanMaxKeys < d.PrepareBatchSize || d.ScanMaxKeys > 65536 {
+		return fmt.Errorf("delivery.prepareBatchSize must be 1..256 and scanMaxKeys must be between batch size and 65536")
 	}
 	if size, err := d.PrepareBatchBytes.Bytes(); err != nil || size < 1024 || size > 256<<10 {
 		return fmt.Errorf("delivery.prepareBatchBytes must be 1KiB..256KiB")

@@ -34,6 +34,8 @@ cluster:
 
 storage:
   engine: pebble
+  payloadCacheSlots: 4096 # freshness tracker slots per DB; power of two, 64..1048576; restart to change
+  payloadCacheHash: fnv # fnv (FNV-1a 64-bit) or xxhash64; restart to change
   pebble:
     # memory uses a virtual filesystem and discards data on exit.
     mode: disk
@@ -43,6 +45,7 @@ storage:
     memtableSize: 64MiB
     compactionConcurrency: 1 # Normal and upper compaction concurrency; delete-only compactions may exceed it.
   # Used only when engine is bolt. Bolt always writes a file.
+  # BOLT IS FOR INTERNAL EXPERIMENTAL TESTING AND NOT PRODUCTION READY
   bolt:
     file: "./data/futureq.db"
     bucket: futureq
@@ -52,14 +55,18 @@ publish:
   proposalTimeout: 5s
 
 delivery:
+  discoveryWorkers: 2 # 1..16 independent storage scan workers
+  preloadScanIdleMaxInterval: 0s # 0 disables speculative idle backoff; due scans keep their poll cadence
   consumerQueueSize: 1024 # 1..65536 messages per consumer sender queue
   timeBucket: 1ms
   dispatchPollInterval: 5ms
+  preloadLookahead: 0s # future caching is opt-in; try 100ms after workload evaluation
+  preloadMaxMessages: 512 # global full-message future-cache cap; 0 disables future caching
   inFlightTimeout: 5s
   deleteBatchInterval: 500ms
   ttlSweepInterval: 1m0s
   # Each topic gets one bounded chunk at a time, with cyclic cursor wrap.
-  prepareBatchSize: 64 # 1..64 candidates; new Raft command tag 4
+  prepareBatchSize: 64 # 1..256 candidates; new Raft command tag 4
   prepareBatchBytes: 256KiB # command cap and local scan byte budget
   scanMaxKeys: 256 # includes remote owners, in-flight keys, and skipped keys
   scanWorkBudget: 5ms # local work only; iterators close before proposal waits

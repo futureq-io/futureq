@@ -35,13 +35,18 @@ type BoltConfig struct {
 
 // boltDB wraps *bolt.DB and implements storage.DB.
 type boltDB struct {
-	db     *bolt.DB
-	bucket []byte
+	versions *cacheVersions
+	db       *bolt.DB
+	bucket   []byte
 }
 
 // NewBoltDB opens a bbolt database at cfg.File and returns it as a
 // storage.DB. The database file is created if it does not exist.
-func NewBoltDB(cfg config.Bolt) (DB, error) {
+func NewBoltDB(cfg config.Bolt, options ...Options) (DB, error) {
+	versions, err := newCacheVersions(options...)
+	if err != nil {
+		return nil, err
+	}
 	if err := os.MkdirAll(filepath.Dir(cfg.File), 0700); err != nil {
 		return nil, fmt.Errorf("bbolt: failed to create parent directory for %q: %w", cfg.File, err)
 	}
@@ -64,7 +69,7 @@ func NewBoltDB(cfg config.Bolt) (DB, error) {
 		return nil, fmt.Errorf("bbolt: failed to create bucket %q: %w", bname, err)
 	}
 
-	return &boltDB{db: db, bucket: []byte(bname)}, nil
+	return &boltDB{db: db, bucket: []byte(bname), versions: versions}, nil
 }
 
 // Get retrieves the value for key using a short-lived read-only transaction.
@@ -90,12 +95,13 @@ func (b *boltDB) Get(key []byte) ([]byte, io.Closer, error) {
 // NewBatch returns a boltBatch that accumulates Set/Delete operations and
 // applies them in a single read-write transaction on Commit.
 func (b *boltDB) NewBatch() Batch {
-	return &boltBatch{db: b.db, bucket: b.bucket}
+	return &boltBatch{db: b.db, bucket: b.bucket, versions: b.versions}
 }
 
 // NewIter opens a read-only transaction and returns an iterator over the bucket.
 // The transaction is released when the iterator is closed.
 func (b *boltDB) NewIter(opts *IterOptions) (Iterator, error) {
+	validity := b.versions.snapshot()
 	tx, err := b.db.Begin(false)
 	if err != nil {
 		return nil, fmt.Errorf("bbolt: failed to begin read tx: %w", err)
@@ -114,10 +120,11 @@ func (b *boltDB) NewIter(opts *IterOptions) (Iterator, error) {
 	}
 
 	return &boltIterator{
-		tx:     tx,
-		cursor: bkt.Cursor(),
-		lower:  lower,
-		upper:  upper,
+		validity: validity,
+		tx:       tx,
+		cursor:   bkt.Cursor(),
+		lower:    lower,
+		upper:    upper,
 	}, nil
 }
 
@@ -175,9 +182,11 @@ func (b *boltDB) Close() error { return b.db.Close() }
 // ── boltBatch ────────────────────────────────────────────────────────────────
 
 type boltBatch struct {
-	db     *bolt.DB
-	bucket []byte
-	ops    []boltOp
+	versions  *cacheVersions
+	mutations cacheMutations
+	db        *bolt.DB
+	bucket    []byte
+	ops       []boltOp
 }
 
 type boltOp struct {
@@ -187,6 +196,7 @@ type boltOp struct {
 }
 
 func (bb *boltBatch) Set(key, value []byte) error {
+	bb.mutations.add(key, bb.versions)
 	k := make([]byte, len(key))
 	copy(k, key)
 	v := make([]byte, len(value))
@@ -196,6 +206,7 @@ func (bb *boltBatch) Set(key, value []byte) error {
 }
 
 func (bb *boltBatch) Delete(key []byte) error {
+	bb.mutations.add(key, bb.versions)
 	k := make([]byte, len(key))
 	copy(k, key)
 	bb.ops = append(bb.ops, boltOp{del: true, key: k})
@@ -206,6 +217,10 @@ func (bb *boltBatch) Delete(key []byte) error {
 // SyncMode is accepted for interface compatibility; bbolt always syncs on
 // commit unless bolt.DB.NoSync is set globally.
 func (bb *boltBatch) Commit(_ SyncMode) error {
+	if bb.versions != nil {
+		done := bb.versions.begin(&bb.mutations)
+		defer done()
+	}
 	return bb.db.Update(func(tx *bolt.Tx) error {
 		bkt := tx.Bucket(bb.bucket)
 		if bkt == nil {
@@ -237,10 +252,11 @@ func (bb *boltBatch) Close() error {
 // boltIterator adapts a *bolt.Cursor to the storage.Iterator interface.
 // It owns the read-only transaction it was created from; Close() rolls it back.
 type boltIterator struct {
-	tx     *bolt.Tx
-	cursor *bolt.Cursor
-	lower  []byte
-	upper  []byte
+	validity *cacheSnapshot
+	tx       *bolt.Tx
+	cursor   *bolt.Cursor
+	lower    []byte
+	upper    []byte
 
 	curKey []byte
 	curVal []byte
@@ -294,4 +310,21 @@ var (
 	_ DB       = (*boltDB)(nil)
 	_ Batch    = (*boltBatch)(nil)
 	_ Iterator = (*boltIterator)(nil)
+)
+
+func (bi *boltIterator) CacheToken(key []byte) CacheToken { return bi.validity.token(key) }
+
+// GetWithCacheToken captures the proof before Get, without holding a tracker
+// lock across storage I/O. Overlapping writes conservatively invalidate it.
+func (b *boltDB) GetWithCacheToken(key []byte) ([]byte, io.Closer, CacheToken, error) {
+	token := b.versions.snapshot().token(key)
+	value, closer, err := b.Get(key)
+	return value, closer, token, err
+}
+
+func (b *boltDB) CacheRevision() uint64 { return b.versions.revision() }
+
+var (
+	_ CachedReader    = (*boltDB)(nil)
+	_ CacheRevisioner = (*boltDB)(nil)
 )

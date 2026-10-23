@@ -73,14 +73,18 @@ func Init(cfg *config.Config, logger *zap.Logger) (*App, error) {
 
 	var s storage.DB
 	var err error
+	storageOptions := storage.Options{
+		PayloadCacheSlots: cfg.Storage.PayloadCacheSlots,
+		PayloadCacheHash:  cfg.Storage.PayloadCacheHash,
+	}
 	switch cfg.Storage.Engine {
 	case "pebble":
-		s, err = storage.NewPebble(cfg.Storage.Pebble, logger)
+		s, err = storage.NewPebble(cfg.Storage.Pebble, logger, storageOptions)
 		if err != nil {
 			return nil, fmt.Errorf("failed to initialize pebble storage: %w", err)
 		}
 	case "bolt":
-		s, err = storage.NewBoltDB(cfg.Storage.Bolt)
+		s, err = storage.NewBoltDB(cfg.Storage.Bolt, storageOptions)
 		if err != nil {
 			return nil, fmt.Errorf("failed to initialize bolt storage: %w", err)
 		}

@@ -61,6 +61,8 @@ export FUTUREQ_CLUSTER_RAFT_INITIALMEMBERS='{1: "10.0.0.1:50005"}'
 | Key                            | Default      | Description |
 | ------------------------------ | ------------ | ----------- |
 | `storage.engine`               | `pebble`     | `pebble` (LSM) or `bolt` (single-file B+-tree). |
+| `storage.payloadCacheSlots`    | `4096`       | Shared payload freshness slots per DB, for both engines and standalone/Raft. Power of two from `64` to `1048576`; requires restart. Larger counts reduce conservative cache invalidations from hash collisions. |
+| `storage.payloadCacheHash`     | `fnv`        | Slot hash: `fnv` (FNV-1a 64-bit) or `xxhash64` (XXH64). Fixed when the DB opens; requires restart. Applies to both engines and standalone/Raft. |
 | `storage.pebble.mode`          | `disk`       | `disk` or `memory` (Pebble over an in-memory FS; nothing persists). |
 | `storage.pebble.dataDir`       | `./data`     | Pebble data directory. |
 | `storage.pebble.walEnabled`    | `true`       | Pebble WAL toggle. Automatically disabled in memory mode and in clustered mode (the Raft log is the WAL); may only be set `false` explicitly for clustered disk nodes. |
@@ -68,6 +70,24 @@ export FUTUREQ_CLUSTER_RAFT_INITIALMEMBERS='{1: "10.0.0.1:50005"}'
 | `storage.pebble.memtableSize`  | `64MiB`      | Memtable size. |
 | `storage.bolt.file`            | `./data/futureq.db` | bbolt database file (engine `bolt`). |
 | `storage.bolt.bucket`          | `futureq`    | Single bbolt bucket holding the flat ordered keyspace. |
+
+For example, set `storage.payloadCacheSlots: 16384` or
+`FUTUREQ_STORAGE_PAYLOADCACHESLOTS=16384`. This changes freshness tracking, not the
+number of cached messages or Pebble's block cache. At `S` slots the tracking
+arrays use approximately `12*S` bytes per DB. Batches touching message keys
+allocate a bitmap of `S/8` bytes (512 bytes at the default count), setting one bit
+per touched slot. Duplicate keys and collisions need no sorting. Each commit pass
+checks `S/64` bitmap words and visits their set bits; metadata-only batches allocate
+no bitmap. There is no bitmap pool. At the maximum slot count, each payload batch
+allocates 128 KiB for its bitmap. Benchmark cache-hit rates and delivery latency
+before increasing the slot count substantially.
+
+Set `storage.payloadCacheHash: xxhash64` or
+`FUTUREQ_STORAGE_PAYLOADCACHEHASH=xxhash64` to select XXH64. FNV remains the default;
+changing the hash changes collision patterns as well as hashing cost. Nodes may
+use different slot counts and algorithms because these settings affect only
+local freshness proofs, not stored keys, records, or the wire format. Wider hash
+output does not increase the number of freshness slots; XXH128 is not supported.
 
 ## publish
 
@@ -81,12 +101,32 @@ export FUTUREQ_CLUSTER_RAFT_INITIALMEMBERS='{1: "10.0.0.1:50005"}'
 | Key                                 | Default | Description |
 | ----------------------------------- | ------- | ----------- |
 | `delivery.timeBucket`               | `1ms`   | Granularity of the key scheme's time buckets. `0` = raw-millisecond buckets (maximum precision). Otherwise must be ≥1ms. |
-| `delivery.dispatchPollInterval`     | `50ms`  | Dispatcher scan interval; passes that dispatched messages trigger an immediate re-scan. |
+| `delivery.discoveryWorkers`          | `2`     | Independent storage discovery workers, `1..16`; at most one scan per topic. |
+| `delivery.preloadScanIdleMaxInterval` | `100ms` | Maximum speculative idle scan backoff. `0` disables it; must be nonnegative. The effective limit is at least the poll interval. Payload mutations reset backoff; due repair cadence is unchanged. |
+| `delivery.dispatchPollInterval`     | `5ms`   | Periodic live due-message scan interval, also used when preloading is enabled. |
+| `delivery.preloadLookahead`         | `0s`    | How far ahead the scheduler scans for upcoming messages. Must be a nonnegative whole number of milliseconds. `0` disables preloading. |
+| `delivery.preloadMaxMessages`       | `512`   | Maximum retained/reserved full-message future entries across topics, `0..1048576`. `0` disables future caching; bounded due delivery continues. Payload sizes determine memory use. |
 | `delivery.inFlightTimeout`          | `5s`    | How long an unacknowledged delivery blocks redelivery; after it expires the message is re-dispatched (at-least-once). |
 | `delivery.deleteBatchInterval`      | `500ms` | How often the deleter flushes its batch of keys to delete (one Raft proposal per batch in clustered mode). |
 | `delivery.ttlsweepInterval`         | `60s`   | How often the TTL janitor sweeps the whole database for expired messages. |
 
 All four intervals and the in-flight timeout must be greater than zero.
+
+Preloading works in standalone and clustered mode. Configure it independently of
+preparation batch sizes and quorum reads:
+
+```yaml
+delivery:
+  preloadLookahead: 0s # opt-in trial: 100ms
+  preloadMaxMessages: 512
+```
+
+The corresponding environment variables are `FUTUREQ_DELIVERY_PRELOADLOOKAHEAD`
+and `FUTUREQ_DELIVERY_PRELOADMAXMESSAGES`. Either setting can be zero to disable
+preloading. Increasing the lookahead or count does not change the scheduled due
+time, freeze recipients early, or bypass a delivery read barrier. See the
+[full-message cache sizing and resource budget](heap-scheduler.md#count-sizing-and-resource-budget)
+before retaining an existing large count: this cache now owns payload data.
 
 ## observability
 

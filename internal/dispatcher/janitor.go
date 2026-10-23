@@ -7,7 +7,6 @@ import (
 	"go.uber.org/zap"
 	"google.golang.org/protobuf/proto"
 
-	"github.com/futureq-io/futureq/internal/metrics"
 	"github.com/futureq-io/futureq/internal/storage"
 	"github.com/futureq-io/futureq/pkg/utils"
 	storagepb "github.com/futureq-io/protocol/proto/go/storage"
@@ -60,7 +59,11 @@ func (j *TTLJanitor) Run(ctx context.Context) {
 // message keys. Uses Scan for lower overhead — no manual iterator lifecycle.
 func (j *TTLJanitor) sweep() {
 	nowMs := time.Now().UnixMilli()
-	var expiredKeys [][]byte
+	type expiredMessage struct {
+		key   []byte
+		topic string
+	}
+	var expiredKeys []expiredMessage
 
 	err := j.db.Scan(nil, func(key, val []byte) error {
 		// Only consider 24-byte event keys.
@@ -84,8 +87,7 @@ func (j *TTLJanitor) sweep() {
 			// Must copy — key is only valid during yield.
 			keyCopy := make([]byte, len(key))
 			copy(keyCopy, key)
-			expiredKeys = append(expiredKeys, keyCopy)
-			metrics.MessagesExpiredTotal.WithLabelValues(msg.Topic, "janitor").Inc()
+			expiredKeys = append(expiredKeys, expiredMessage{key: keyCopy, topic: msg.Topic})
 		}
 
 		return nil
@@ -102,7 +104,7 @@ func (j *TTLJanitor) sweep() {
 
 	// Enqueue expired keys for batched deletion via the Deleter.
 	for _, k := range expiredKeys {
-		j.deleter.MarkDeleted(k)
+		j.deleter.MarkExpired(k.key, k.topic, "janitor")
 	}
 
 	j.logger.Info("TTL janitor: marked expired messages for deletion",
