@@ -228,5 +228,3 @@ same allocation when enqueueing a worker's payload; count shared allocations onc
 A later rediscovered retry can allocate another copy while an expired sender queue
 still references the old one; the queue bounds above account for that separately.
 
-See [evaluation results](heap-scheduler-evaluation.md) for profiles, measured
-storage work, variance, rollout tradeoffs and exact validation commands.

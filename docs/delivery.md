@@ -44,9 +44,6 @@ and retry after bounded backoff. Topic generations reject stale scan/delivery
 results after subscription changes. Storage batch invalidation covers deletion,
 replay, overwrite and snapshot replacement before old data can validate.
 
-See the [scheduler design](heap-scheduler.md) for the validity proof, lifecycle,
-count sizing, resource table and [measured tradeoffs](heap-scheduler-evaluation.md).
-
 ## Hub & consumer groups
 
 Each consumer registers with a topic and a group and gets a UUID and a buffered channel (capacity 1024). Delivery semantics per topic:
