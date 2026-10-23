@@ -72,7 +72,7 @@ func (b *directDeleteBackend) DeleteKeys(keys [][]byte) error {
 		}
 	}
 
-	return batch.Commit(storage.Sync)
+	return batch.Commit(storage.NoSync)
 }
 
 // ─── Deleter ─────────────────────────────────────────────────────────────────
