@@ -105,10 +105,10 @@ func (d *Dispatcher) collectTopic(topic string, nowMs int64) deliveryChunk {
 		if examined >= d.Limits.Examined || len(chunk.items) >= d.Limits.Candidates || bytesRead >= d.Limits.Bytes || (examined > 0 && time.Since(started) >= d.Limits.WorkTime) || !d.hub.DeliveryPermitted() {
 			break
 		}
-		key, value := iter.Key(), iter.Value()
+		key := iter.Key()
 		examined++
-		bytesRead += len(key) + len(value)
-		metrics.DeliveryDiscoveryBytesTotal.Add(float64(len(key) + len(value)))
+		bytesRead += len(key)
+		metrics.DeliveryDiscoveryBytesTotal.Add(float64(len(key)))
 		// Appending zero is the inclusive lower bound strictly after this
 		// fixed-length event key, without assuming IDs are consecutive.
 		cursor.after = append(append([]byte(nil), key...), 0)
@@ -131,6 +131,9 @@ func (d *Dispatcher) collectTopic(topic string, nowMs int64) deliveryChunk {
 			valid = iter.Next()
 			continue
 		}
+		value := iter.Value()
+		bytesRead += len(value)
+		metrics.DeliveryDiscoveryBytesTotal.Add(float64(len(value)))
 		payload, err := cachePayload(iter, key, value)
 		if err != nil {
 			d.logger.Error("invalid stored message", zap.Error(err))
@@ -282,19 +285,19 @@ func (d *Dispatcher) prepareChunk(ctx context.Context, chunk deliveryChunk) (map
 			msg := payload.message
 			if msg == nil || !payload.validity.Valid() {
 				metrics.DeliveryPreparePayloadCacheTotal.WithLabelValues("fallback").Inc()
-				value, closer, err := d.db.Get(item.Key)
+				refreshed, err := d.readPayload(item.Key, "preparation")
 				if errors.Is(err, storage.ErrNotFound) {
 					continue
 				}
 				if err != nil {
 					return nil, err
 				}
-				msg = &storagepb.StoredMessage{}
-				metrics.DeliveryPayloadDecodesTotal.WithLabelValues("preparation").Inc()
-				err = proto.Unmarshal(value, msg)
-				_ = closer.Close()
-				if err != nil {
+				msg = refreshed.message
+				if msg == nil {
 					continue
+				}
+				if chunk.payloads != nil {
+					chunk.payloads[string(item.Key)] = refreshed
 				}
 			} else {
 				metrics.DeliveryPreparePayloadCacheTotal.WithLabelValues("cache").Inc()
@@ -360,7 +363,7 @@ func (d *Dispatcher) deliverChunk(chunk deliveryChunk, states map[string]*raft.D
 		} else {
 			metrics.DeliveryPayloadCacheTotal.WithLabelValues("fallback").Inc()
 			metrics.DeliveryPayloadReadsTotal.Inc()
-			value, closer, err := d.db.Get(item.Key)
+			refreshed, err := d.readPayload(item.Key, "delivery")
 			if errors.Is(err, storage.ErrNotFound) {
 				continue
 			}
@@ -368,11 +371,8 @@ func (d *Dispatcher) deliverChunk(chunk deliveryChunk, states map[string]*raft.D
 				d.logger.Warn("prepared payload read failed", zap.Error(err))
 				continue
 			}
-			msg = &storagepb.StoredMessage{}
-			metrics.DeliveryPayloadDecodesTotal.WithLabelValues("delivery").Inc()
-			err = proto.Unmarshal(value, msg)
-			_ = closer.Close()
-			if err != nil {
+			msg = refreshed.message
+			if msg == nil {
 				continue
 			}
 		}

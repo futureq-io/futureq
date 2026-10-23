@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"container/heap"
 	"encoding/json"
+	"io"
 	"sync/atomic"
 	"time"
 
@@ -43,6 +44,32 @@ func cachePayload(iter storage.Iterator, key, value []byte) (cachedPayload, erro
 	return payload, nil
 }
 
+// readPayload refreshes both the decoded message and its storage freshness proof.
+// Unsupported wrappers retain the conservative final-Get fallback. Malformed
+// values return an empty payload; storage failures return an error.
+func (d *Dispatcher) readPayload(key []byte, stage string) (cachedPayload, error) {
+	var payload cachedPayload
+	var value []byte
+	var closer io.Closer
+	var err error
+	if reader, ok := d.db.(storage.CachedReader); ok {
+		value, closer, payload.validity, err = reader.GetWithCacheToken(key)
+	} else {
+		value, closer, err = d.db.Get(key)
+	}
+	if err != nil {
+		return cachedPayload{}, err
+	}
+	defer closer.Close() //nolint:errcheck
+	msg := &storagepb.StoredMessage{}
+	metrics.DeliveryPayloadDecodesTotal.WithLabelValues(stage).Inc()
+	if proto.Unmarshal(value, msg) != nil {
+		return cachedPayload{}, nil
+	}
+	payload.message = msg
+	return payload, nil
+}
+
 type candidateHeap []preloadCandidate
 
 func (h candidateHeap) Len() int { return len(h) }
@@ -71,6 +98,8 @@ type topicPreload struct {
 	items            candidateHeap
 	keys             map[[24]byte]bool
 	scanNext         bool
+	futureScanAfter  time.Time // scheduler-owned speculative scan deadline
+	futureScanIdle   time.Duration
 }
 
 // collectScheduledTopic alternates cached chunks with live due scans. Even a
@@ -164,11 +193,12 @@ func (d *Dispatcher) collectPreloaded(topic string, p *topicPreload, view Intere
 // preloadTopic reads only the moving lookahead range, with its own cyclic
 // cursor and the existing key/byte/time budgets. Full buffers stop speculative
 // reads, while live due scans continue independently. Coarse buckets require
-// checking the exact message due time before retaining a candidate.
-func (d *Dispatcher) preloadTopic(topic string, p *topicPreload, view InterestView, nowMs int64) {
+// checking the exact message due time before retaining a candidate. It returns
+// true only when the range was exhausted without an iterator error.
+func (d *Dispatcher) preloadTopic(topic string, p *topicPreload, view InterestView, nowMs int64) bool {
 	defer d.observePreload()
 	if d.preloadCount >= d.PreloadMaxMessages {
-		return
+		return false
 	}
 	started := time.Now()
 	loaded, scanned, filtered := 0, 0, 0
@@ -191,7 +221,7 @@ func (d *Dispatcher) preloadTopic(topic string, p *topicPreload, view InterestVi
 	iter, err := d.db.NewIter(&storage.IterOptions{LowerBound: lower, UpperBound: utils.DueUpperBound(hash, utils.CalculateBucket(horizon, d.TimeBucket))})
 	if err != nil {
 		d.logger.Warn("preload iterator failed", zap.Error(err))
-		return
+		return false
 	}
 	defer iter.Close() //nolint:errcheck
 	examined, bytesRead := 0, 0
@@ -200,34 +230,39 @@ func (d *Dispatcher) preloadTopic(topic string, p *topicPreload, view InterestVi
 		if d.preloadCount >= d.PreloadMaxMessages || examined >= d.Limits.Examined || bytesRead >= d.Limits.Bytes || (examined > 0 && time.Since(started) >= d.Limits.WorkTime) || !d.hub.DeliveryPermitted() {
 			break
 		}
-		key, value := iter.Key(), iter.Value()
+		key := iter.Key()
 		examined++
-		bytesRead += len(key) + len(value)
-		metrics.DeliveryDiscoveryBytesTotal.Add(float64(len(key) + len(value)))
+		bytesRead += len(key)
+		metrics.DeliveryDiscoveryBytesTotal.Add(float64(len(key)))
 		p.after = append(append([]byte(nil), key...), 0)
 		if len(key) == 24 {
 			scanned++
+			if p.keys[[24]byte(key)] {
+				valid = iter.Next()
+				continue
+			}
 			if len(view.localOwners(key)) == 0 {
 				filtered++
 				valid = iter.Next()
 				continue
 			}
 			candidate := preloadCandidate{key: [24]byte(key)}
-			if !p.keys[candidate.key] {
-				payload, err := cachePayload(iter, key, value)
-				if err == nil {
-					msg := payload.message
-					candidate.payload = payload
-					candidate.due = msg.EnqueuedAtUnixMs + msg.DelayMs
-					if candidate.due > nowMs && candidate.due <= horizon && !d.isExpired(msg, nowMs) {
-						if p.keys == nil {
-							p.keys = make(map[[24]byte]bool)
-						}
-						heap.Push(&p.items, candidate)
-						p.keys[candidate.key] = true
-						d.preloadCount++
-						loaded++
+			value := iter.Value()
+			bytesRead += len(value)
+			metrics.DeliveryDiscoveryBytesTotal.Add(float64(len(value)))
+			payload, err := cachePayload(iter, key, value)
+			if err == nil {
+				msg := payload.message
+				candidate.payload = payload
+				candidate.due = msg.EnqueuedAtUnixMs + msg.DelayMs
+				if candidate.due > nowMs && candidate.due <= horizon && !d.isExpired(msg, nowMs) {
+					if p.keys == nil {
+						p.keys = make(map[[24]byte]bool)
 					}
+					heap.Push(&p.items, candidate)
+					p.keys[candidate.key] = true
+					d.preloadCount++
+					loaded++
 				}
 			}
 		}
@@ -236,6 +271,7 @@ func (d *Dispatcher) preloadTopic(topic string, p *topicPreload, view InterestVi
 	if !valid || iter.Error() != nil {
 		p.after = nil
 	}
+	return !valid && iter.Error() == nil
 }
 
 func (d *Dispatcher) dropPreload(topic string) {

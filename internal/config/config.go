@@ -96,20 +96,22 @@ type Publish struct {
 }
 
 type Delivery struct {
-	ConsumerQueueSize    int           `mapstructure:"consumerQueueSize" yaml:"consumerQueueSize"`
-	TimeBucket           time.Duration `mapstructure:"timeBucket" yaml:"timeBucket"`
-	DispatchPollInterval time.Duration `mapstructure:"dispatchPollInterval" yaml:"dispatchPollInterval"`
-	PreloadLookahead     time.Duration `mapstructure:"preloadLookahead" yaml:"preloadLookahead"`
-	PreloadMaxMessages   int           `mapstructure:"preloadMaxMessages" yaml:"preloadMaxMessages"`
-	InFlightTimeout      time.Duration `mapstructure:"inFlightTimeout" yaml:"inFlightTimeout"`
-	DeleteBatchInterval  time.Duration `mapstructure:"deleteBatchInterval" yaml:"deleteBatchInterval"`
-	TTLSweepInterval     time.Duration `mapstructure:"ttlSweepInterval" yaml:"ttlSweepInterval"`
-	PrepareBatchSize     int           `mapstructure:"prepareBatchSize" yaml:"prepareBatchSize"`
-	PrepareBatchBytes    Size          `mapstructure:"prepareBatchBytes" yaml:"prepareBatchBytes"`
-	ScanMaxKeys          int           `mapstructure:"scanMaxKeys" yaml:"scanMaxKeys"`
-	ScanWorkBudget       time.Duration `mapstructure:"scanWorkBudget" yaml:"scanWorkBudget"`
-	PrepareTimeout       time.Duration `mapstructure:"prepareTimeout" yaml:"prepareTimeout"`
-	PrepareWorkers       int           `mapstructure:"prepareWorkers" yaml:"prepareWorkers"`
+	DiscoveryWorkers           int           `mapstructure:"discoveryWorkers" yaml:"discoveryWorkers"`
+	PreloadScanIdleMaxInterval time.Duration `mapstructure:"preloadScanIdleMaxInterval" yaml:"preloadScanIdleMaxInterval"`
+	ConsumerQueueSize          int           `mapstructure:"consumerQueueSize" yaml:"consumerQueueSize"`
+	TimeBucket                 time.Duration `mapstructure:"timeBucket" yaml:"timeBucket"`
+	DispatchPollInterval       time.Duration `mapstructure:"dispatchPollInterval" yaml:"dispatchPollInterval"`
+	PreloadLookahead           time.Duration `mapstructure:"preloadLookahead" yaml:"preloadLookahead"`
+	PreloadMaxMessages         int           `mapstructure:"preloadMaxMessages" yaml:"preloadMaxMessages"`
+	InFlightTimeout            time.Duration `mapstructure:"inFlightTimeout" yaml:"inFlightTimeout"`
+	DeleteBatchInterval        time.Duration `mapstructure:"deleteBatchInterval" yaml:"deleteBatchInterval"`
+	TTLSweepInterval           time.Duration `mapstructure:"ttlSweepInterval" yaml:"ttlSweepInterval"`
+	PrepareBatchSize           int           `mapstructure:"prepareBatchSize" yaml:"prepareBatchSize"`
+	PrepareBatchBytes          Size          `mapstructure:"prepareBatchBytes" yaml:"prepareBatchBytes"`
+	ScanMaxKeys                int           `mapstructure:"scanMaxKeys" yaml:"scanMaxKeys"`
+	ScanWorkBudget             time.Duration `mapstructure:"scanWorkBudget" yaml:"scanWorkBudget"`
+	PrepareTimeout             time.Duration `mapstructure:"prepareTimeout" yaml:"prepareTimeout"`
+	PrepareWorkers             int           `mapstructure:"prepareWorkers" yaml:"prepareWorkers"`
 }
 
 type Observability struct {
@@ -356,6 +358,12 @@ func (c *Config) validatePublishAndDelivery() error {
 	}
 
 	d := c.Delivery
+	if d.DiscoveryWorkers < 1 || d.DiscoveryWorkers > 16 {
+		return fmt.Errorf("delivery.discoveryWorkers must be 1..16")
+	}
+	if d.PreloadScanIdleMaxInterval < 0 {
+		return fmt.Errorf("delivery.preloadScanIdleMaxInterval must be nonnegative")
+	}
 	if d.PreloadLookahead < 0 || d.PreloadLookahead%time.Millisecond != 0 {
 		return fmt.Errorf("delivery.preloadLookahead must be zero or a positive whole number of milliseconds")
 	}

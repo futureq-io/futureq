@@ -313,3 +313,18 @@ var (
 )
 
 func (bi *boltIterator) CacheToken(key []byte) CacheToken { return bi.validity.token(key) }
+
+// GetWithCacheToken captures the proof before Get, without holding a tracker
+// lock across storage I/O. Overlapping writes conservatively invalidate it.
+func (b *boltDB) GetWithCacheToken(key []byte) ([]byte, io.Closer, CacheToken, error) {
+	token := b.versions.snapshot().token(key)
+	value, closer, err := b.Get(key)
+	return value, closer, token, err
+}
+
+func (b *boltDB) CacheRevision() uint64 { return b.versions.revision() }
+
+var (
+	_ CachedReader    = (*boltDB)(nil)
+	_ CacheRevisioner = (*boltDB)(nil)
+)

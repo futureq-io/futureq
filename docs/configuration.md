@@ -73,10 +73,10 @@ export FUTUREQ_CLUSTER_RAFT_INITIALMEMBERS='{1: "10.0.0.1:50005"}'
 For example, set `storage.payloadCacheSlots: 16384` or
 `FUTUREQ_STORAGE_PAYLOADCACHESLOTS=16384`. This changes freshness tracking, not the
 number of cached messages or Pebble's block cache. At `S` slots the tracking
-arrays use approximately `12*S` bytes per DB, plus an `S/8`-byte bitmap per batch
-that touches message keys. Metadata-only batches allocate no bitmap. The current
-commit path scans that bitmap, so larger counts also increase CPU work and time
-under the tracker lock. Benchmark the cache-hit rate and delivery latency before
+arrays use approximately `12*S` bytes per DB. Batches touching message keys
+collect a sparse list of `uint32` slots, sorted and deduplicated before taking the
+tracker lock. Commit traversal depends on touched slots rather than table size;
+metadata-only batches allocate no tracking list. Benchmark the cache-hit rate and delivery latency before
 increasing it substantially. Nodes may use different counts; this setting changes
 no stored records or wire format.
 
@@ -92,6 +92,8 @@ no stored records or wire format.
 | Key                                 | Default | Description |
 | ----------------------------------- | ------- | ----------- |
 | `delivery.timeBucket`               | `1ms`   | Granularity of the key scheme's time buckets. `0` = raw-millisecond buckets (maximum precision). Otherwise must be ≥1ms. |
+| `delivery.discoveryWorkers`          | `2`     | Independent storage discovery workers, `1..16`; at most one scan per topic. |
+| `delivery.preloadScanIdleMaxInterval` | `100ms` | Maximum speculative idle scan backoff. `0` disables it; must be nonnegative. The effective limit is at least the poll interval. Payload mutations reset backoff; due repair cadence is unchanged. |
 | `delivery.dispatchPollInterval`     | `5ms`   | Periodic live due-message scan interval, also used when preloading is enabled. |
 | `delivery.preloadLookahead`         | `0s`    | How far ahead the scheduler scans for upcoming messages. Must be a nonnegative whole number of milliseconds. `0` disables preloading. |
 | `delivery.preloadMaxMessages`       | `512`   | Maximum retained/reserved full-message future entries across topics, `0..1048576`. `0` disables future caching; bounded due delivery continues. Payload sizes determine memory use. |

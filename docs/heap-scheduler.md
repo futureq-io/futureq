@@ -40,8 +40,9 @@ No scheduler/tracker lock spans storage, quorum or network work.
 
 A single global message heap was rejected because a blocked topic could obstruct
 other topics. Per-topic heaps and fair rotation retain current one-job-per-topic
-semantics without another ownership partition. Two discovery workers provide
+semantics without another ownership partition. By default two discovery workers provide
 cross-topic isolation on both engines without overlapping scans of a topic.
+`delivery.discoveryWorkers` configures this pool from 1 to 16 workers.
 Separate per-topic scanner goroutines or scheduler partitions would add resident
 state and require evidence of a scheduler bottleneck first.
 
@@ -61,8 +62,11 @@ of version slots and pending counts per engine (default 4096, power of two from
 64 to 1048576). The count is fixed when opening the engine and requires restart
 to change; both engines and both standalone/Raft use it. Slot indexes are
 `uint32`, and hashing uses a mask because the count is a power of two. Every batch
-that touches 24-byte event keys lazily allocates a bitmap sized to that count;
-metadata-only batches allocate none.
+that touches 24-byte event keys lazily collects a sparse list of `uint32` slots;
+metadata-only batches allocate none. The list is sorted and deduplicated before
+the tracker lock is acquired. Duplicate slots are also compacted before growing
+its backing array, bounding capacity by a constant factor of the slot count.
+Both commit passes visit only the touched slots.
 Before committing any such batch, under a short tracker lock, it advances the
 sequence, stamps affected slots and marks them pending. After storage commit
 returns (including failure), it advances/stamps again and clears its pending
@@ -86,7 +90,10 @@ is no later than the token's snapshot sequence. Therefore:
    committing a new receipt, the worker rereads an invalid/unsupported payload
    and checks its current exact due time and TTL. Eligible messages prepare on
    that attempt; deleted, expired or future replacements cannot freeze recipients.
-   Final delivery independently validates or rereads after the read barrier.
+   Built-in engines return refreshed bytes with a proof captured before the Get;
+   preparation retains both the decoded message and that proof. Final delivery
+   independently validates it or rereads after the read barrier. Unsupported engines
+   and wrappers retain the conservative ordinary-Get fallback.
 5. A successful token validation is the payload freshness point corresponding to
    the old final Get. A delete starting afterwards can race enqueue just as it
    could after that Get; the change does not claim atomic delivery versus delete.
@@ -107,7 +114,7 @@ uses those same functions. It is not a second sender algorithm.
 
 A scan reserves result slots before dispatch. Future reservations plus retained
 future entries never exceed `preloadMaxMessages`. Due discovery has a separate
-allowance of `max(2, prepareWorkers) * prepareBatchSize`, so future entries cannot exclude overdue
+allowance of `max(discoveryWorkers, prepareWorkers) * prepareBatchSize`, so future entries cannot exclude overdue
 arrivals. Assigned jobs have the existing `prepareWorkers * prepareBatchSize`
 bound. A heap pop clears its backing slot; sparse heaps/maps rebuild at one-quarter
 occupancy, bounding capacity by a constant factor. Topic removal clears its data
@@ -125,7 +132,12 @@ watermark or proof of cache completeness.
 Only results that actually enter admission trigger immediate refill, subject to
 reservations and fair rotation. A nonempty scan whose entries are stale,
 duplicated or unusable waits for the poll cadence.
-Empty scans wait for the poll cadence. Each topic may retain/reserve at most
+Due repair scans keep the poll cadence. Exhausted speculative future scans with
+no new candidates back off exponentially up to `delivery.preloadScanIdleMaxInterval`
+(default 100ms, zero disables backoff; the effective limit is at least the poll
+interval). Payload commit revisions reset this backoff on the next scheduler pass.
+Engines or wrappers without revision tracking keep the original poll cadence.
+A due-only scan does not change the future cursor. Each topic may retain/reserve at most
 one due batch, including while its preparation job is busy. The global due
 allowance covers at least every preparation worker, so busy topics cannot consume
 all admission while another worker is idle. A scan reserves only the unfilled
@@ -188,24 +200,25 @@ are smaller than that default envelope. It is configurable, and internal storage
 can contain larger valid messages. None are truncated or permanently rejected by
 a byte cap. These memory figures are estimates, not universal maximums.
 
-Let `C=preloadMaxMessages`, `B=prepareBatchSize`, `W=prepareWorkers`, and `Q` be
-a consumer's configured channel capacity. With defaults C=512, B=64, W=2:
+Let `C=preloadMaxMessages`, `B=prepareBatchSize`, `W=prepareWorkers`,
+`D=discoveryWorkers`, and `Q` be
+a consumer's configured channel capacity. With defaults C=512, B=64, W=2, D=2:
 
 | Stage | Bound | Payload ownership after handoff |
 | --- | --- | --- |
 | Retained/reserved future entries | C across heaps, scans and result channels combined | Immutable decoded message |
-| Due scan results and ready entries | max(2,W)B combined, independent of C; at most B retained/reserved per topic | Same admission representation |
+| Due scan results and ready entries | max(D,W)B combined, independent of C; at most B retained/reserved per topic | Same admission representation |
 | Assigned preparation/delivery jobs | WB total; one/topic | References removed from heap and held by worker |
-| Scanner transients | At most two current decodes plus engine iterators | Released on iterator close/job return |
-| Maintenance | At most two discovery jobs and one pending receipt chunk; uses shared pools | One transient payload read/decode per scanner, no retained payload batch |
+| Scanner transients | At most D current decodes plus engine iterators | Released on iterator close/job return |
+| Maintenance | At most D discovery jobs and one pending receipt chunk; uses shared pools | One transient payload read/decode per scanner, no retained payload batch |
 | Retry state | Per-active-topic deadline and cyclic cursor; no retry payload side queue | Failed jobs evict, then rediscover |
 | Heap/map backing capacity | Heap <4 times live entries after drain; maps rebuilt with it | Popped slots zeroed; removed topics clear arrays/maps |
 | Sender queues and tracked attempts | Per consumer: Q buffered + at most max(1024,Q) records | Shared immutable payload; expired buffered attempts may outlive tracking |
 | Delete/ACK buffers | Existing 8192-key limits per completion kind | Keys/recipient metadata, no payload cache |
-| Validity metadata | At `S` configured slots, about `12*S` bytes per engine plus an `S/8`-byte bitmap per batch touching message keys; defaults: 48 KiB and 512 bytes. Small snapshot token. | No per-key unbounded history; commit bitmap traversal grows with `S` |
-| Known-key scan filters | At most two copies of relevant bounded heap/assigned key sets | Keys only |
+| Validity metadata | At `S` configured slots, about `12*S` bytes per engine plus a sparse `uint32` list per batch touching message keys; default arrays: 48 KiB. Small snapshot token. | No per-key unbounded history; commit traversal visits touched slots only |
+| Known-key scan filters | At most D copies of relevant bounded heap/assigned key sets | Keys only |
 
-Conservatively, the heap/discovery/worker stages retain at most `C+max(2,W)B+WB=768`
+Conservatively, the heap/discovery/worker stages retain at most `C+max(D,W)B+WB=768`
 message allocations plus current decoder transients. At 64 KiB this is about
 48 MiB of payload plus bookkeeping, **before** sender queues, in-flight consumers,
 storage caches, publish batches and transient fallback reads. Fan-out shares the

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/futureq-io/futureq/internal/metrics"
+	"github.com/futureq-io/futureq/internal/storage"
 	"go.uber.org/zap"
 )
 
@@ -17,9 +18,8 @@ import (
 // ready heap deadline or another topic's scan from being scheduled. Ranges of
 // the same topic never overlap concurrently. No mutable scheduler state is
 // passed to workers; cursors are acknowledged only with their matching result.
-const discoveryWorkers = 2
-
 type discoveryJob struct {
+	revision              uint64
 	repairGeneration      uint64
 	known                 map[[24]byte]bool
 	topic                 string
@@ -29,11 +29,12 @@ type discoveryJob struct {
 	futureSlots, dueSlots int
 }
 type discoveryResult struct {
-	job    discoveryJob
-	chunk  deliveryChunk
-	future candidateHeap
-	cursor scanCursor
-	after  []byte
+	futureExhausted bool
+	job             discoveryJob
+	chunk           deliveryChunk
+	future          candidateHeap
+	cursor          scanCursor
+	after           []byte
 }
 type deliveryJob struct {
 	chunk deliveryChunk
@@ -63,10 +64,11 @@ func (d *Dispatcher) discover(job discoveryJob) discoveryResult {
 	p := &topicPreload{epoch: job.owner.epoch, after: job.futureAfter, keys: job.known}
 	// Future scans have independent work budgets and run even with productive
 	// due traffic, provided the scheduler reserved future admission first.
+	exhausted := false
 	if job.topic != maintenanceTopic && job.futureSlots > 0 && d.PreloadLookahead > 0 {
-		scanner.preloadTopic(job.topic, p, d.hub.InterestView(job.topic), time.Now().UnixMilli())
+		exhausted = scanner.preloadTopic(job.topic, p, d.hub.InterestView(job.topic), time.Now().UnixMilli())
 	}
-	return discoveryResult{job: job, chunk: chunk, future: p.items, cursor: *scanner.cursors[job.topic], after: p.after}
+	return discoveryResult{futureExhausted: exhausted, job: job, chunk: chunk, future: p.items, cursor: *scanner.cursors[job.topic], after: p.after}
 }
 
 // admitCandidate is shared by synchronous adapters and asynchronous discovery.
@@ -119,6 +121,7 @@ func (d *Dispatcher) admitChunk(p *topicPreload, chunk deliveryChunk, assigned m
 // bounded immutable batches/outcomes. Retry recovery is the cyclic due scan.
 func (d *Dispatcher) runPipeline(parent context.Context) {
 	ctx, cancel := context.WithCancel(parent)
+	discoveryWorkers := max(1, d.DiscoveryWorkers)
 	scanJobs := make(chan discoveryJob, discoveryWorkers)
 	scans := make(chan discoveryResult, discoveryWorkers)
 	jobs := make(chan deliveryJob, d.Limits.Workers)
@@ -252,8 +255,19 @@ func (d *Dispatcher) runPipeline(parent context.Context) {
 	timer.Stop()
 	defer timer.Stop()
 
+	revisions, tracksRevisions := d.db.(storage.CacheRevisioner)
+	var revision uint64
 	schedule := func() {
 		now := time.Now()
+		if tracksRevisions {
+			current := revisions.CacheRevision()
+			if current != revision {
+				revision = current
+				for _, p := range d.preloads {
+					p.futureScanAfter, p.futureScanIdle = time.Time{}, 0
+				}
+			}
+		}
 		if !now.Before(housekeepAfter) {
 			d.hub.ExpireInFlight(now)
 			d.hub.ObserveQueues()
@@ -357,7 +371,7 @@ func (d *Dispatcher) runPipeline(parent context.Context) {
 			// allowance. Already retained entries consume its topic credit.
 			dueSlots := min(max(0, d.Limits.Candidates-p.readyCount), dueCapacity-d.readyCount-reservedDue)
 			futureSlots := 0
-			if topic != maintenanceTopic && d.PreloadLookahead > 0 {
+			if topic != maintenanceTopic && d.PreloadLookahead > 0 && !now.Before(p.futureScanAfter) {
 				futureSlots = min(d.Limits.Candidates, max(0, d.PreloadMaxMessages-d.preloadCount-reservedFuture))
 			}
 			if dueSlots <= 0 && futureSlots <= 0 {
@@ -379,7 +393,7 @@ func (d *Dispatcher) runPipeline(parent context.Context) {
 			for key := range assigned[topic] {
 				known[key] = true
 			}
-			scanJobs <- discoveryJob{repairGeneration: p.repairGeneration, known: known, topic: topic, owner: p, cursor: cursor, futureAfter: append([]byte(nil), p.after...), futureSlots: futureSlots, dueSlots: dueSlots}
+			scanJobs <- discoveryJob{revision: revision, repairGeneration: p.repairGeneration, known: known, topic: topic, owner: p, cursor: cursor, futureAfter: append([]byte(nil), p.after...), futureSlots: futureSlots, dueSlots: dueSlots}
 			rotation = (start + offset + 1) % len(topics)
 		}
 		d.observePreload()
@@ -465,7 +479,18 @@ func (d *Dispatcher) runPipeline(parent context.Context) {
 						admitted = len(result.chunk.items)
 					}
 				} else {
-					current.after = result.after
+					if job.futureSlots > 0 {
+						current.after = result.after
+						if tracksRevisions && d.PreloadScanIdleMaxInterval > 0 && job.revision == revision && result.futureExhausted && len(result.future) == 0 {
+							// Bound exponential backoff without overflowing a configured duration.
+							limit := max(d.interval, d.PreloadScanIdleMaxInterval)
+							idle := min(limit, max(d.interval, current.futureScanIdle))
+							current.futureScanIdle = idle + min(idle, limit-idle)
+							current.futureScanAfter = time.Now().Add(current.futureScanIdle)
+						} else {
+							current.futureScanAfter, current.futureScanIdle = time.Time{}, 0
+						}
+					}
 					if !time.Now().Before(retryAfter[job.topic]) {
 						admitted += d.admitChunk(current, result.chunk, assigned[job.topic])
 					} else if len(result.chunk.items) > 0 {

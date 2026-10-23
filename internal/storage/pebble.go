@@ -212,3 +212,18 @@ var (
 )
 
 func (pi *pebbleIterator) CacheToken(key []byte) CacheToken { return pi.validity.token(key) }
+
+// GetWithCacheToken captures the proof before Get, without holding a tracker
+// lock across storage I/O. Overlapping writes conservatively invalidate it.
+func (p *Pebble) GetWithCacheToken(key []byte) ([]byte, io.Closer, CacheToken, error) {
+	token := p.versions.snapshot().token(key)
+	value, closer, err := p.Get(key)
+	return value, closer, token, err
+}
+
+func (p *Pebble) CacheRevision() uint64 { return p.versions.revision() }
+
+var (
+	_ CachedReader    = (*Pebble)(nil)
+	_ CacheRevisioner = (*Pebble)(nil)
+)

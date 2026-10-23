@@ -148,6 +148,8 @@ func startRun(cmd *cobra.Command, _ []string) {
 	disp.PrepareBatch = ledger.PrepareBatch
 	disp.MaintenanceRecipients = recipients
 	disp.TimeBucket = cfg.Delivery.TimeBucket
+	disp.DiscoveryWorkers = cfg.Delivery.DiscoveryWorkers
+	disp.PreloadScanIdleMaxInterval = cfg.Delivery.PreloadScanIdleMaxInterval
 	disp.PreloadLookahead = cfg.Delivery.PreloadLookahead
 	disp.PreloadMaxMessages = cfg.Delivery.PreloadMaxMessages
 	prepareBytes, _ := cfg.Delivery.PrepareBatchBytes.Bytes() // validated during Load

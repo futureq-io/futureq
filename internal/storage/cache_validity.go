@@ -2,7 +2,8 @@ package storage
 
 import (
 	"fmt"
-	"math/bits"
+	"io"
+	"slices"
 	"sync"
 
 	"github.com/futureq-io/futureq/internal/config"
@@ -43,6 +44,19 @@ type CachedIterator interface {
 	CacheToken(key []byte) CacheToken
 }
 
+// CachedReader optionally returns a freshness proof captured BEFORE reading.
+// A proof captured after Get could incorrectly validate bytes raced by a write.
+// The value and closer have the same ownership rules as DB.Get.
+type CachedReader interface {
+	GetWithCacheToken(key []byte) ([]byte, io.Closer, CacheToken, error)
+}
+
+// CacheRevisioner exposes payload mutation progress for speculative scan backoff.
+// Both beginning and completing a payload commit advance this revision.
+type CacheRevisioner interface {
+	CacheRevision() uint64
+}
+
 // Fixed-at-open striped versions bound metadata independently of key cardinality.
 // Collisions cause conservative rereads, never false validity. Only event keys
 // (24 bytes) change these versions; manifest preparation cannot invalidate data.
@@ -64,6 +78,10 @@ func newCacheVersions(options ...Options) (*cacheVersions, error) {
 	slots := config.DefaultPayloadCacheSlots
 	if len(options) == 1 && options[0].PayloadCacheSlots != 0 {
 		slots = options[0].PayloadCacheSlots
+	}
+
+	if slots < config.MinPayloadCacheSlots || slots > config.MaxPayloadCacheSlots || slots&(slots-1) != 0 {
+		return nil, fmt.Errorf("payload cache slots must be a power of two from %d to %d", config.MinPayloadCacheSlots, config.MaxPayloadCacheSlots)
 	}
 
 	return &cacheVersions{
@@ -101,16 +119,23 @@ func cacheSlot(key []byte, mask uint32) uint32 {
 	return uint32(h) & mask
 }
 
-type cacheMutations []uint64
+// Batches collect only touched slots. Sorting and deduplication happen before
+// acquiring the tracker lock, so commit work does not scan the version table.
+type cacheMutations []uint32
 
-// Metadata-only batches do not need a mutation bitmap.
 func (m *cacheMutations) add(key []byte, versions *cacheVersions) {
 	if len(key) == 24 && versions != nil {
-		if len(*m) == 0 {
-			*m = make(cacheMutations, len(versions.slots)/64)
+		if *m == nil {
+			// One small allocation covers typical batches; this is an allocation
+			// hint, not a limit on batch size or configured version slots.
+			*m = make(cacheMutations, 0, 64)
+		} else if len(*m) == cap(*m) {
+			// Deduplicate before growing so repeated keys cannot grow tracking
+			// memory beyond a constant factor of the configured slot count.
+			slices.Sort(*m)
+			*m = slices.Compact(*m)
 		}
-		slot := cacheSlot(key, versions.mask)
-		(*m)[slot/64] |= 1 << (slot % 64)
+		*m = append(*m, cacheSlot(key, versions.mask))
 	}
 }
 
@@ -118,31 +143,28 @@ func (v *cacheVersions) begin(m *cacheMutations) func() {
 	if len(*m) == 0 {
 		return func() {}
 	}
+	slices.Sort(*m)
+	*m = slices.Compact(*m)
 	v.mu.Lock()
 	v.sequence++
-	for i, word := range *m {
-		for word != 0 {
-			bit := bits.TrailingZeros64(word)
-			slot := i*64 + bit
-			v.slots[slot] = v.sequence
-			v.pending[slot]++
-			word &= word - 1
-		}
+	for _, slot := range *m {
+		v.slots[slot] = v.sequence
+		v.pending[slot]++
 	}
-
 	v.mu.Unlock()
 	return func() {
 		v.mu.Lock()
 		v.sequence++
-		for i, word := range *m {
-			for word != 0 {
-				bit := bits.TrailingZeros64(word)
-				slot := i*64 + bit
-				v.pending[slot]--
-				v.slots[slot] = v.sequence
-				word &= word - 1
-			}
+		for _, slot := range *m {
+			v.pending[slot]--
+			v.slots[slot] = v.sequence
 		}
 		v.mu.Unlock()
 	}
+}
+
+func (v *cacheVersions) revision() uint64 {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return v.sequence
 }

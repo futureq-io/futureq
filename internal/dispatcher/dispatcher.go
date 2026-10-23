@@ -8,6 +8,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/futureq-io/futureq/internal/app"
+	"github.com/futureq-io/futureq/internal/config"
 	raft "github.com/futureq-io/futureq/internal/raft/event"
 	"github.com/futureq-io/futureq/internal/storage"
 
@@ -42,18 +43,20 @@ type Dispatcher struct {
 	wakeCh          chan struct{}
 	inFlight        sync.Map // key: string(pebbleKey) → *inFlightEntry
 	// Installed before Run. Cluster reads also refresh the bounded metadata permit.
-	ReadBarrier           func() error
-	PrepareDelivery       func(string, []byte) (*raft.DeliveryState, error) // legacy single-key hook
-	PrepareBatch          func(context.Context, []raft.DeliveryPrepare) (map[string]*raft.DeliveryState, error)
-	MaintenanceRecipients func(string) (uint64, []string, bool)
-	Limits                ScanLimits
-	TimeBucket            time.Duration
-	cursors               map[string]*scanCursor // owned by the scheduler
-	PreloadLookahead      time.Duration
-	PreloadMaxMessages    int
-	preloads              map[string]*topicPreload // owned by the scheduler
-	preloadCount          int
-	readyCount            int // scheduler-owned due admission, separate from future cap
+	ReadBarrier                func() error
+	PrepareDelivery            func(string, []byte) (*raft.DeliveryState, error) // legacy single-key hook
+	PrepareBatch               func(context.Context, []raft.DeliveryPrepare) (map[string]*raft.DeliveryState, error)
+	MaintenanceRecipients      func(string) (uint64, []string, bool)
+	Limits                     ScanLimits
+	TimeBucket                 time.Duration
+	cursors                    map[string]*scanCursor // owned by the scheduler
+	DiscoveryWorkers           int
+	PreloadScanIdleMaxInterval time.Duration
+	PreloadLookahead           time.Duration
+	PreloadMaxMessages         int
+	preloads                   map[string]*topicPreload // owned by the scheduler
+	preloadCount               int
+	readyCount                 int // scheduler-owned due admission, separate from future cap
 }
 
 // NewDispatcher constructs a Dispatcher.
@@ -71,17 +74,20 @@ func NewDispatcher(
 	if app.A != nil {
 		bucket = app.A.Config().Delivery.TimeBucket
 	}
+	defaults := config.DefaultDelivery()
 	return &Dispatcher{
-		db:              db,
-		hub:             hub,
-		deleter:         deleter,
-		logger:          logger.Named("dispatcher"),
-		interval:        interval,
-		inFlightTimeout: inFlightTimeout,
-		wakeCh:          wakeCh,
-		Limits:          DefaultScanLimits(),
-		TimeBucket:      bucket,
-		cursors:         make(map[string]*scanCursor),
+		DiscoveryWorkers:           defaults.DiscoveryWorkers,
+		PreloadScanIdleMaxInterval: defaults.PreloadScanIdleMaxInterval,
+		db:                         db,
+		hub:                        hub,
+		deleter:                    deleter,
+		logger:                     logger.Named("dispatcher"),
+		interval:                   interval,
+		inFlightTimeout:            inFlightTimeout,
+		wakeCh:                     wakeCh,
+		Limits:                     DefaultScanLimits(),
+		TimeBucket:                 bucket,
+		cursors:                    make(map[string]*scanCursor),
 	}
 }
 
