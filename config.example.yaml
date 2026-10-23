@@ -54,7 +54,7 @@ publish:
 
 delivery:
   discoveryWorkers: 2 # 1..16 independent storage scan workers
-  preloadScanIdleMaxInterval: 0ms # 0 disables speculative idle backoff; due scans keep their poll cadence
+  preloadScanIdleMaxInterval: 0s # 0 disables speculative idle backoff; due scans keep their poll cadence
   consumerQueueSize: 1024 # 1..65536 messages per consumer sender queue
   timeBucket: 1ms
   dispatchPollInterval: 5ms
