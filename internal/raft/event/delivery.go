@@ -51,7 +51,7 @@ type DeliveryPrepare struct {
 type prepareDelivery = DeliveryPrepare // old single-key command wire shape
 
 const (
-	MaxDeliveryPrepareItems = 64
+	MaxDeliveryPrepareItems = 256
 	MaxDeliveryPrepareBytes = 256 << 10
 	MaxDeliveryRecipients   = 1024
 )

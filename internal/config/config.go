@@ -371,8 +371,8 @@ func (c *Config) validatePublishAndDelivery() error {
 	if d.DispatchPollInterval <= 0 || d.InFlightTimeout <= 0 || d.DeleteBatchInterval <= 0 || d.TTLSweepInterval <= 0 {
 		return fmt.Errorf("delivery intervals and timeout must be positive")
 	}
-	if d.PrepareBatchSize < 1 || d.PrepareBatchSize > 64 || d.ScanMaxKeys < d.PrepareBatchSize || d.ScanMaxKeys > 65536 {
-		return fmt.Errorf("delivery.prepareBatchSize must be 1..64 and scanMaxKeys must be between batch size and 65536")
+	if d.PrepareBatchSize < 1 || d.PrepareBatchSize > 256 || d.ScanMaxKeys < d.PrepareBatchSize || d.ScanMaxKeys > 65536 {
+		return fmt.Errorf("delivery.prepareBatchSize must be 1..256 and scanMaxKeys must be between batch size and 65536")
 	}
 	if size, err := d.PrepareBatchBytes.Bytes(); err != nil || size < 1024 || size > 256<<10 {
 		return fmt.Errorf("delivery.prepareBatchBytes must be 1KiB..256KiB")
