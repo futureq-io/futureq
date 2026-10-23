@@ -44,9 +44,9 @@ func New(
 		}),
 
 		grpc.KeepaliveParams(keepalive.ServerParameters{
-			MaxConnectionIdle:     30 * time.Second,
-			MaxConnectionAge:      2 * time.Minute,
-			MaxConnectionAgeGrace: 10 * time.Second,
+			MaxConnectionIdle:     cfg.MaxConnectionIdle,
+			MaxConnectionAge:      cfg.MaxConnectionAge,
+			MaxConnectionAgeGrace: cfg.MaxConnectionAgeGrace,
 			Time:                  10 * time.Second,
 			Timeout:               cfg.KeepaliveTimeout,
 		}),

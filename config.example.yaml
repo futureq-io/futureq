@@ -14,6 +14,9 @@ api:
     maxReceiveMessageSize: 100KiB
     maxSendMessageSize: 100KiB
     keepaliveTimeout: 5s
+    maxConnectionIdle: 30s
+    maxConnectionAge: 0s
+    maxConnectionAgeGrace: 0s
 
 cluster:
   enabled: false

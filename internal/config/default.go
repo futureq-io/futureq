@@ -7,6 +7,9 @@ var defaultConfig = Config{
 	API: API{GRPC: GRPC{
 		Listen: "0.0.0.0:8443", Advertise: "", MaxConcurrentStreams: 10,
 		MaxReceiveMessageSize: "100KiB", MaxSendMessageSize: "100KiB", KeepaliveTimeout: 5 * time.Second,
+		MaxConnectionIdle:     30 * time.Second,
+		MaxConnectionAge:      0 * time.Second,
+		MaxConnectionAgeGrace: 0 * time.Second,
 	}},
 	Cluster: Cluster{
 		Enabled: false, NodeID: 1, ShardID: 1, JoinSeeds: []string{},

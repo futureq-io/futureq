@@ -52,6 +52,9 @@ type GRPC struct {
 	MaxReceiveMessageSize Size          `mapstructure:"maxReceiveMessageSize" yaml:"maxReceiveMessageSize"`
 	MaxSendMessageSize    Size          `mapstructure:"maxSendMessageSize" yaml:"maxSendMessageSize"`
 	KeepaliveTimeout      time.Duration `mapstructure:"keepaliveTimeout" yaml:"keepaliveTimeout"`
+	MaxConnectionIdle     time.Duration `mapstructure:"maxConnectionIdle" yaml:"maxConnectionIdle"`
+	MaxConnectionAge      time.Duration `mapstructure:"maxConnectionAge" yaml:"maxConnectionAge"`
+	MaxConnectionAgeGrace time.Duration `mapstructure:"maxConnectionAgeGrace" yaml:"maxConnectionAgeGrace"`
 }
 
 type Cluster struct {
