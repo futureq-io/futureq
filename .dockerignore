@@ -3,7 +3,8 @@
 !go.mod
 !go.sum
 !cmd/
-!cmd/**
+!cmd/futureq/
+!cmd/futureq/**
 !internal/
 !internal/**
 !pkg/
