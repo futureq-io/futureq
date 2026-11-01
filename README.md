@@ -157,11 +157,50 @@ On first start the node contacts each seed until one accepts its `JoinCluster` r
 ### Docker
 
 ```bash
-docker build -t futureq .
+make docker-build
 docker run -p 8443:8443 -p 9090:9090 -p 50005:50005 \
-  -v $(pwd)/config.yaml:/app/config.yaml \
-  futureq start -c /app/config.yaml
+  -v "$(pwd)/config.yaml:/app/config.yaml:ro" \
+  -v futureq-data:/app/data \
+  -v futureq-raft-data:/app/raft-data \
+  futureq:local start -c /app/config.yaml
 ```
+
+Create `config.yaml` from `config.example.yaml` first. The image runs as UID 1000;
+if you use host directories for storage, make them writable by that UID. Named
+volumes shown above preserve data when the container is replaced. You can also
+build without Make using `docker build -t futureq:local .`.
+
+### Publish tagged images to Docker Hub
+
+The `Publish Docker image` GitHub Actions workflow tests the tagged source and
+publishes Linux AMD64 and ARM64 images only when a **new Git tag is pushed**.
+Branch pushes and updates to existing tags do not publish images.
+
+One-time setup:
+
+1. Create a Docker Hub repository, such as `yourname/futureq` or an organization repository.
+2. Create a [Docker Hub access token](https://docs.docker.com/security/access-tokens/personal-access-tokens/)
+   with permission to push to that repository.
+3. In GitHub **Settings → Secrets and variables → Actions**, add these repository settings:
+
+   | Type | Name | Value |
+   | ---- | ---- | ----- |
+   | Variable | `DOCKERHUB_USERNAME` | Docker ID used to authenticate |
+   | Variable | `DOCKERHUB_IMAGE` | Full image name, e.g. `yourname/futureq` |
+   | Secret | `DOCKERHUB_TOKEN` | Docker Hub access token |
+
+After committing and pushing the workflow and Dockerfile changes, publish a release:
+
+```bash
+git tag -a v0.1.0 -m "Release v0.1.0"
+git push origin v0.1.0
+```
+
+Once the workflow succeeds, pull `yourname/futureq:v0.1.0`. The image tag preserves
+the Git tag, including the `v` prefix. Characters Docker does not allow in image
+tags (such as `/`) are normalized by the metadata action, so prefer simple
+version tags. The workflow does not create a `latest` tag. Use a new version tag
+for each release; existing tags are not published retroactively.
 
 ## Configuration
 
@@ -230,10 +269,13 @@ pkg/
 ## Development
 
 ```bash
-go build ./...      # build
-go test ./...       # run tests
+make build         # build bin/futureq
+make test          # run tests with the race detector
+make run           # start a local node; ARGS="-c config.yaml" selects a config
 golangci-lint run   # lint
 ```
+
+Run `make help` for the available targets. Go and Docker commands also work directly.
 
 Contributions are welcome — please open an issue to discuss substantial changes before sending a PR.
 
