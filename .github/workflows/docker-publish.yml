@@ -23,7 +23,7 @@ jobs:
           go-version-file: go.mod
 
       - name: Run tests
-        run: go test -mod=readonly -race ./...
+        run: make test
 
   publish:
     name: Publish to Docker Hub

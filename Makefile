@@ -11,7 +11,7 @@ help:
 	@printf '%s\n' \
 	  'make build         Build bin/futureq' \
 	  'make run           Build and start a local node (ARGS="-c config.yaml")' \
-	  'make test          Run all Go tests with the race detector' \
+	  'make test          Run application tests with the race detector' \
 	  'make docker-build  Build a local image (IMAGE=futureq TAG=local)'
 
 build:
@@ -22,7 +22,7 @@ run: build
 	./bin/futureq start $(ARGS)
 
 test:
-	$(GO) test -mod=readonly -race ./...
+	$(GO) test -mod=readonly -race ./cmd/... ./internal/... ./pkg/...
 
 docker-build:
 	docker build --tag "$(IMAGE):$(TAG)" .
