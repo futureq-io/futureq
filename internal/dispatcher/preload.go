@@ -3,7 +3,6 @@ package dispatcher
 import (
 	"bytes"
 	"container/heap"
-	"encoding/json"
 	"io"
 	"sync/atomic"
 	"time"
@@ -12,7 +11,7 @@ import (
 	raft "github.com/futureq-io/futureq/internal/raft/event"
 	"github.com/futureq-io/futureq/internal/storage"
 	"github.com/futureq-io/futureq/pkg/utils"
-	storagepb "github.com/futureq-io/protocol/proto/go/storage"
+	deliverypb "github.com/futureq-io/protocol/proto/go/delivery"
 	"go.uber.org/zap"
 	"google.golang.org/protobuf/proto"
 )
@@ -27,14 +26,14 @@ type preloadCandidate struct {
 }
 
 type cachedPayload struct {
-	message  *storagepb.StoredMessage
+	message  *deliverypb.StoredDeliveryMessage
 	validity storage.CacheToken
 }
 
 func cachePayload(iter storage.Iterator, key, value []byte) (cachedPayload, error) {
-	var msg storagepb.StoredMessage
+	var msg deliverypb.StoredDeliveryMessage
 	metrics.DeliveryPayloadDecodesTotal.WithLabelValues("discovery").Inc()
-	if err := proto.Unmarshal(value, &msg); err != nil {
+	if err := (proto.UnmarshalOptions{DiscardUnknown: true}).Unmarshal(value, &msg); err != nil {
 		return cachedPayload{}, err
 	}
 	payload := cachedPayload{message: &msg}
@@ -61,9 +60,9 @@ func (d *Dispatcher) readPayload(key []byte, stage string) (cachedPayload, error
 		return cachedPayload{}, err
 	}
 	defer closer.Close() //nolint:errcheck
-	msg := &storagepb.StoredMessage{}
+	msg := &deliverypb.StoredDeliveryMessage{}
 	metrics.DeliveryPayloadDecodesTotal.WithLabelValues(stage).Inc()
-	if proto.Unmarshal(value, msg) != nil {
+	if (proto.UnmarshalOptions{DiscardUnknown: true}).Unmarshal(value, msg) != nil {
 		return cachedPayload{}, nil
 	}
 	payload.message = msg
@@ -144,15 +143,15 @@ func (d *Dispatcher) collectPreloaded(topic string, p *topicPreload, view Intere
 		observeCollection("preload_ready", started)
 		d.observePreload()
 	}()
-	commandBytes, examined := 3, 0
+	examined := 0
+	var commandSize raft.DeliveryPrepareSizer
 	for len(p.items) > 0 && p.items[0].due <= nowMs {
 		if examined >= d.Limits.Examined || len(chunk.items) >= d.Limits.Candidates || (examined > 0 && time.Since(started) >= d.Limits.WorkTime) || !d.hub.DeliveryPermitted() {
 			break
 		}
 		candidate := p.items[0]
 		item := raft.DeliveryPrepare{Key: append([]byte(nil), candidate.key[:]...), Epoch: view.Epoch, Recipients: view.Recipients}
-		encoded, err := json.Marshal(item)
-		if err == nil && commandBytes+len(encoded)+1 > d.Limits.Bytes && len(chunk.items) > 0 {
+		if commandSize.SizeWith(item) > d.Limits.Bytes && len(chunk.items) > 0 {
 			break // retain this candidate for a subsequent bounded chunk
 		}
 		heap.Pop(&p.items)
@@ -164,7 +163,7 @@ func (d *Dispatcher) collectPreloaded(topic string, p *topicPreload, view Intere
 			d.preloadCount--
 		}
 		examined++
-		if err != nil || commandBytes+len(encoded)+1 > d.Limits.Bytes {
+		if commandSize.SizeWith(item) > d.Limits.Bytes {
 			chunk.unfit = true
 			d.logger.Error("delivery interests exceed preparation byte limit", zap.String("topic", topic), zap.Int("limit", d.Limits.Bytes))
 			metrics.DeliveryRejectedTotal.WithLabelValues("prepare_bytes").Inc()
@@ -174,7 +173,7 @@ func (d *Dispatcher) collectPreloaded(topic string, p *topicPreload, view Intere
 		if len(owners) == 0 || !d.hub.hasReadyOwner(owners, item.Key) {
 			continue
 		}
-		commandBytes += len(encoded) + 1
+		commandSize.Add(item)
 		source := "preload"
 		if candidate.ready {
 			source = "scan"
@@ -250,6 +249,17 @@ func (d *Dispatcher) preloadTopic(topic string, p *topicPreload, view InterestVi
 			value := iter.Value()
 			bytesRead += len(value)
 			metrics.DeliveryDiscoveryBytesTotal.Add(float64(len(value)))
+			// Reject out-of-window entries without copying payloads or decoding indexes.
+			var header deliverypb.StoredMessageMetadata
+			if err := (proto.UnmarshalOptions{DiscardUnknown: true}).Unmarshal(value, &header); err != nil {
+				valid = iter.Next()
+				continue
+			}
+			due := header.EnqueuedAtUnixMs + header.DelayMs
+			if due <= nowMs || due > horizon || d.isExpired(&header, nowMs) {
+				valid = iter.Next()
+				continue
+			}
 			payload, err := cachePayload(iter, key, value)
 			if err == nil {
 				msg := payload.message

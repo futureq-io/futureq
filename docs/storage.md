@@ -31,11 +31,15 @@ The sort order is therefore *topic → time bucket → ID*, which makes "give me
 
 The stored value is the protobuf `StoredMessage` (topic, payload, enqueue time, delay, TTL, indexes). The 24-byte key doubles as the opaque `delivery_tag` consumers receive and echo back on ACK.
 
+Delivery preparation and ACK commands, preparation results, and persisted delivery receipts use Protobuf exclusively. Receipts have an `FQR` version-1 prefix, and batch preparation results have an `FQP` version-1 prefix. JSON delivery formats are no longer supported; development data containing them must be reset, including databases, Raft logs, and snapshots. The removed delivery command numbers (2, 3, and 4) remain reserved. Consumer membership and consumer snapshot metadata still use JSON.
+
 ## Engines
 
 ### Pebble (default)
 
 LSM-tree engine (`storage.pebble.*`). Scans and iterators run on internal snapshots, so reads never block writes. Options: disk or in-memory mode (`vfs.NewMem()` — same code path, nothing persists, WAL auto-disabled), WAL toggle (auto-off in clustered mode — the Raft log is the WAL), block cache (default 16MiB) and memtable size (default 64MiB).
+
+Bounded `NewIter` calls remember verified empty prefixes in a small in-memory cache. Later snapshots can seek past those prefixes instead of repeatedly walking point tombstones in `First()`. Writes invalidate overlapping proofs before and after commit; inserts behind a discovery cursor remain visible on the next cyclic scan. Pending writes and old snapshots cannot certify a raced gap. The cache retains at most 64 ranges and 64 probes with bounds up to 256 bytes, and starts empty after restart. It changes neither the on-disk format, delivery polling/retry intervals, nor payload cache-validity tokens. The first scan of an uncached range still pays the underlying traversal cost; scans over live receipts still examine them.
 
 ### bbolt
 

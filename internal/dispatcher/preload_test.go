@@ -104,7 +104,7 @@ func (s *PreloadSuite) TestPreloadCachedCollectionAvoidsDueIteratorAndStillCheck
 	require.Len(chunk.items, 1)
 	require.Equal(key, chunk.items[0].Key)
 	// A future caller timestamp is not delivery authorization, even for a cache hit.
-	require.Zero(d.deliverChunk(chunk, map[string]*raft.DeliveryState{string(key): {Epoch: chunk.items[0].Epoch, Recipients: map[string]bool{"g:workers": false}}}))
+	require.Zero(d.deliverChunk(chunk, map[string]*raft.DeliveryState{string(key): {Epoch: chunk.items[0].Epoch, Recipients: []string{"g:workers"}}}))
 	require.Empty(ch)
 }
 

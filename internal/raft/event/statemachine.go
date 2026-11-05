@@ -130,7 +130,7 @@ func (s *EventStateMachine) applyEntry(batch storage.Batch, delivery *DeliveryBa
 		}
 		return statemachine.Result{Value: uint64(len(deleted))}, deleted, 0, nil
 
-	case PrepareDeliveryCmd, AckDeliveryBatchCmd, PrepareDeliveryBatchCmd:
+	case ProtoPrepareDeliveryBatchCmd, ProtoAckDeliveryBatchCmd, ProtoPrepareDeliveryCmd:
 		result, deleted, err := delivery.Apply(cmd)
 		return result, deleted, 0, err
 
@@ -164,6 +164,9 @@ func (s *EventStateMachine) Update(entries []statemachine.Entry) ([]statemachine
 		}
 	}
 
+	if err := delivery.Flush(); err != nil {
+		return nil, err
+	}
 	if lastID > s.lastPersistedID {
 		if err := s.repo.PersistLastID(batch, lastID); err != nil {
 			return nil, fmt.Errorf("raft: PersistLastID: %w", err)

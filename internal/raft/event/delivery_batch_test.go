@@ -2,13 +2,14 @@ package raft
 
 import (
 	"bytes"
-	"encoding/json"
 	"testing"
 
 	"github.com/futureq-io/futureq/internal/storage"
 	"github.com/futureq-io/futureq/pkg/utils"
+	deliverypb "github.com/futureq-io/protocol/proto/go/delivery"
 	"github.com/lni/dragonboat/v4/statemachine"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/proto"
 )
 
 func TestBatchPrepareOverlayAckDeleteEpochAndSnapshot(t *testing.T) {
@@ -24,8 +25,8 @@ func TestBatchPrepareOverlayAckDeleteEpochAndSnapshot(t *testing.T) {
 	require.NoError(t, err)
 	entries, err := sm.Update([]statemachine.Entry{{Index: 1, Cmd: store}, {Index: 2, Cmd: prepare}, {Index: 3, Cmd: ack}, {Index: 4, Cmd: refresh}})
 	require.NoError(t, err)
-	var prepared []DeliveryPrepared
-	require.NoError(t, json.Unmarshal(entries[3].Result.Data, &prepared))
+	prepared, err := UnmarshalDeliveryPrepared(entries[3].Result.Data)
+	require.NoError(t, err)
 	require.Len(t, prepared, 2)
 	require.Equal(t, a, prepared[0].Key)
 	require.Nil(t, prepared[1].State)
@@ -68,10 +69,14 @@ func TestBatchPrepareRejectsMalformedBeforeMutating(t *testing.T) {
 	require.NoError(t, err)
 	valid := DeliveryPrepare{Key: key, Epoch: 1, Recipients: []string{"g:a"}}
 	for _, items := range [][]DeliveryPrepare{{valid, valid}, {valid, {Key: []byte("short"), Recipients: []string{"g:a"}}}, {valid, {Key: utils.EventKey(1, 2, 2), Recipients: []string{"bad"}}}} {
-		data, err := json.Marshal(items)
+		wire := &deliverypb.DeliveryPrepareBatch{}
+		for _, item := range items {
+			wire.Groups = append(wire.Groups, &deliverypb.DeliveryPrepareGroup{Epoch: item.Epoch, Recipients: item.Recipients, Keys: [][]byte{item.Key}})
+		}
+		data, err := proto.Marshal(wire)
 		require.NoError(t, err)
 		batch := db.NewBatch()
-		_, _, err = NewDeliveryBatch(db, batch).Apply(append([]byte{byte(PrepareDeliveryBatchCmd)}, data...))
+		_, _, err = NewDeliveryBatch(db, batch).Apply(append([]byte{byte(ProtoPrepareDeliveryBatchCmd)}, data...))
 		require.Error(t, err)
 		require.NoError(t, batch.Commit(storage.Sync))
 		require.NoError(t, batch.Close())
@@ -79,17 +84,23 @@ func TestBatchPrepareRejectsMalformedBeforeMutating(t *testing.T) {
 		require.NoError(t, err)
 		require.Nil(t, state, "even earlier valid items must not mutate on malformed input")
 	}
-	items := make([]DeliveryPrepare, MaxDeliveryPrepareItems+1)
-	data, _ := json.Marshal(items)
-	_, err = UnmarshalPrepareDeliveryBatchCmd(append([]byte{byte(PrepareDeliveryBatchCmd)}, data...))
+	keys := make([][]byte, MaxDeliveryPrepareItems+1)
+	for i := range keys {
+		keys[i] = utils.EventKey(1, 2, uint64(i))
+	}
+	data, err := proto.Marshal(&deliverypb.DeliveryPrepareBatch{Groups: []*deliverypb.DeliveryPrepareGroup{{Recipients: valid.Recipients, Keys: keys}}})
+	require.NoError(t, err)
+	_, err = UnmarshalPrepareDeliveryBatchCmd(append([]byte{byte(ProtoPrepareDeliveryBatchCmd)}, data...))
 	require.Error(t, err)
 	_, err = UnmarshalPrepareDeliveryBatchCmd(make([]byte, MaxDeliveryPrepareBytes+1))
 	require.Error(t, err)
 	cmd, err := MarshalPrepareDeliveryBatchCmd([]DeliveryPrepare{valid})
 	require.NoError(t, err)
-	_, err = UnmarshalPrepareDeliveryBatchCmd(append(cmd, []byte(" {}")...))
+	_, err = UnmarshalPrepareDeliveryBatchCmd(append(cmd, 0))
 	require.Error(t, err)
 	require.Equal(t, CommandType(0), StoreBatchCmd)
-	require.Equal(t, CommandType(3), AckDeliveryBatchCmd)
-	require.Equal(t, CommandType(4), PrepareDeliveryBatchCmd)
+	require.Equal(t, CommandType(1), DeleteBatchCmd)
+	require.Equal(t, CommandType(5), ProtoPrepareDeliveryBatchCmd)
+	require.Equal(t, CommandType(6), ProtoAckDeliveryBatchCmd)
+	require.Equal(t, CommandType(7), ProtoPrepareDeliveryCmd)
 }
