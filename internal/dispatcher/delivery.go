@@ -175,7 +175,7 @@ func (l *DeliveryLedger) apply(cmd []byte) (statemachine.Result, error) {
 		return l.propose(cmd)
 	}
 	mode := storage.Sync
-	if raft.CommandType(cmd[0]) == raft.AckDeliveryBatchCmd || raft.CommandType(cmd[0]) == raft.ProtoAckDeliveryBatchCmd {
+	if raft.CommandType(cmd[0]) == raft.ProtoAckDeliveryBatchCmd {
 		mode = storage.NoSync
 	}
 	var result statemachine.Result

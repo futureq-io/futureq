@@ -2,7 +2,6 @@ package raft
 
 import (
 	"bytes"
-	"encoding/json"
 	"fmt"
 	"testing"
 
@@ -14,10 +13,9 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-func TestProtoReceiptLegacyMigrationAndBitmap(t *testing.T) {
-	legacy := []byte(`{"epoch":17,"recipients":{"u:old":false,"g:b":true,"g:a":false}}`)
-	state, err := UnmarshalDeliveryState(legacy)
-	require.NoError(t, err)
+func TestProtoReceiptRoundTripAndBitmap(t *testing.T) {
+	state := newDeliveryState(17, []string{"u:old", "g:b", "g:a"})
+	require.True(t, state.acknowledge("g:b"))
 	require.Equal(t, []string{"g:a", "g:b", "u:old"}, state.Recipients)
 	require.Equal(t, 2, state.remaining)
 	require.False(t, state.acknowledge("g:b"))
@@ -101,30 +99,47 @@ func TestProtoPreparationRejectsBeforeMutation(t *testing.T) {
 	}
 }
 
-func TestLegacyJSONCommandsAndResultsRemainReplayable(t *testing.T) {
+func TestLegacyJSONDeliveryFormatsAreRejected(t *testing.T) {
 	sm, db := newDeliveryTestSM(t)
 	key := utils.EventKey(1, 2, 1)
 	store, err := MarshalStoreBatchCmd([]StoreBatchItem{{ID: 1, Bucket: 1, TopicHash: 2, Msg: []byte("payload")}})
 	require.NoError(t, err)
-	body, err := json.Marshal([]DeliveryPrepare{{Key: key, Epoch: 1, Recipients: []string{"g:a", "g:b"}}})
+	_, err = sm.Update([]statemachine.Entry{{Index: 1, Cmd: store}})
 	require.NoError(t, err)
-	prepare := append([]byte{byte(PrepareDeliveryBatchCmd)}, body...)
-	ackBody, err := json.Marshal([]DeliveryAck{{Key: key, Recipient: "g:a"}})
-	require.NoError(t, err)
-	entries, err := sm.Update([]statemachine.Entry{{Index: 1, Cmd: store}, {Index: 2, Cmd: prepare}, {Index: 3, Cmd: append([]byte{byte(AckDeliveryBatchCmd)}, ackBody...)}})
-	require.NoError(t, err)
-	require.Equal(t, byte('['), entries[1].Result.Data[0], "legacy log entries retain JSON results")
-	var oldResults []DeliveryPrepared
-	require.NoError(t, json.Unmarshal(entries[1].Result.Data, &oldResults))
-	require.True(t, oldResults[0].State.Needs("g:a"))
-	state, err := ReadDeliveryState(db, key)
-	require.NoError(t, err)
-	require.False(t, state.Needs("g:a"))
-	require.True(t, state.Needs("g:b"))
-	data, closer, err := db.Get(DeliveryStateKey(key))
-	require.NoError(t, err)
-	require.True(t, bytes.HasPrefix(data, receiptPrefix))
-	require.NoError(t, closer.Close())
+	for _, legacy := range []struct {
+		tag  byte
+		body string
+	}{
+		{2, `{"key":"AAAAAAAAAAEAAAAAAAAAAgAAAAAAAAAB","epoch":1,"recipients":["g:a"]}`},
+		{3, `[{"key":"AAAAAAAAAAEAAAAAAAAAAgAAAAAAAAAB","recipient":"g:a"}]`},
+		{4, `[{"key":"AAAAAAAAAAEAAAAAAAAAAgAAAAAAAAAB","epoch":1,"recipients":["g:a"]}]`},
+	} {
+		t.Run(fmt.Sprint(legacy.tag), func(t *testing.T) {
+			cmd := append([]byte{legacy.tag}, legacy.body...)
+			batch := db.NewBatch()
+			defer batch.Close()
+			_, _, err := NewDeliveryBatch(db, batch).Apply(cmd)
+			require.ErrorContains(t, err, "invalid delivery command")
+			_, err = UnmarshalPrepareDeliveryBatchCmd(cmd)
+			require.Error(t, err)
+			_, err = sm.Update([]statemachine.Entry{{Index: 2, Cmd: cmd}})
+			require.ErrorContains(t, err, "unknown command type")
+			require.Equal(t, uint64(1), sm.lastApplied)
+			state, err := ReadDeliveryState(db, key)
+			require.NoError(t, err)
+			require.Nil(t, state)
+			payload, closer, err := db.Get(key)
+			require.NoError(t, err)
+			require.Equal(t, []byte("payload"), payload)
+			require.NoError(t, closer.Close())
+		})
+	}
+	_, err = UnmarshalDeliveryState([]byte(`{"epoch":17,"recipients":{"g:a":false}}`))
+	require.ErrorContains(t, err, "unknown delivery receipt format")
+	_, err = DeliveryStateEpoch([]byte(`{"epoch":17,"recipients":{"g:a":false}}`))
+	require.ErrorContains(t, err, "unknown delivery receipt format")
+	_, err = UnmarshalDeliveryPrepared([]byte(`[]`))
+	require.ErrorContains(t, err, "unknown delivery preparation result format")
 }
 
 func FuzzProtoPreparationDecode(f *testing.F) {

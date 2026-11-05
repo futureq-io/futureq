@@ -1,11 +1,8 @@
 package raft
 
 import (
-	"bytes"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"sort"
 	"strings"
 
@@ -44,17 +41,15 @@ func (s *DeliveryState) acknowledge(recipient string) bool {
 }
 
 type DeliveryAck struct {
-	Key       []byte `json:"key"`
-	Recipient string `json:"recipient"`
+	Key       []byte
+	Recipient string
 }
 
 type DeliveryPrepare struct {
-	Key        []byte   `json:"key"`
-	Epoch      uint64   `json:"epoch"`
-	Recipients []string `json:"recipients"`
+	Key        []byte
+	Epoch      uint64
+	Recipients []string
 }
-
-type prepareDelivery = DeliveryPrepare // old single-key command wire shape
 
 const (
 	MaxDeliveryPrepareItems = 256
@@ -66,8 +61,8 @@ const (
 // they were deleted or had no recipients. Results come from the committed
 // state machine; callers need not assume an immediate follower Get is current.
 type DeliveryPrepared struct {
-	Key   []byte         `json:"key"`
-	State *DeliveryState `json:"state"`
+	Key   []byte
+	State *DeliveryState
 }
 
 func validatePrepares(items []DeliveryPrepare) error {
@@ -105,39 +100,12 @@ func MarshalPrepareDeliveryBatchCmd(items []DeliveryPrepare) ([]byte, error) {
 	return marshalProtoPrepares(items, ProtoPrepareDeliveryBatchCmd)
 }
 
-// Decode incrementally and check the count before allocating another item.
 // Validation completes before any mutations are added to the overlay.
 func UnmarshalPrepareDeliveryBatchCmd(cmd []byte) ([]DeliveryPrepare, error) {
-	if len(cmd) > 0 && (CommandType(cmd[0]) == ProtoPrepareDeliveryBatchCmd || CommandType(cmd[0]) == ProtoPrepareDeliveryCmd) {
-		return unmarshalProtoPrepares(cmd)
-	}
-	if len(cmd) < 3 || len(cmd) > MaxDeliveryPrepareBytes || CommandType(cmd[0]) != PrepareDeliveryBatchCmd {
+	if len(cmd) == 0 || (CommandType(cmd[0]) != ProtoPrepareDeliveryBatchCmd && CommandType(cmd[0]) != ProtoPrepareDeliveryCmd) {
 		return nil, fmt.Errorf("invalid delivery prepare batch size or tag")
 	}
-	dec := json.NewDecoder(bytes.NewReader(cmd[1:]))
-	dec.DisallowUnknownFields()
-	if token, err := dec.Token(); err != nil || token != json.Delim('[') {
-		return nil, fmt.Errorf("delivery prepare batch must be an array")
-	}
-	items := make([]DeliveryPrepare, 0, MaxDeliveryPrepareItems)
-	for dec.More() {
-		if len(items) == MaxDeliveryPrepareItems {
-			return nil, fmt.Errorf("too many delivery prepare items")
-		}
-		var item DeliveryPrepare
-		if err := dec.Decode(&item); err != nil {
-			return nil, err
-		}
-		items = append(items, item)
-	}
-	if _, err := dec.Token(); err != nil {
-		return nil, err
-	}
-	var extra interface{}
-	if err := dec.Decode(&extra); err != io.EOF {
-		return nil, fmt.Errorf("trailing delivery prepare data")
-	}
-	return items, validatePrepares(items)
+	return unmarshalProtoPrepares(cmd)
 }
 
 func DeliveryStateKey(key []byte) []byte {
@@ -243,8 +211,7 @@ func (b *DeliveryBatch) Flush() error {
 	return nil
 }
 
-// Prepare applies a legacy single-key preparation without a command/result
-// encoding. Its validation matches PrepareDeliveryCmd for log compatibility.
+// Prepare validates and applies a single-key preparation without wire encoding.
 func (b *DeliveryBatch) Prepare(item DeliveryPrepare) (*DeliveryState, bool, error) {
 	if len(item.Key) != 24 {
 		return nil, false, fmt.Errorf("invalid delivery key length")
@@ -306,7 +273,7 @@ func (b *DeliveryBatch) Apply(cmd []byte) (statemachine.Result, [][]byte, error)
 		return statemachine.Result{}, nil, fmt.Errorf("empty delivery command")
 	}
 	switch CommandType(cmd[0]) {
-	case PrepareDeliveryBatchCmd, ProtoPrepareDeliveryBatchCmd:
+	case ProtoPrepareDeliveryBatchCmd:
 		items, err := UnmarshalPrepareDeliveryBatchCmd(cmd)
 		if err != nil {
 			return statemachine.Result{}, nil, err
@@ -315,22 +282,17 @@ func (b *DeliveryBatch) Apply(cmd []byte) (statemachine.Result, [][]byte, error)
 		if err != nil {
 			return statemachine.Result{}, nil, err
 		}
-		data, err := marshalPrepared(results, CommandType(cmd[0]) == PrepareDeliveryBatchCmd)
+		data, err := marshalPrepared(results)
 		return statemachine.Result{Value: uint64(len(results)), Data: data}, deleted, err
-	case PrepareDeliveryCmd, ProtoPrepareDeliveryCmd:
-		var prepare prepareDelivery
-		if CommandType(cmd[0]) == ProtoPrepareDeliveryCmd {
-			items, err := unmarshalProtoPrepares(cmd)
-			if err != nil {
-				return statemachine.Result{}, nil, err
-			}
-			if len(items) != 1 {
-				return statemachine.Result{}, nil, fmt.Errorf("single prepare must contain one key")
-			}
-			prepare = items[0]
-		} else if err := json.Unmarshal(cmd[1:], &prepare); err != nil {
+	case ProtoPrepareDeliveryCmd:
+		items, err := unmarshalProtoPrepares(cmd)
+		if err != nil {
 			return statemachine.Result{}, nil, err
 		}
+		if len(items) != 1 {
+			return statemachine.Result{}, nil, fmt.Errorf("single prepare must contain one key")
+		}
+		prepare := items[0]
 
 		state, removed, err := b.Prepare(prepare)
 		if err != nil {
@@ -342,18 +304,12 @@ func (b *DeliveryBatch) Apply(cmd []byte) (statemachine.Result, [][]byte, error)
 		if state == nil {
 			return statemachine.Result{}, nil, nil
 		}
-		data, err := marshalStateResult(state, CommandType(cmd[0]) == PrepareDeliveryCmd)
+		data, err := marshalDeliveryState(state)
 		return statemachine.Result{Value: 1, Data: data}, nil, err
 
-	case AckDeliveryBatchCmd, ProtoAckDeliveryBatchCmd:
-		var acks []DeliveryAck
-		if CommandType(cmd[0]) == ProtoAckDeliveryBatchCmd {
-			var err error
-			acks, err = unmarshalProtoAcks(cmd[1:])
-			if err != nil {
-				return statemachine.Result{}, nil, err
-			}
-		} else if err := json.Unmarshal(cmd[1:], &acks); err != nil {
+	case ProtoAckDeliveryBatchCmd:
+		acks, err := unmarshalProtoAcks(cmd[1:])
+		if err != nil {
 			return statemachine.Result{}, nil, err
 		}
 

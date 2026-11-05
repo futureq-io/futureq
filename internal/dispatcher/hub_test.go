@@ -2,7 +2,6 @@ package dispatcher
 
 import (
 	"context"
-	"encoding/json"
 	"path/filepath"
 	"testing"
 	"time"
@@ -11,9 +10,11 @@ import (
 	raft "github.com/futureq-io/futureq/internal/raft/event"
 	"github.com/futureq-io/futureq/internal/storage"
 	pb "github.com/futureq-io/protocol/proto/go"
+	deliverypb "github.com/futureq-io/protocol/proto/go/delivery"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 	"go.uber.org/zap"
+	"google.golang.org/protobuf/proto"
 )
 
 type HubSuite struct {
@@ -378,11 +379,12 @@ func TestStandaloneEpochDoesNotIgnoreCorruptReceipts(t *testing.T) {
 	key := putPipelineEvent(t, d, "orders", 1, time.Now().Add(-time.Second).UnixMilli())
 	batch := d.db.NewBatch()
 	defer batch.Close() //nolint:errcheck
-	require.NoError(t, batch.Set(raft.DeliveryStateKey(key), []byte("invalid JSON")))
+	require.NoError(t, batch.Set(raft.DeliveryStateKey(key), []byte("invalid receipt")))
 	require.NoError(t, batch.Commit(storage.Sync))
 	require.Error(t, d.hub.RestoreStandaloneEpoch(d.db))
-	data, err := json.Marshal(&raft.DeliveryState{Epoch: ^uint64(0)})
+	data, err := proto.Marshal(&deliverypb.DeliveryReceipt{Epoch: ^uint64(0)})
 	require.NoError(t, err)
+	data = append([]byte{'F', 'Q', 'R', 1}, data...)
 	batch = d.db.NewBatch()
 	defer batch.Close() //nolint:errcheck
 	require.NoError(t, batch.Set(raft.DeliveryStateKey(key), data))

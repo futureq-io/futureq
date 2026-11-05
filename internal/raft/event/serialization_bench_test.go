@@ -1,7 +1,6 @@
 package raft
 
 import (
-	"encoding/json"
 	"fmt"
 	"testing"
 
@@ -74,11 +73,12 @@ func BenchmarkDeliveryAckOverlay(b *testing.B) {
 
 func BenchmarkDeliveryPrepareSizing(b *testing.B) {
 	item := DeliveryPrepare{Key: utils.EventKey(1, 2, 3), Epoch: 123456789, Recipients: []string{"g:a", "g:b", "u:one", "g:<>&\u2028"}}
-	b.Run("json", func(b *testing.B) {
+	items := []DeliveryPrepare{item}
+	b.Run("protobuf", func(b *testing.B) {
 		total := 0
 		b.ReportAllocs()
 		for b.Loop() {
-			data, err := json.Marshal(item)
+			data, err := MarshalPrepareDeliveryBatchCmd(items)
 			if err != nil {
 				b.Fatal(err)
 			}

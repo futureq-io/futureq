@@ -17,16 +17,11 @@ const (
 	// DeleteBatchCmd atomically deletes a batch of message keys from Pebble.
 	// Used for Raft-replicated ACK-driven deletions and TTL expirations.
 	DeleteBatchCmd
-	// PrepareDeliveryCmd freezes independent fan-out recipients before sending.
-	PrepareDeliveryCmd
-	// AckDeliveryBatchCmd records recipient ACKs, deleting the payload only
-	// when all independent recipients have completed.
-	AckDeliveryBatchCmd
-	// PrepareDeliveryBatchCmd is appended for log compatibility. All voting
-	// replicas must support it before a broker enables batched preparation.
-	PrepareDeliveryBatchCmd
+	_ // 2: reserved for the removed JSON single-delivery preparation command.
+	_ // 3: reserved for the removed JSON delivery ACK command.
+	_ // 4: reserved for the removed JSON batch-delivery preparation command.
 
-	// Appended wire versions; legacy JSON tags remain readable during replay.
+	// Delivery commands use Protobuf exclusively.
 	ProtoPrepareDeliveryBatchCmd
 	ProtoAckDeliveryBatchCmd
 	ProtoPrepareDeliveryCmd

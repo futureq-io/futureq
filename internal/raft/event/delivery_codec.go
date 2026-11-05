@@ -2,7 +2,6 @@ package raft
 
 import (
 	"bytes"
-	"encoding/json"
 	"fmt"
 	"math/bits"
 	"sort"
@@ -17,18 +16,13 @@ var receiptPrefix = []byte{'F', 'Q', 'R', 1}
 var preparedPrefix = []byte{'F', 'Q', 'P', 1}
 var deliveryUnmarshal = proto.UnmarshalOptions{DiscardUnknown: true, RecursionLimit: 16}
 
-type legacyDeliveryState struct {
-	Epoch      uint64          `json:"epoch"`
-	Recipients map[string]bool `json:"recipients"`
-}
-
 func newDeliveryState(epoch uint64, recipients []string) *DeliveryState {
 	names := make([]string, len(recipients))
 	for i, r := range recipients {
 		names[i] = deliveryRecipient(r)
 	}
 	sort.Strings(names)
-	// Legacy single-key commands permitted duplicate recipients.
+	// Keep the frozen roster unique after recipient normalization.
 	unique := names[:0]
 	for _, name := range names {
 		if len(unique) == 0 || unique[len(unique)-1] != name {
@@ -38,31 +32,6 @@ func newDeliveryState(epoch uint64, recipients []string) *DeliveryState {
 	return &DeliveryState{Epoch: epoch, Recipients: unique, Acknowledged: make([]byte, (len(unique)+7)/8), remaining: len(unique)}
 }
 
-// MarshalJSON is exclusively for legacy log results and migration tests.
-func (s *DeliveryState) MarshalJSON() ([]byte, error) {
-	legacy := legacyDeliveryState{Epoch: s.Epoch, Recipients: make(map[string]bool, len(s.Recipients))}
-	for _, r := range s.Recipients {
-		legacy.Recipients[r] = !s.Needs(r)
-	}
-	return json.Marshal(legacy)
-}
-func (s *DeliveryState) UnmarshalJSON(data []byte) error {
-	var legacy legacyDeliveryState
-	if err := json.Unmarshal(data, &legacy); err != nil {
-		return err
-	}
-	names := make([]string, 0, len(legacy.Recipients))
-	for r := range legacy.Recipients {
-		names = append(names, r)
-	}
-	*s = *newDeliveryState(legacy.Epoch, names)
-	for r, acked := range legacy.Recipients {
-		if acked {
-			s.acknowledge(r)
-		}
-	}
-	return nil
-}
 func receiptProto(s *DeliveryState) *deliverypb.DeliveryReceipt {
 	if s == nil {
 		return nil
@@ -93,45 +62,25 @@ func receiptState(p *deliverypb.DeliveryReceipt) (*DeliveryState, error) {
 func marshalDeliveryState(s *DeliveryState) ([]byte, error) {
 	return proto.MarshalOptions{}.MarshalAppend(append([]byte(nil), receiptPrefix...), receiptProto(s))
 }
-func marshalStateResult(s *DeliveryState, legacy bool) ([]byte, error) {
-	if legacy {
-		return json.Marshal(s)
-	}
-	return marshalDeliveryState(s)
-}
 
-// UnmarshalDeliveryState reads both persisted formats. New writes use Protobuf.
+// UnmarshalDeliveryState reads a versioned Protobuf receipt.
 func UnmarshalDeliveryState(data []byte) (*DeliveryState, error) {
-	if bytes.HasPrefix(data, receiptPrefix) {
-		return decodeStoredReceipt(data[len(receiptPrefix):])
-	}
-	if len(bytes.TrimSpace(data)) == 0 || bytes.TrimSpace(data)[0] != '{' {
+	if !bytes.HasPrefix(data, receiptPrefix) {
 		return nil, fmt.Errorf("unknown delivery receipt format")
 	}
-	var state DeliveryState
-	if err := json.Unmarshal(data, &state); err != nil {
-		return nil, err
-	}
-	return &state, nil
+	return decodeStoredReceipt(data[len(receiptPrefix):])
 }
 
 // DeliveryStateEpoch avoids allocating the recipient roster during scans.
 func DeliveryStateEpoch(data []byte) (uint64, error) {
-	if bytes.HasPrefix(data, receiptPrefix) {
-		var p deliverypb.DeliveryReceiptEpoch
-		err := deliveryUnmarshal.Unmarshal(data[len(receiptPrefix):], &p)
-		return p.Epoch, err
+	if !bytes.HasPrefix(data, receiptPrefix) {
+		return 0, fmt.Errorf("unknown delivery receipt format")
 	}
-	state, err := UnmarshalDeliveryState(data)
-	if err != nil {
-		return 0, err
-	}
-	return state.Epoch, nil
+	var p deliverypb.DeliveryReceiptEpoch
+	err := deliveryUnmarshal.Unmarshal(data[len(receiptPrefix):], &p)
+	return p.Epoch, err
 }
-func marshalPrepared(items []DeliveryPrepared, legacy bool) ([]byte, error) {
-	if legacy {
-		return json.Marshal(items)
-	}
+func marshalPrepared(items []DeliveryPrepared) ([]byte, error) {
 	p := &deliverypb.DeliveryPreparedBatch{Items: make([]*deliverypb.DeliveryPrepared, len(items))}
 	for i, item := range items {
 		p.Items[i] = &deliverypb.DeliveryPrepared{Key: item.Key, State: receiptProto(item.State)}
@@ -140,9 +89,7 @@ func marshalPrepared(items []DeliveryPrepared, legacy bool) ([]byte, error) {
 }
 func UnmarshalDeliveryPrepared(data []byte) ([]DeliveryPrepared, error) {
 	if !bytes.HasPrefix(data, preparedPrefix) {
-		var items []DeliveryPrepared
-		err := json.Unmarshal(data, &items)
-		return items, err
+		return nil, fmt.Errorf("unknown delivery preparation result format")
 	}
 	var p deliverypb.DeliveryPreparedBatch
 	if err := deliveryUnmarshal.Unmarshal(data[len(preparedPrefix):], &p); err != nil {
@@ -386,7 +333,7 @@ func unmarshalProtoAcksGeneral(data []byte) ([]DeliveryAck, error) {
 	return acks, nil
 }
 
-// Match the previous JSON command normalization for invalid UTF-8 names.
+// Normalize invalid UTF-8 consistently in typed operations and Protobuf commands.
 func deliveryRecipient(s string) string {
 	if utf8.ValidString(s) {
 		return s
