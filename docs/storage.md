@@ -37,6 +37,8 @@ The stored value is the protobuf `StoredMessage` (topic, payload, enqueue time, 
 
 LSM-tree engine (`storage.pebble.*`). Scans and iterators run on internal snapshots, so reads never block writes. Options: disk or in-memory mode (`vfs.NewMem()` — same code path, nothing persists, WAL auto-disabled), WAL toggle (auto-off in clustered mode — the Raft log is the WAL), block cache (default 16MiB) and memtable size (default 64MiB).
 
+Bounded `NewIter` calls remember verified empty prefixes in a small in-memory cache. Later snapshots can seek past those prefixes instead of repeatedly walking point tombstones in `First()`. Writes invalidate overlapping proofs before and after commit; inserts behind a discovery cursor remain visible on the next cyclic scan. Pending writes and old snapshots cannot certify a raced gap. The cache retains at most 64 ranges and 64 probes with bounds up to 256 bytes, and starts empty after restart. It changes neither the on-disk format, delivery polling/retry intervals, nor payload cache-validity tokens. The first scan of an uncached range still pays the underlying traversal cost; scans over live receipts still examine them.
+
 ### bbolt
 
 Alternative single-file engine (`storage.engine: bolt`). One flat B+-tree bucket preserves the ordered keyspace. Reads use read-only transactions; scans run inside a single `db.View` with cursor seek/next. Batches are buffered and applied in one `db.Update`, which always fsyncs on commit — the sync-mode flag is ignored and `Flush` is a no-op.
