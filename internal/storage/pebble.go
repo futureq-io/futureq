@@ -14,6 +14,7 @@ import (
 // Pebble holds an open pebble database and implements storage.DB.
 type Pebble struct {
 	versions *cacheVersions
+	empty    pebbleEmptyRanges
 	db       *pebble.DB
 	logger   *zap.Logger
 }
@@ -88,14 +89,18 @@ func (p *Pebble) Get(key []byte) ([]byte, io.Closer, error) {
 }
 
 func (p *Pebble) NewBatch() Batch {
-	return &pebbleBatch{b: p.db.NewBatch(), versions: p.versions}
+	return &pebbleBatch{b: p.db.NewBatch(), versions: p.versions, empty: &p.empty}
 }
 
 // NewIter opens a snapshot internally and returns an iterator scoped to it.
 // Close() on the returned iterator releases both the iterator and the snapshot.
 func (p *Pebble) NewIter(opts *IterOptions) (Iterator, error) {
+	// Serialize snapshot capture with gap invalidation, never with commit I/O.
+	p.empty.mu.Lock()
 	validity := p.versions.snapshot()
 	snap := p.db.NewSnapshot()
+	probe, lower := p.empty.capture(opts)
+	p.empty.mu.Unlock()
 
 	var po *pebble.IterOptions
 	if opts != nil {
@@ -103,15 +108,19 @@ func (p *Pebble) NewIter(opts *IterOptions) (Iterator, error) {
 			LowerBound: opts.LowerBound,
 			UpperBound: opts.UpperBound,
 		}
+		if lower != nil {
+			po.LowerBound = lower
+		}
 	}
 
 	iter, err := snap.NewIter(po)
 	if err != nil {
+		p.empty.finish(probe, nil)
 		_ = snap.Close()
 		return nil, err
 	}
 
-	return &pebbleIterator{iter: iter, snap: snap, validity: validity}, nil
+	return &pebbleIterator{iter: iter, snap: snap, validity: validity, empty: &p.empty, probe: probe}, nil
 }
 
 func (p *Pebble) Scan(opts *IterOptions, yield func(key, value []byte) error) error {
@@ -149,6 +158,8 @@ func (p *Pebble) Close() error { return p.db.Close() }
 // ── pebbleBatch ───────────────────────────────────────────────────────────────
 
 type pebbleBatch struct {
+	empty     *pebbleEmptyRanges
+	sets      pebbleKeySpan
 	versions  *cacheVersions
 	mutations cacheMutations
 	b         *pebble.Batch
@@ -156,6 +167,7 @@ type pebbleBatch struct {
 
 func (pb *pebbleBatch) Set(key, value []byte) error {
 	pb.mutations.add(key, pb.versions)
+	pb.sets.include(key)
 	return pb.b.Set(key, value, nil)
 }
 func (pb *pebbleBatch) Delete(key []byte) error {
@@ -165,6 +177,10 @@ func (pb *pebbleBatch) Delete(key []byte) error {
 func (pb *pebbleBatch) Close() error { return pb.b.Close() }
 
 func (pb *pebbleBatch) Commit(mode SyncMode) error {
+	if pb.empty != nil {
+		done := pb.empty.begin(&pb.sets)
+		defer done()
+	}
 	if pb.versions != nil {
 		done := pb.versions.begin(&pb.mutations)
 		defer done()
@@ -182,18 +198,35 @@ func (pb *pebbleBatch) Commit(mode SyncMode) error {
 // pebbleIterator owns both the pebble.Iterator and the pebble.Snapshot it was
 // created from. Close() releases both so callers only manage one resource.
 type pebbleIterator struct {
+	empty    *pebbleEmptyRanges
+	probe    *pebbleEmptyProbe
 	validity *cacheSnapshot
 	iter     *pebble.Iterator
 	snap     *pebble.Snapshot
 }
 
-func (pi *pebbleIterator) First() bool   { return pi.iter.First() }
+func (pi *pebbleIterator) First() bool {
+	valid := pi.iter.First()
+	if pi.probe != nil {
+		var end []byte
+		if valid {
+			end = pi.iter.Key()
+		} else if pi.iter.Error() == nil {
+			end = pi.probe.upper
+		}
+		pi.empty.finish(pi.probe, end)
+		pi.probe = nil
+	}
+	return valid
+}
 func (pi *pebbleIterator) Next() bool    { return pi.iter.Next() }
 func (pi *pebbleIterator) Valid() bool   { return pi.iter.Valid() }
 func (pi *pebbleIterator) Key() []byte   { return pi.iter.Key() }
 func (pi *pebbleIterator) Value() []byte { return pi.iter.Value() }
 func (pi *pebbleIterator) Error() error  { return pi.iter.Error() }
 func (pi *pebbleIterator) Close() error {
+	pi.empty.finish(pi.probe, nil)
+	pi.probe = nil
 	iterErr := pi.iter.Close()
 	snapErr := pi.snap.Close()
 	if iterErr != nil {
