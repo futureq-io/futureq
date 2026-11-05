@@ -5,12 +5,14 @@ import (
 	"encoding/binary"
 	"fmt"
 	"hash/fnv"
+	"math"
 	"sort"
 	"sync"
 	"time"
 
 	"github.com/futureq-io/futureq/internal/metrics"
 	raft "github.com/futureq-io/futureq/internal/raft/event"
+	"github.com/futureq-io/futureq/internal/storage"
 	"github.com/futureq-io/futureq/pkg/raft/metadata"
 	pb "github.com/futureq-io/protocol/proto/go"
 	"go.uber.org/zap"
@@ -95,6 +97,11 @@ type TopicSubscription struct {
 
 	// universal: consumerID → *ConsumerEntry (fan-out consumers)
 	universal map[string]*ConsumerEntry
+
+	// Rebuilt under Hub.mu only when subscriptions change. Published snapshots
+	// own their maps/slices and remain immutable across later mutations.
+	groupsView    map[string][]*ConsumerEntry
+	universalView []*ConsumerEntry
 }
 
 // newTopicSubscription returns an empty TopicSubscription.
@@ -107,6 +114,7 @@ func newTopicSubscription() *TopicSubscription {
 
 // add inserts a consumer into the appropriate bucket.
 func (ts *TopicSubscription) add(c *ConsumerEntry) {
+	defer ts.rebuildSnapshots()
 	if c.IsUniversal() {
 		ts.universal[c.ID] = c
 		return
@@ -116,6 +124,7 @@ func (ts *TopicSubscription) add(c *ConsumerEntry) {
 
 // remove deletes a consumer. Returns true if the subscription is now empty.
 func (ts *TopicSubscription) remove(c *ConsumerEntry) bool {
+	defer ts.rebuildSnapshots()
 	if c.IsUniversal() {
 		delete(ts.universal, c.ID)
 	} else {
@@ -140,22 +149,24 @@ func (ts *TopicSubscription) isEmpty() bool {
 
 // groupSnapshot returns a snapshot of all groups (non-universal).
 func (ts *TopicSubscription) groupSnapshot() map[string][]*ConsumerEntry {
-	snap := make(map[string][]*ConsumerEntry, len(ts.groups))
-	for gid, consumers := range ts.groups {
-		cp := make([]*ConsumerEntry, len(consumers))
-		copy(cp, consumers)
-		snap[gid] = cp
-	}
-	return snap
+	return ts.groupsView
 }
 
 // universalSnapshot returns a snapshot of all universal consumers.
 func (ts *TopicSubscription) universalSnapshot() []*ConsumerEntry {
-	snap := make([]*ConsumerEntry, 0, len(ts.universal))
-	for _, c := range ts.universal {
-		snap = append(snap, c)
+	return ts.universalView
+}
+
+func (ts *TopicSubscription) rebuildSnapshots() {
+	groups := make(map[string][]*ConsumerEntry, len(ts.groups))
+	for id, consumers := range ts.groups {
+		groups[id] = append([]*ConsumerEntry(nil), consumers...)
 	}
-	return snap
+	universal := make([]*ConsumerEntry, 0, len(ts.universal))
+	for _, consumer := range ts.universal {
+		universal = append(universal, consumer)
+	}
+	ts.groupsView, ts.universalView = groups, universal
 }
 
 // ─── Hub ─────────────────────────────────────────────────────────────────────
@@ -594,4 +605,343 @@ func (h *Hub) GroupsForTopic(topic string) []string {
 		}
 	}
 	return result
+}
+
+// RestoreStandaloneEpoch runs before accepting subscriptions or starting any
+// workers. Existing receipts outlive the Hub, so a new process must start above
+// their epochs to retire its predecessor's ephemeral universal interests.
+func (h *Hub) RestoreStandaloneEpoch(db storage.DB) (err error) {
+	prefix := []byte("metadata/delivery/")
+	upper := append([]byte(nil), prefix...)
+	upper[len(upper)-1]++
+	iter, err := db.NewIter(&storage.IterOptions{LowerBound: prefix, UpperBound: upper})
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if closeErr := iter.Close(); err == nil {
+			err = closeErr
+		}
+	}()
+	var epoch uint64
+	for iter.First(); iter.Valid(); iter.Next() {
+		receiptEpoch, err := raft.DeliveryStateEpoch(iter.Value())
+		if err != nil {
+			return fmt.Errorf("read standalone delivery epoch: %w", err)
+		}
+		epoch = max(epoch, receiptEpoch)
+	}
+	if err := iter.Error(); err != nil {
+		return err
+	}
+	if epoch == math.MaxUint64 {
+		return fmt.Errorf("standalone delivery epoch exhausted")
+	}
+	h.mu.Lock()
+	h.registryEpoch = max(h.registryEpoch, epoch+1)
+	h.mu.Unlock()
+	return nil
+}
+
+type localGroup struct {
+	members   []metadata.ConsumerMember
+	consumers []*ConsumerEntry
+}
+
+// InterestView freezes both the local subscriptions and the global assignment
+// used to filter a chunk. Queueing still validates the live epoch under the
+// rebalance lock; this view is never itself a delivery permit.
+type InterestView struct {
+	Epoch      uint64
+	Active     bool
+	Recipients []string
+	groups     []localGroup
+	universal  []*ConsumerEntry
+}
+
+func (h *Hub) SetDeliveryView(source func(string) metadata.TopicDeliveryView) {
+	h.deliveryMu.Lock()
+	defer h.deliveryMu.Unlock()
+	h.deliveryView = source
+}
+
+func (h *Hub) InterestView(topic string) InterestView {
+	h.deliveryMu.RLock()
+	defer h.deliveryMu.RUnlock()
+	if !h.permitted() {
+		return InterestView{}
+	}
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	view := InterestView{Active: true, Epoch: h.registryEpoch}
+	var global metadata.TopicDeliveryView
+	if h.deliveryView != nil {
+		global = h.deliveryView(topic)
+		if !global.Active || global.Epoch != h.permitEpoch {
+			return InterestView{}
+		}
+		view.Epoch, view.Recipients = global.Epoch, global.Recipients
+	} else if h.version != nil {
+		view.Epoch = h.permitEpoch
+	}
+	sub := h.topics[topic]
+	if sub == nil {
+		return view
+	}
+	for group, consumers := range sub.groupSnapshot() {
+		entry := localGroup{consumers: consumers}
+		if h.deliveryView != nil {
+			entry.members = global.Groups[group]
+		} else if h.groupMembers != nil {
+			entry.members = h.groupMembers(topic, group)
+		}
+		// A non-nil membership source must not fall back to local ownership.
+		if (h.deliveryView != nil || h.groupMembers != nil) && len(entry.members) == 0 {
+			continue
+		}
+		view.groups = append(view.groups, entry)
+		if h.deliveryView == nil {
+			view.Recipients = append(view.Recipients, metadata.DeliveryRecipient(group, ""))
+		}
+	}
+	for id, consumer := range sub.universal {
+		eligible := h.deliveryView == nil
+		for _, member := range global.Groups[""] {
+			if member.ID == id {
+				eligible = true
+				break
+			}
+		}
+		if eligible {
+			view.universal = append(view.universal, consumer)
+		}
+		if h.deliveryView == nil {
+			view.Recipients = append(view.Recipients, metadata.DeliveryRecipient("", id))
+		}
+	}
+	return view
+}
+
+// localOwners uses the committed member order and deliveryOrdinal for every
+// represented group independently. In standalone mode any group member can
+// serve; selection remains with the configured dispatch strategy.
+func (v InterestView) localOwners(key []byte) []*ConsumerEntry {
+	owners := append([]*ConsumerEntry(nil), v.universal...)
+	for _, group := range v.groups {
+		if len(group.members) == 0 {
+			owners = append(owners, group.consumers...)
+			continue
+		}
+		id := group.members[deliveryOrdinal(key)%uint64(len(group.members))].ID
+		for _, consumer := range group.consumers {
+			if consumer.ID == id {
+				owners = append(owners, consumer)
+				break
+			}
+		}
+	}
+	return owners
+}
+
+func (h *Hub) hasReadyOwner(owners []*ConsumerEntry, key []byte) bool {
+	h.inFlightMu.Lock()
+	defer h.inFlightMu.Unlock()
+	for _, owner := range owners {
+		if owner.Group != "" {
+			reservation := groupDeliveryKey{topic: owner.Topic, group: owner.Group, key: string(key)}
+			if _, exists := h.groupInFlight[reservation]; exists {
+				continue
+			}
+		}
+		if _, exists := h.deliveryRecords[owner.ID][string(key)]; !exists {
+			return true
+		}
+	}
+	return false
+}
+
+func (h *Hub) DeliveryPermitted() bool {
+	h.deliveryMu.RLock()
+	defer h.deliveryMu.RUnlock()
+	return h.permitted()
+}
+
+func (h *Hub) DeliveryEpoch() (uint64, bool) {
+	h.deliveryMu.RLock()
+	defer h.deliveryMu.RUnlock()
+	if h.version != nil {
+		return h.version()
+	}
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.registryEpoch, true
+}
+
+func (h *Hub) PermitNeedsRenewal(budget time.Duration) bool {
+	h.deliveryMu.RLock()
+	defer h.deliveryMu.RUnlock()
+	return h.version != nil && (!h.permitted() || time.Until(h.permitUntil) <= budget)
+}
+
+// BeginSend validates the exact buffered pointer and authorizes the actual
+// attempt. ACKs are accepted only after this point. The in-flight drain keeps
+// rebalances safe while the network send runs outside these locks.
+func (h *Hub) BeginSend(consumerID string, msg *pb.QueueMessage) bool {
+	h.deliveryMu.RLock()
+	defer h.deliveryMu.RUnlock()
+	if !h.permitted() {
+		metrics.DeliveryRejectedTotal.WithLabelValues("permit").Inc()
+		return false
+	}
+	h.inFlightMu.Lock()
+	defer h.inFlightMu.Unlock()
+	record, exists := h.deliveryRecords[consumerID][string(msg.DeliveryTag)]
+	if !exists || record.sending || record.ackPending || record.message != msg || !time.Now().Before(record.expires) || (h.version != nil && record.epoch != h.permitEpoch) {
+		return false
+	}
+	if time.Now().UnixMilli() < msg.EnqueuedAtUnixMs+msg.DelayMs {
+		return false
+	}
+	record.sending = true
+	// The queue has its own bounded lifetime. Once a send starts, grant a full
+	// ACK window so time buffered behind another send does not shorten it.
+	record.expires = time.Now().Add(h.inFlightTimeout)
+	h.deliveryRecords[consumerID][string(msg.DeliveryTag)] = record
+	return true
+}
+
+// RejectQueuedAttempt cannot erase a retry with the same key: only the exact
+// buffered pointer can remove its record. Wake scanning to revisit the key.
+func (h *Hub) RejectQueuedAttempt(consumerID string, msg *pb.QueueMessage) {
+	h.inFlightMu.Lock()
+	record, exists := h.deliveryRecords[consumerID][string(msg.DeliveryTag)]
+	if exists && record.message == msg && !record.sending {
+		h.removeDeliveryRecordLocked(consumerID, string(msg.DeliveryTag))
+		keys := h.inFlightByConsumer[consumerID]
+		for i, key := range keys {
+			if string(key) == string(msg.DeliveryTag) {
+				h.inFlightByConsumer[consumerID] = append(keys[:i], keys[i+1:]...)
+				break
+			}
+		}
+	}
+	h.inFlightMu.Unlock()
+	select {
+	case h.wakeCh <- struct{}{}:
+	default:
+	}
+}
+
+// MarkAcknowledgedSent accepts a successful ACK once, retaining the delivery
+// record until persistence completes (or the normal timeout/disconnect).
+func (h *Hub) MarkAcknowledgedSent(consumerID string, key []byte) bool {
+	h.inFlightMu.Lock()
+	defer h.inFlightMu.Unlock()
+	record, exists := h.deliveryRecords[consumerID][string(key)]
+	if !exists || !record.sending || record.ackPending {
+		return false
+	}
+	record.ackPending = true
+	h.deliveryRecords[consumerID][string(key)] = record
+	return true
+}
+
+// RemoveAcknowledgedBatch releases only the recipients whose ACKs committed.
+// Other recipients may still need the same payload.
+func (h *Hub) RemoveAcknowledgedBatch(acks []raft.DeliveryAck) {
+	completed := make(map[string]map[string]bool)
+	for _, ack := range acks {
+		if completed[ack.Recipient] == nil {
+			completed[ack.Recipient] = make(map[string]bool)
+		}
+		completed[ack.Recipient][string(ack.Key)] = true
+	}
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	h.inFlightMu.Lock()
+	defer h.inFlightMu.Unlock()
+	for id, keys := range h.inFlightByConsumer {
+		consumer := h.byID[id]
+		if consumer == nil {
+			continue
+		}
+		done := completed[metadata.DeliveryRecipient(consumer.Group, id)]
+		if len(done) == 0 {
+			continue
+		}
+		kept := keys[:0]
+		for _, key := range keys {
+			if done[string(key)] {
+				h.removeDeliveryRecordLocked(id, string(key))
+			} else {
+				kept = append(kept, key)
+			}
+		}
+		h.inFlightByConsumer[id] = kept
+	}
+}
+
+// AcknowledgeSent releases a sent delivery immediately for a NACK.
+func (h *Hub) AcknowledgeSent(consumerID string, key []byte) bool {
+	h.inFlightMu.Lock()
+	defer h.inFlightMu.Unlock()
+	record, exists := h.deliveryRecords[consumerID][string(key)]
+	if !exists || !record.sending || record.ackPending {
+		return false
+	}
+	h.removeDeliveryRecordLocked(consumerID, string(key))
+	keys := h.inFlightByConsumer[consumerID]
+	for i, pending := range keys {
+		if string(pending) == string(key) {
+			h.inFlightByConsumer[consumerID] = append(keys[:i], keys[i+1:]...)
+			break
+		}
+	}
+	return true
+}
+
+func (h *Hub) ObserveQueues() {
+	h.mu.RLock()
+	depth := 0
+	for _, consumer := range h.byID {
+		depth += len(consumer.Ch)
+	}
+	h.mu.RUnlock()
+	h.inFlightMu.Lock()
+	oldest := int64(0)
+	now := time.Now().UnixMilli()
+	for _, records := range h.deliveryRecords {
+		for _, record := range records {
+			if !record.sending {
+				late := now - record.message.EnqueuedAtUnixMs - record.message.DelayMs
+				if late > oldest {
+					oldest = late
+				}
+			}
+		}
+	}
+	h.inFlightMu.Unlock()
+	metrics.DeliveryQueueDepth.WithLabelValues("consumer").Set(float64(depth))
+	metrics.DeliveryOldestQueuedLatenessMs.Set(float64(oldest))
+}
+
+// DeliveryViewCurrent checks authorization/version without rebuilding membership
+// copies per message. DispatchPrepared still checks live subscriptions and fences.
+func (h *Hub) DeliveryViewCurrent(topic string, epoch uint64) bool {
+	h.deliveryMu.RLock()
+	defer h.deliveryMu.RUnlock()
+	if !h.permitted() {
+		return false
+	}
+	if h.version != nil {
+		current, active := h.version()
+		return active && current == epoch
+	}
+	if h.deliveryView != nil {
+		view := h.deliveryView(topic)
+		return view.Active && view.Epoch == epoch
+	}
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.registryEpoch == epoch
 }

@@ -2,7 +2,6 @@ package dispatcher
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -105,7 +104,7 @@ func TestPrepareBatchValidatesManifestHitsWithoutEncoding(t *testing.T) {
 		return statemachine.Result{}, nil
 	}
 	for _, items := range [][]raft.DeliveryPrepare{
-		nil, {valid, valid}, {{Key: key, Epoch: 1, Recipients: []string{"bad"}}}, {{Key: key, Epoch: 1, Recipients: []string{"g:" + strings.Repeat("<", raft.MaxDeliveryPrepareBytes/6)}}},
+		nil, {valid, valid}, {{Key: key, Epoch: 1, Recipients: []string{"bad"}}}, {{Key: key, Epoch: 1, Recipients: []string{"g:" + strings.Repeat("<", raft.MaxDeliveryPrepareBytes)}}},
 	} {
 		_, err = ledger.PrepareBatch(context.Background(), items)
 		require.Error(t, err)
@@ -197,9 +196,9 @@ func TestPreparationSizingHonorsExactChunkBoundary(t *testing.T) {
 				require.NoError(t, err)
 				item.Epoch = view.Epoch
 			}
-			data, err := json.Marshal([]raft.DeliveryPrepare{item})
+			data, err := raft.MarshalPrepareDeliveryBatchCmd([]raft.DeliveryPrepare{item})
 			require.NoError(t, err)
-			d.Limits.Bytes = len(data) + 1
+			d.Limits.Bytes = len(data)
 			var chunk deliveryChunk
 			switch path {
 			case "scan":

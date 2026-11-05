@@ -1,103 +1,86 @@
 package raft
 
 import (
-	"encoding/base64"
-	"encoding/json"
 	"fmt"
-	"unicode/utf8"
+
+	"google.golang.org/protobuf/encoding/protowire"
 )
 
-// Go's JSON implementations can emit a replacement rune as either UTF-8 or
-// an escape. Determine its size once so byte limits match the active encoder.
-var jsonReplacementSize = func() int {
-	data, _ := json.Marshal("\xff")
-	return len(data) - 2
-}()
+// The scheduler passes one immutable recipient slice for an entire topic view.
+// Identity sharing avoids hashing/copying names for every candidate. Equal
+// slices with different backing arrays remain valid independent wire groups.
+type prepareViewKey struct {
+	epoch uint64
+	first *string
+	count int
+}
 
-// DeliveryPrepareSize is the exact encoding/json size of an item, without
-// allocating encoded bytes. Keep this in step with DeliveryPrepare's wire shape.
-func DeliveryPrepareSize(item DeliveryPrepare) int {
-	size := len(`{"key":,"epoch":,"recipients":}`)
-	if item.Key == nil {
-		size += 4 // null
-	} else {
-		size += 2 + base64.StdEncoding.EncodedLen(len(item.Key))
+func prepareView(item DeliveryPrepare) prepareViewKey {
+	key := prepareViewKey{epoch: item.Epoch, count: len(item.Recipients)}
+	if len(item.Recipients) > 0 {
+		key.first = &item.Recipients[0]
 	}
-	size++ // at least one decimal digit
-	for epoch := item.Epoch; epoch >= 10; epoch /= 10 {
-		size++
+	return key
+}
+func prepareViewSize(item DeliveryPrepare) int {
+	size := 0
+	if item.Epoch != 0 {
+		size += 1 + protowire.SizeVarint(item.Epoch)
 	}
-	if item.Recipients == nil {
-		return size + 4 // null
-	}
-	size += 2 // []
-	for i, recipient := range item.Recipients {
-		if i > 0 {
-			size++
-		}
-		size += jsonStringSize(recipient)
+	for _, r := range item.Recipients {
+		size += 1 + protowire.SizeBytes(len(deliveryRecipient(r)))
 	}
 	return size
 }
 
-// ValidateDeliveryPrepares checks the complete request, including its encoded
-// byte limit, even when every manifest is already present. It never encodes it.
+// DeliveryPrepareSizer accounts for shared recipient views and changing varint
+// lengths without encoding bytes. The zero value includes the command tag.
+type DeliveryPrepareSizer struct {
+	groups map[prepareViewKey]int
+	size   int
+}
+
+func (s *DeliveryPrepareSizer) next(item DeliveryPrepare) (prepareViewKey, int, int) {
+	key := prepareView(item)
+	old, exists := s.groups[key]
+	body := old
+	if !exists {
+		body = prepareViewSize(item)
+	}
+	body += 1 + protowire.SizeBytes(len(item.Key))
+	total := s.size
+	if total == 0 {
+		total = 1
+	}
+	total += 1 + protowire.SizeBytes(body)
+	if exists {
+		total -= 1 + protowire.SizeBytes(old)
+	}
+	return key, body, total
+}
+func (s *DeliveryPrepareSizer) SizeWith(item DeliveryPrepare) int {
+	_, _, size := s.next(item)
+	return size
+}
+func (s *DeliveryPrepareSizer) Add(item DeliveryPrepare) int {
+	key, body, size := s.next(item)
+	if s.groups == nil {
+		s.groups = make(map[prepareViewKey]int)
+	}
+	s.groups[key] = body
+	s.size = size
+	return size
+}
+func DeliveryPrepareSize(item DeliveryPrepare) int { var s DeliveryPrepareSizer; return s.Add(item) }
 func ValidateDeliveryPrepares(items []DeliveryPrepare) error {
 	if err := validatePrepares(items); err != nil {
 		return err
 	}
-	size := 3 // command tag and []
-	for i, item := range items {
-		if i > 0 {
-			size++
-		}
-		size += DeliveryPrepareSize(item)
-		if size > MaxDeliveryPrepareBytes {
+	var size DeliveryPrepareSizer
+	for _, item := range items {
+		if size.Add(item) > MaxDeliveryPrepareBytes {
 			return fmt.Errorf("delivery prepare batch exceeds %d bytes", MaxDeliveryPrepareBytes)
 		}
 	}
 	return nil
-}
-
-func jsonStringSize(s string) int {
-	size := 2 // quotes
-	for i := 0; i < len(s); {
-		c := s[i]
-		if c < utf8.RuneSelf {
-			switch c {
-			case '"', '\\', '\b', '\f', '\n', '\r', '\t':
-				size += 2
-			case '<', '>', '&':
-				size += 6 // encoding/json's default HTML escaping
-			default:
-				if c < 0x20 {
-					size += 6
-				} else {
-					size++
-				}
-			}
-			i++
-			continue
-		}
-		r, n := utf8.DecodeRuneInString(s[i:])
-		if r == utf8.RuneError && n == 1 {
-			size += jsonReplacementSize
-		} else if r == '\u2028' || r == '\u2029' {
-			size += 6
-		} else {
-			size += n
-		}
-		i += n
-	}
-	return size
-}
-
-// Match the former JSON command round trip for malformed UTF-8, replacing
-// each invalid byte separately. Valid recipient names retain their storage.
-func deliveryRecipient(s string) string {
-	if utf8.ValidString(s) {
-		return s
-	}
-	runes := []rune(s)
-	return string(runes)
 }

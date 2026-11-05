@@ -2,9 +2,10 @@ package raft
 
 import (
 	"bytes"
-	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/futureq-io/protocol/proto/go/delivery"
+	"google.golang.org/protobuf/proto"
 	"math"
 	"strings"
 	"testing"
@@ -15,24 +16,24 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestDeliveryPrepareSizeMatchesJSON(t *testing.T) {
+func TestDeliveryPrepareSizeMatchesProtobuf(t *testing.T) {
 	names := []string{"", "g:plain", "u:\"\\\b\f\n\r\t", "g:<>&", "g:\x00\x01\x1f", "g:فارسی日本語😀", "g:\u2028\u2029", "g:\xff\xfe", "g:\ufffd"}
 	for _, key := range [][]byte{nil, {}, make([]byte, 1), make([]byte, 23), make([]byte, 24), make([]byte, 25)} {
 		for _, epoch := range []uint64{0, 9, 10, 99, 100, math.MaxUint64} {
 			for _, recipients := range [][]string{nil, {}, names} {
 				item := DeliveryPrepare{Key: key, Epoch: epoch, Recipients: recipients}
-				encoded, err := json.Marshal(item)
+				encoded, err := proto.Marshal(&delivery.DeliveryPrepareBatch{Groups: []*delivery.DeliveryPrepareGroup{{Epoch: item.Epoch, Recipients: normalizedRecipients(item.Recipients), Keys: [][]byte{item.Key}}}})
 				require.NoError(t, err)
-				require.Equal(t, len(encoded), DeliveryPrepareSize(item), "%s", encoded)
+				require.Equal(t, len(encoded)+1, DeliveryPrepareSize(item), "%s", encoded)
 			}
 		}
 	}
 	// Exercise every byte, including all short escapes and invalid UTF-8.
 	for i := 0; i < 256; i++ {
 		item := DeliveryPrepare{Key: make([]byte, 24), Recipients: []string{"g:" + string([]byte{byte(i)})}}
-		encoded, err := json.Marshal(item)
+		encoded, err := proto.Marshal(&delivery.DeliveryPrepareBatch{Groups: []*delivery.DeliveryPrepareGroup{{Epoch: item.Epoch, Recipients: normalizedRecipients(item.Recipients), Keys: [][]byte{item.Key}}}})
 		require.NoError(t, err)
-		require.Equal(t, len(encoded), DeliveryPrepareSize(item))
+		require.Equal(t, len(encoded)+1, DeliveryPrepareSize(item))
 	}
 }
 
@@ -41,16 +42,20 @@ func FuzzDeliveryPrepareSize(f *testing.F) {
 	f.Add([]byte{}, uint64(math.MaxUint64), "")
 	f.Fuzz(func(t *testing.T, key []byte, epoch uint64, name string) {
 		item := DeliveryPrepare{Key: key, Epoch: epoch, Recipients: []string{name}}
-		data, err := json.Marshal(item)
+		data, err := proto.Marshal(&delivery.DeliveryPrepareBatch{Groups: []*delivery.DeliveryPrepareGroup{{Epoch: item.Epoch, Recipients: normalizedRecipients(item.Recipients), Keys: [][]byte{item.Key}}}})
 		require.NoError(t, err)
-		require.Equal(t, len(data), DeliveryPrepareSize(item))
+		require.Equal(t, len(data)+1, DeliveryPrepareSize(item))
 	})
 }
 
 func TestDeliveryPrepareValidationExactByteBoundary(t *testing.T) {
 	item := DeliveryPrepare{Key: make([]byte, 24), Epoch: math.MaxUint64, Recipients: []string{"g:x"}}
-	padding := MaxDeliveryPrepareBytes - 3 - DeliveryPrepareSize(item)
+	padding := MaxDeliveryPrepareBytes - DeliveryPrepareSize(item)
 	item.Recipients[0] += strings.Repeat("x", padding)
+	for DeliveryPrepareSize(item) > MaxDeliveryPrepareBytes {
+		item.Recipients[0] = item.Recipients[0][:len(item.Recipients[0])-1]
+	}
+	require.Equal(t, MaxDeliveryPrepareBytes, DeliveryPrepareSize(item))
 	require.NoError(t, ValidateDeliveryPrepares([]DeliveryPrepare{item}))
 	cmd, err := MarshalPrepareDeliveryBatchCmd([]DeliveryPrepare{item})
 	require.NoError(t, err)
@@ -118,11 +123,11 @@ func TestDeliveryCoalescesReceiptsAcrossRaftEntries(t *testing.T) {
 			}
 			results, err := sm.Update(entries)
 			require.NoError(t, err)
-			var initial []DeliveryPrepared
-			require.NoError(t, json.Unmarshal(results[1].Result.Data, &initial))
+			initial, err := UnmarshalDeliveryPrepared(results[1].Result.Data)
+			require.NoError(t, err)
 			require.True(t, initial[0].State.Needs("g:a"), "earlier results must describe their own log position")
-			var refreshed DeliveryState
-			require.NoError(t, json.Unmarshal(results[3].Result.Data, &refreshed))
+			refreshed, err := UnmarshalDeliveryState(results[3].Result.Data)
+			require.NoError(t, err)
 			require.False(t, refreshed.Needs("g:a"))
 			require.True(t, refreshed.Needs("g:b"), "later ACKs cannot change an earlier preparation result")
 			state, err := ReadDeliveryState(db, key)
@@ -181,5 +186,5 @@ func TestDeliveryDeleteStorePrepareDoesNotFlushOldReceipt(t *testing.T) {
 	require.NoError(t, err)
 	state, err := ReadDeliveryState(db, key)
 	require.NoError(t, err)
-	require.Equal(t, &DeliveryState{Epoch: 2, Recipients: map[string]bool{"g:fresh": false}}, state)
+	require.Equal(t, newDeliveryState(2, []string{"g:fresh"}), state)
 }

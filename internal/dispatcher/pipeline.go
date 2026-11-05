@@ -2,7 +2,6 @@ package dispatcher
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"sync/atomic"
 	"time"
@@ -13,7 +12,7 @@ import (
 	"github.com/futureq-io/futureq/internal/storage"
 	"github.com/futureq-io/futureq/pkg/utils"
 	pb "github.com/futureq-io/protocol/proto/go"
-	storagepb "github.com/futureq-io/protocol/proto/go/storage"
+	deliverypb "github.com/futureq-io/protocol/proto/go/delivery"
 	"go.uber.org/zap"
 	"google.golang.org/protobuf/proto"
 )
@@ -97,11 +96,8 @@ func (d *Dispatcher) collectTopic(topic string, nowMs int64) deliveryChunk {
 		return chunk
 	}
 	defer iter.Close() //nolint:errcheck
-	examined, bytesRead, commandBytes := 0, 0, 3
-	itemBytes := 0
-	if !d.scanOnly {
-		itemBytes = raft.DeliveryPrepareSize(raft.DeliveryPrepare{Key: make([]byte, 24), Epoch: view.Epoch, Recipients: view.Recipients})
-	}
+	examined, bytesRead := 0, 0
+	var commandSize raft.DeliveryPrepareSizer
 	valid := iter.First()
 	for valid {
 		// Iterator setup may consume the entire time budget. Examine one key
@@ -160,11 +156,7 @@ func (d *Dispatcher) collectTopic(topic string, nowMs int64) deliveryChunk {
 		// recipients and enforces preparation command bytes when selecting due
 		// entries; avoid serialising a speculative recipient set twice.
 		if !d.scanOnly {
-			addedBytes := itemBytes
-			if len(chunk.items) > 0 {
-				addedBytes++ // comma between items
-			}
-			if commandBytes+addedBytes > d.Limits.Bytes {
+			if commandSize.SizeWith(item) > d.Limits.Bytes {
 				// Revisit this item next chunk rather than advancing past a byte
 				// boundary. A single oversized interest set is reported explicitly.
 				cursor.after = append([]byte(nil), key...)
@@ -173,7 +165,7 @@ func (d *Dispatcher) collectTopic(topic string, nowMs int64) deliveryChunk {
 				}
 				break
 			}
-			commandBytes += addedBytes
+			commandSize.Add(item)
 		}
 
 		chunk.items = append(chunk.items, item)
@@ -221,7 +213,8 @@ func (d *Dispatcher) collectMaintenance() deliveryChunk {
 		return chunk
 	}
 	defer iter.Close() //nolint:errcheck
-	examined, bytesRead, commandBytes := 0, 0, 3
+	examined, bytesRead := 0, 0
+	var commandSize raft.DeliveryPrepareSizer
 	valid := iter.First()
 	for valid {
 		// Maintenance must also advance when iterator setup exhausts the
@@ -237,40 +230,33 @@ func (d *Dispatcher) collectMaintenance() deliveryChunk {
 			valid = iter.Next()
 			continue
 		}
-		var state raft.DeliveryState
-		if json.Unmarshal(value, &state) != nil {
+		receiptEpoch, err := raft.DeliveryStateEpoch(value)
+		if err != nil || receiptEpoch >= epochNow {
 			valid = iter.Next()
 			continue
 		}
-		if state.Epoch >= epochNow {
-			valid = iter.Next()
-			continue
-		}
+
 		eventKey := key[len(prefix):]
 		payload, closer, err := d.db.Get(eventKey)
 		if err != nil {
 			valid = iter.Next()
 			continue
 		}
-		var msg storagepb.StoredMessage
-		err = proto.Unmarshal(payload, &msg)
+		var msg deliverypb.StoredMessageMetadata
+		err = proto.UnmarshalOptions{DiscardUnknown: true}.Unmarshal(payload, &msg)
 		_ = closer.Close()
 		if err != nil {
 			valid = iter.Next()
 			continue
 		}
 		epoch, recipients, active := d.MaintenanceRecipients(msg.Topic)
-		if active && epoch > state.Epoch {
+		if active && epoch > receiptEpoch {
 			item := raft.DeliveryPrepare{Key: append([]byte(nil), eventKey...), Epoch: epoch, Recipients: recipients}
-			addedBytes := raft.DeliveryPrepareSize(item)
-			if len(chunk.items) > 0 {
-				addedBytes++
-			}
-			if commandBytes+addedBytes > d.Limits.Bytes {
+			if commandSize.SizeWith(item) > d.Limits.Bytes {
 				cursor.after = append([]byte(nil), key...)
 				break
 			}
-			commandBytes += addedBytes
+			commandSize.Add(item)
 			chunk.items = append(chunk.items, item)
 		}
 		valid = iter.Next()
@@ -358,8 +344,7 @@ func (d *Dispatcher) deliverChunk(chunk deliveryChunk, states map[string]*raft.D
 			metrics.DeliveryRejectedTotal.WithLabelValues("permit").Inc()
 			break
 		}
-		view := d.hub.InterestView(chunk.topic)
-		if !view.Active || view.Epoch != item.Epoch {
+		if !d.hub.DeliveryViewCurrent(chunk.topic, item.Epoch) {
 			break
 		}
 		manifest := states[string(item.Key)]

@@ -2,7 +2,6 @@ package dispatcher
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"sync"
 	"time"
@@ -88,7 +87,7 @@ func (l *DeliveryLedger) PrepareBatch(ctx context.Context, items []raft.Delivery
 			result, err = l.apply(cmd)
 		}
 		if err == nil {
-			err = json.Unmarshal(result.Data, &prepared)
+			prepared, err = raft.UnmarshalDeliveryPrepared(result.Data)
 		}
 	}
 	if err != nil {
@@ -128,6 +127,9 @@ func (l *DeliveryLedger) Prepare(topic string, key []byte) (*raft.DeliveryState,
 		return state, nil
 	}
 	if l.propose == nil {
+		if err := raft.ValidateDeliveryPrepares([]raft.DeliveryPrepare{{Key: key, Epoch: epoch, Recipients: recipients}}); err != nil {
+			return nil, err
+		}
 		var prepared *raft.DeliveryState
 		err := l.applyLocal(storage.Sync, func(batch *raft.DeliveryBatch) ([][]byte, error) {
 			var removed bool
@@ -151,11 +153,7 @@ func (l *DeliveryLedger) Prepare(topic string, key []byte) (*raft.DeliveryState,
 	if err != nil || len(result.Data) == 0 {
 		return nil, err
 	}
-	var prepared raft.DeliveryState
-	if err := json.Unmarshal(result.Data, &prepared); err != nil {
-		return nil, err
-	}
-	return &prepared, nil
+	return raft.UnmarshalDeliveryState(result.Data)
 }
 
 func (l *DeliveryLedger) Acknowledge(acks []raft.DeliveryAck) error {
@@ -177,7 +175,7 @@ func (l *DeliveryLedger) apply(cmd []byte) (statemachine.Result, error) {
 		return l.propose(cmd)
 	}
 	mode := storage.Sync
-	if raft.CommandType(cmd[0]) == raft.AckDeliveryBatchCmd {
+	if raft.CommandType(cmd[0]) == raft.AckDeliveryBatchCmd || raft.CommandType(cmd[0]) == raft.ProtoAckDeliveryBatchCmd {
 		mode = storage.NoSync
 	}
 	var result statemachine.Result

@@ -24,8 +24,8 @@ func TestBatchPrepareOverlayAckDeleteEpochAndSnapshot(t *testing.T) {
 	require.NoError(t, err)
 	entries, err := sm.Update([]statemachine.Entry{{Index: 1, Cmd: store}, {Index: 2, Cmd: prepare}, {Index: 3, Cmd: ack}, {Index: 4, Cmd: refresh}})
 	require.NoError(t, err)
-	var prepared []DeliveryPrepared
-	require.NoError(t, json.Unmarshal(entries[3].Result.Data, &prepared))
+	prepared, err := UnmarshalDeliveryPrepared(entries[3].Result.Data)
+	require.NoError(t, err)
 	require.Len(t, prepared, 2)
 	require.Equal(t, a, prepared[0].Key)
 	require.Nil(t, prepared[1].State)

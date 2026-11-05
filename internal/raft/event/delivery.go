@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 
 	"github.com/futureq-io/futureq/internal/storage"
@@ -16,24 +17,29 @@ import (
 // Named group receipts survive disconnects and reassignment. Universal
 // subscriptions are ephemeral and lose their interest when unregistered.
 type DeliveryState struct {
-	Epoch      uint64          `json:"epoch"`
-	Recipients map[string]bool `json:"recipients"` // recipient -> acknowledged
+	Epoch        uint64
+	Recipients   []string // sorted, unique frozen roster
+	Acknowledged []byte   // bit i corresponds to Recipients[i]
+	remaining    int      // derived on read; updated only by the first ACK for a recipient
 }
 
 func (s *DeliveryState) Needs(recipient string) bool {
 	if s == nil {
 		return false
 	}
-	acked, exists := s.Recipients[recipient]
-	return exists && !acked
+	i := sort.SearchStrings(s.Recipients, recipient)
+	return i < len(s.Recipients) && s.Recipients[i] == recipient && (i/8 >= len(s.Acknowledged) || s.Acknowledged[i/8]&(1<<uint(i%8)) == 0)
 }
 
-func (s *DeliveryState) complete() bool {
-	for _, acked := range s.Recipients {
-		if !acked {
-			return false
-		}
+func (s *DeliveryState) complete() bool { return s.remaining == 0 }
+
+func (s *DeliveryState) acknowledge(recipient string) bool {
+	if !s.Needs(recipient) {
+		return false
 	}
+	i := sort.SearchStrings(s.Recipients, recipient)
+	s.Acknowledged[i/8] |= 1 << uint(i%8)
+	s.remaining--
 	return true
 }
 
@@ -68,15 +74,21 @@ func validatePrepares(items []DeliveryPrepare) error {
 	if len(items) == 0 || len(items) > MaxDeliveryPrepareItems {
 		return fmt.Errorf("delivery prepare batch must contain 1..%d items", MaxDeliveryPrepareItems)
 	}
-	seen := make(map[string]bool, len(items))
+	seen := make(map[[24]byte]bool, len(items))
+	views := make(map[prepareViewKey]bool)
 	for _, item := range items {
-		if len(item.Key) != 24 || seen[string(item.Key)] {
+		if len(item.Key) != 24 || seen[[24]byte(item.Key)] {
 			return fmt.Errorf("invalid or duplicate delivery key")
 		}
-		seen[string(item.Key)] = true
+		seen[[24]byte(item.Key)] = true
 		if len(item.Recipients) > MaxDeliveryRecipients {
 			return fmt.Errorf("too many delivery recipients")
 		}
+		view := prepareView(item)
+		if views[view] {
+			continue
+		}
+		views[view] = true
 		recipients := make(map[string]bool, len(item.Recipients))
 		for _, recipient := range item.Recipients {
 			recipient = deliveryRecipient(recipient)
@@ -90,22 +102,15 @@ func validatePrepares(items []DeliveryPrepare) error {
 }
 
 func MarshalPrepareDeliveryBatchCmd(items []DeliveryPrepare) ([]byte, error) {
-	if err := validatePrepares(items); err != nil {
-		return nil, err
-	}
-	data, err := json.Marshal(items)
-	if err != nil {
-		return nil, err
-	}
-	if len(data)+1 > MaxDeliveryPrepareBytes {
-		return nil, fmt.Errorf("delivery prepare batch exceeds %d bytes", MaxDeliveryPrepareBytes)
-	}
-	return append([]byte{byte(PrepareDeliveryBatchCmd)}, data...), nil
+	return marshalProtoPrepares(items, ProtoPrepareDeliveryBatchCmd)
 }
 
 // Decode incrementally and check the count before allocating another item.
 // Validation completes before any mutations are added to the overlay.
 func UnmarshalPrepareDeliveryBatchCmd(cmd []byte) ([]DeliveryPrepare, error) {
+	if len(cmd) > 0 && (CommandType(cmd[0]) == ProtoPrepareDeliveryBatchCmd || CommandType(cmd[0]) == ProtoPrepareDeliveryCmd) {
+		return unmarshalProtoPrepares(cmd)
+	}
 	if len(cmd) < 3 || len(cmd) > MaxDeliveryPrepareBytes || CommandType(cmd[0]) != PrepareDeliveryBatchCmd {
 		return nil, fmt.Errorf("invalid delivery prepare batch size or tag")
 	}
@@ -148,21 +153,15 @@ func ReadDeliveryState(db storage.DB, key []byte) (*DeliveryState, error) {
 		return nil, err
 	}
 	defer closer.Close() //nolint:errcheck
-	var state DeliveryState
-	if err := json.Unmarshal(data, &state); err != nil {
-		return nil, err
-	}
-	return &state, nil
+	return UnmarshalDeliveryState(data)
 }
 
 func MarshalPrepareDeliveryCmd(key []byte, epoch uint64, recipients []string) ([]byte, error) {
-	data, err := json.Marshal(prepareDelivery{Key: key, Epoch: epoch, Recipients: recipients})
-	return append([]byte{byte(PrepareDeliveryCmd)}, data...), err
+	return marshalProtoPrepares([]DeliveryPrepare{{Key: key, Epoch: epoch, Recipients: recipients}}, ProtoPrepareDeliveryCmd)
 }
 
 func MarshalAckDeliveryBatchCmd(acks []DeliveryAck) ([]byte, error) {
-	data, err := json.Marshal(acks)
-	return append([]byte{byte(AckDeliveryBatchCmd)}, data...), err
+	return marshalProtoAcks(acks)
 }
 
 // DeliveryBatch overlays uncommitted mutations so several prepares, ACKs, and
@@ -232,7 +231,7 @@ func (b *DeliveryBatch) save(key []byte, state *DeliveryState) {
 // storage batch have updated the overlay. Deleted receipts require no encoding.
 func (b *DeliveryBatch) Flush() error {
 	for key := range b.dirty {
-		data, err := json.Marshal(b.states[key])
+		data, err := marshalDeliveryState(b.states[key])
 		if err != nil {
 			return err
 		}
@@ -289,7 +288,7 @@ func (b *DeliveryBatch) Acknowledge(acks []DeliveryAck) ([][]byte, error) {
 		if state == nil || !state.Needs(recipient) {
 			continue
 		}
-		state.Recipients[recipient] = true
+		state.acknowledge(recipient)
 		if state.complete() {
 			if err := b.Delete(ack.Key); err != nil {
 				return nil, err
@@ -307,7 +306,7 @@ func (b *DeliveryBatch) Apply(cmd []byte) (statemachine.Result, [][]byte, error)
 		return statemachine.Result{}, nil, fmt.Errorf("empty delivery command")
 	}
 	switch CommandType(cmd[0]) {
-	case PrepareDeliveryBatchCmd:
+	case PrepareDeliveryBatchCmd, ProtoPrepareDeliveryBatchCmd:
 		items, err := UnmarshalPrepareDeliveryBatchCmd(cmd)
 		if err != nil {
 			return statemachine.Result{}, nil, err
@@ -316,13 +315,23 @@ func (b *DeliveryBatch) Apply(cmd []byte) (statemachine.Result, [][]byte, error)
 		if err != nil {
 			return statemachine.Result{}, nil, err
 		}
-		data, err := json.Marshal(results)
+		data, err := marshalPrepared(results, CommandType(cmd[0]) == PrepareDeliveryBatchCmd)
 		return statemachine.Result{Value: uint64(len(results)), Data: data}, deleted, err
-	case PrepareDeliveryCmd:
+	case PrepareDeliveryCmd, ProtoPrepareDeliveryCmd:
 		var prepare prepareDelivery
-		if err := json.Unmarshal(cmd[1:], &prepare); err != nil {
+		if CommandType(cmd[0]) == ProtoPrepareDeliveryCmd {
+			items, err := unmarshalProtoPrepares(cmd)
+			if err != nil {
+				return statemachine.Result{}, nil, err
+			}
+			if len(items) != 1 {
+				return statemachine.Result{}, nil, fmt.Errorf("single prepare must contain one key")
+			}
+			prepare = items[0]
+		} else if err := json.Unmarshal(cmd[1:], &prepare); err != nil {
 			return statemachine.Result{}, nil, err
 		}
+
 		state, removed, err := b.Prepare(prepare)
 		if err != nil {
 			return statemachine.Result{}, nil, err
@@ -333,14 +342,21 @@ func (b *DeliveryBatch) Apply(cmd []byte) (statemachine.Result, [][]byte, error)
 		if state == nil {
 			return statemachine.Result{}, nil, nil
 		}
-		data, err := json.Marshal(state)
+		data, err := marshalStateResult(state, CommandType(cmd[0]) == PrepareDeliveryCmd)
 		return statemachine.Result{Value: 1, Data: data}, nil, err
 
-	case AckDeliveryBatchCmd:
+	case AckDeliveryBatchCmd, ProtoAckDeliveryBatchCmd:
 		var acks []DeliveryAck
-		if err := json.Unmarshal(cmd[1:], &acks); err != nil {
+		if CommandType(cmd[0]) == ProtoAckDeliveryBatchCmd {
+			var err error
+			acks, err = unmarshalProtoAcks(cmd[1:])
+			if err != nil {
+				return statemachine.Result{}, nil, err
+			}
+		} else if err := json.Unmarshal(cmd[1:], &acks); err != nil {
 			return statemachine.Result{}, nil, err
 		}
+
 		deleted, err := b.Acknowledge(acks)
 		return statemachine.Result{Value: uint64(len(deleted))}, deleted, err
 	default:
@@ -361,10 +377,7 @@ func (b *DeliveryBatch) prepare(prepare DeliveryPrepare) (*DeliveryState, bool, 
 		if len(prepare.Recipients) == 0 {
 			return nil, false, nil
 		}
-		state = &DeliveryState{Epoch: prepare.Epoch, Recipients: make(map[string]bool)}
-		for _, recipient := range prepare.Recipients {
-			state.Recipients[deliveryRecipient(recipient)] = false
-		}
+		state = newDeliveryState(prepare.Epoch, prepare.Recipients)
 	} else if prepare.Epoch > state.Epoch {
 		active := make(map[string]bool, len(prepare.Recipients))
 		for _, recipient := range prepare.Recipients {
@@ -372,9 +385,9 @@ func (b *DeliveryBatch) prepare(prepare DeliveryPrepare) (*DeliveryState, bool, 
 		}
 		// Fixed named interests and ACK bits survive re-preparation. Only
 		// vanished ephemeral universal interests are completed on epoch change.
-		for recipient := range state.Recipients {
+		for _, recipient := range state.Recipients {
 			if strings.HasPrefix(recipient, "u:") && !active[recipient] {
-				state.Recipients[recipient] = true
+				state.acknowledge(recipient)
 			}
 		}
 		state.Epoch = prepare.Epoch

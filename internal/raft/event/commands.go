@@ -25,6 +25,11 @@ const (
 	// PrepareDeliveryBatchCmd is appended for log compatibility. All voting
 	// replicas must support it before a broker enables batched preparation.
 	PrepareDeliveryBatchCmd
+
+	// Appended wire versions; legacy JSON tags remain readable during replay.
+	ProtoPrepareDeliveryBatchCmd
+	ProtoAckDeliveryBatchCmd
+	ProtoPrepareDeliveryCmd
 )
 
 // StoreBatchItem is the minimal per-message metadata carried in a StoreBatchCmd.

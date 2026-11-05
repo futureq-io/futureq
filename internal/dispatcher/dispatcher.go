@@ -11,8 +11,6 @@ import (
 	"github.com/futureq-io/futureq/internal/config"
 	raft "github.com/futureq-io/futureq/internal/raft/event"
 	"github.com/futureq-io/futureq/internal/storage"
-
-	storagepb "github.com/futureq-io/protocol/proto/go/storage"
 )
 
 // inFlightEntry tracks a single message that has been sent to a consumer but
@@ -165,9 +163,12 @@ func (d *Dispatcher) isInFlight(key []byte) bool {
 }
 
 // isExpired returns true if the message's TTL has elapsed.
-func (d *Dispatcher) isExpired(msg *storagepb.StoredMessage, nowMs int64) bool {
-	if msg.TtlMs <= 0 {
+func (d *Dispatcher) isExpired(msg interface {
+	GetTtlMs() int64
+	GetEnqueuedAtUnixMs() int64
+}, nowMs int64) bool {
+	if msg.GetTtlMs() <= 0 {
 		return false
 	}
-	return nowMs >= msg.EnqueuedAtUnixMs+msg.TtlMs
+	return nowMs >= msg.GetEnqueuedAtUnixMs()+msg.GetTtlMs()
 }

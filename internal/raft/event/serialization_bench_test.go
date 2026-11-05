@@ -20,11 +20,11 @@ func BenchmarkDeliveryAckOverlay(b *testing.B) {
 			}
 			defer db.Close()
 			key := utils.EventKey(1, 2, 3)
-			state := &DeliveryState{Epoch: 1, Recipients: make(map[string]bool, fanout)}
+			state := &DeliveryState{Epoch: 1, Recipients: make([]string, fanout)}
 			cmds := make([][]byte, fanout-1) // keep one interest pending
 			for i := 0; i < fanout; i++ {
 				recipient := fmt.Sprintf("g:%d", i)
-				state.Recipients[recipient] = false
+				state.Recipients[i] = recipient
 				if i < len(cmds) {
 					cmds[i], err = MarshalAckDeliveryBatchCmd([]DeliveryAck{{Key: key, Recipient: recipient}})
 					if err != nil {
@@ -32,7 +32,8 @@ func BenchmarkDeliveryAckOverlay(b *testing.B) {
 					}
 				}
 			}
-			data, err := json.Marshal(state)
+			state = newDeliveryState(state.Epoch, state.Recipients)
+			data, err := marshalDeliveryState(state)
 			if err != nil {
 				b.Fatal(err)
 			}
