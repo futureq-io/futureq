@@ -41,7 +41,7 @@ func (l *DeliveryLedger) PrepareBatch(ctx context.Context, items []raft.Delivery
 		}
 	}()
 	// Validate even the inputs whose manifests are already present.
-	if _, err := raft.MarshalPrepareDeliveryBatchCmd(items); err != nil {
+	if err := raft.ValidateDeliveryPrepares(items); err != nil {
 		return nil, err
 	}
 	states := make(map[string]*raft.DeliveryState, len(items))
@@ -64,23 +64,34 @@ func (l *DeliveryLedger) PrepareBatch(ctx context.Context, items []raft.Delivery
 	if len(missing) == 0 {
 		return states, nil
 	}
-	cmd, err := raft.MarshalPrepareDeliveryBatchCmd(missing)
-	if err != nil {
-		return nil, err
-	}
 	metrics.DeliveryPrepareProposalsTotal.Inc()
 	metrics.DeliveryPrepareKeys.Observe(float64(len(missing)))
-	var result statemachine.Result
-	if l.ProposeContext != nil {
-		result, err = l.ProposeContext(ctx, cmd)
+	var prepared []raft.DeliveryPrepared
+	var err error
+	if l.propose == nil && l.ProposeContext == nil {
+		err = l.applyLocal(storage.Sync, func(batch *raft.DeliveryBatch) ([][]byte, error) {
+			var deleted [][]byte
+			var err error
+			prepared, deleted, err = batch.PrepareBatch(missing)
+			return deleted, err
+		})
 	} else {
-		result, err = l.apply(cmd)
+		var cmd []byte
+		cmd, err = raft.MarshalPrepareDeliveryBatchCmd(missing)
+		if err != nil {
+			return nil, err
+		}
+		var result statemachine.Result
+		if l.ProposeContext != nil {
+			result, err = l.ProposeContext(ctx, cmd)
+		} else {
+			result, err = l.apply(cmd)
+		}
+		if err == nil {
+			err = json.Unmarshal(result.Data, &prepared)
+		}
 	}
 	if err != nil {
-		return nil, err
-	}
-	var prepared []raft.DeliveryPrepared
-	if err := json.Unmarshal(result.Data, &prepared); err != nil {
 		return nil, err
 	}
 	if len(prepared) != len(missing) {
@@ -116,6 +127,22 @@ func (l *DeliveryLedger) Prepare(topic string, key []byte) (*raft.DeliveryState,
 	if state != nil && state.Epoch >= epoch {
 		return state, nil
 	}
+	if l.propose == nil {
+		var prepared *raft.DeliveryState
+		err := l.applyLocal(storage.Sync, func(batch *raft.DeliveryBatch) ([][]byte, error) {
+			var removed bool
+			var err error
+			prepared, removed, err = batch.Prepare(raft.DeliveryPrepare{Key: key, Epoch: epoch, Recipients: recipients})
+			if removed {
+				return [][]byte{key}, err
+			}
+			return nil, err
+		})
+		if err != nil {
+			return nil, err
+		}
+		return prepared, nil
+	}
 	cmd, err := raft.MarshalPrepareDeliveryCmd(key, epoch, recipients)
 	if err != nil {
 		return nil, err
@@ -132,6 +159,11 @@ func (l *DeliveryLedger) Prepare(topic string, key []byte) (*raft.DeliveryState,
 }
 
 func (l *DeliveryLedger) Acknowledge(acks []raft.DeliveryAck) error {
+	if l.propose == nil {
+		return l.applyLocal(storage.NoSync, func(batch *raft.DeliveryBatch) ([][]byte, error) {
+			return batch.Acknowledge(acks)
+		})
+	}
 	cmd, err := raft.MarshalAckDeliveryBatchCmd(acks)
 	if err != nil {
 		return err
@@ -144,8 +176,26 @@ func (l *DeliveryLedger) apply(cmd []byte) (statemachine.Result, error) {
 	if l.propose != nil {
 		return l.propose(cmd)
 	}
-	stage := "prepare"
+	mode := storage.Sync
 	if raft.CommandType(cmd[0]) == raft.AckDeliveryBatchCmd {
+		mode = storage.NoSync
+	}
+	var result statemachine.Result
+	err := l.applyLocal(mode, func(batch *raft.DeliveryBatch) ([][]byte, error) {
+		var deleted [][]byte
+		var err error
+		result, deleted, err = batch.Apply(cmd)
+		return deleted, err
+	})
+	if err != nil {
+		return statemachine.Result{}, err
+	}
+	return result, nil
+}
+
+func (l *DeliveryLedger) applyLocal(mode storage.SyncMode, apply func(*raft.DeliveryBatch) ([][]byte, error)) error {
+	stage := "prepare"
+	if mode == storage.NoSync {
 		stage = "ack"
 	}
 	lockStarted := time.Now()
@@ -155,28 +205,28 @@ func (l *DeliveryLedger) apply(cmd []byte) (statemachine.Result, error) {
 	batch := l.db.NewBatch()
 	defer batch.Close() //nolint:errcheck
 	applyStarted := time.Now()
-	result, deleted, err := raft.NewDeliveryBatch(l.db, batch).Apply(cmd)
+	delivery := raft.NewDeliveryBatch(l.db, batch)
+	deleted, err := apply(delivery)
+	if err == nil {
+		err = delivery.Flush()
+	}
 	metrics.DeliveryPrepareDurationMs.WithLabelValues(stage + "_apply").Observe(float64(time.Since(applyStarted).Nanoseconds()) / 1e6)
 	if err != nil {
-		return statemachine.Result{}, err
+		return err
 	}
 
 	// Preparation must be durable before delivery; only ACK persistence may
 	// trade crash durability for throughput (duplicates remain permissible).
-	mode := storage.Sync
-	if raft.CommandType(cmd[0]) == raft.AckDeliveryBatchCmd {
-		mode = storage.NoSync
-	}
 	commitStarted := time.Now()
 	commitErr := batch.Commit(mode)
 	metrics.DeliveryPrepareDurationMs.WithLabelValues(stage + "_commit").Observe(float64(time.Since(commitStarted).Nanoseconds()) / 1e6)
 	if commitErr != nil {
-		return statemachine.Result{}, commitErr
+		return commitErr
 	}
 	if len(deleted) > 0 && l.OnDelete != nil {
 		l.OnDelete(deleted)
 	}
-	return result, nil
+	return nil
 }
 
 func (l *DeliveryLedger) DeleteKeys(keys [][]byte) error {

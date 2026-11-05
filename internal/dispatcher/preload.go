@@ -3,7 +3,6 @@ package dispatcher
 import (
 	"bytes"
 	"container/heap"
-	"encoding/json"
 	"io"
 	"sync/atomic"
 	"time"
@@ -145,14 +144,21 @@ func (d *Dispatcher) collectPreloaded(topic string, p *topicPreload, view Intere
 		d.observePreload()
 	}()
 	commandBytes, examined := 3, 0
+	itemBytes := 0
+	if len(p.items) > 0 && p.items[0].due <= nowMs {
+		itemBytes = raft.DeliveryPrepareSize(raft.DeliveryPrepare{Key: make([]byte, 24), Epoch: view.Epoch, Recipients: view.Recipients})
+	}
 	for len(p.items) > 0 && p.items[0].due <= nowMs {
 		if examined >= d.Limits.Examined || len(chunk.items) >= d.Limits.Candidates || (examined > 0 && time.Since(started) >= d.Limits.WorkTime) || !d.hub.DeliveryPermitted() {
 			break
 		}
 		candidate := p.items[0]
 		item := raft.DeliveryPrepare{Key: append([]byte(nil), candidate.key[:]...), Epoch: view.Epoch, Recipients: view.Recipients}
-		encoded, err := json.Marshal(item)
-		if err == nil && commandBytes+len(encoded)+1 > d.Limits.Bytes && len(chunk.items) > 0 {
+		addedBytes := itemBytes
+		if len(chunk.items) > 0 {
+			addedBytes++
+		}
+		if commandBytes+addedBytes > d.Limits.Bytes && len(chunk.items) > 0 {
 			break // retain this candidate for a subsequent bounded chunk
 		}
 		heap.Pop(&p.items)
@@ -164,7 +170,7 @@ func (d *Dispatcher) collectPreloaded(topic string, p *topicPreload, view Intere
 			d.preloadCount--
 		}
 		examined++
-		if err != nil || commandBytes+len(encoded)+1 > d.Limits.Bytes {
+		if commandBytes+addedBytes > d.Limits.Bytes {
 			chunk.unfit = true
 			d.logger.Error("delivery interests exceed preparation byte limit", zap.String("topic", topic), zap.Int("limit", d.Limits.Bytes))
 			metrics.DeliveryRejectedTotal.WithLabelValues("prepare_bytes").Inc()
@@ -174,7 +180,7 @@ func (d *Dispatcher) collectPreloaded(topic string, p *topicPreload, view Intere
 		if len(owners) == 0 || !d.hub.hasReadyOwner(owners, item.Key) {
 			continue
 		}
-		commandBytes += len(encoded) + 1
+		commandBytes += addedBytes
 		source := "preload"
 		if candidate.ready {
 			source = "scan"

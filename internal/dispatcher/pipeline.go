@@ -98,6 +98,10 @@ func (d *Dispatcher) collectTopic(topic string, nowMs int64) deliveryChunk {
 	}
 	defer iter.Close() //nolint:errcheck
 	examined, bytesRead, commandBytes := 0, 0, 3
+	itemBytes := 0
+	if !d.scanOnly {
+		itemBytes = raft.DeliveryPrepareSize(raft.DeliveryPrepare{Key: make([]byte, 24), Epoch: view.Epoch, Recipients: view.Recipients})
+	}
 	valid := iter.First()
 	for valid {
 		// Iterator setup may consume the entire time budget. Examine one key
@@ -156,8 +160,11 @@ func (d *Dispatcher) collectTopic(topic string, nowMs int64) deliveryChunk {
 		// recipients and enforces preparation command bytes when selecting due
 		// entries; avoid serialising a speculative recipient set twice.
 		if !d.scanOnly {
-			encoded, err := json.Marshal(item)
-			if err != nil || commandBytes+len(encoded)+1 > d.Limits.Bytes {
+			addedBytes := itemBytes
+			if len(chunk.items) > 0 {
+				addedBytes++ // comma between items
+			}
+			if commandBytes+addedBytes > d.Limits.Bytes {
 				// Revisit this item next chunk rather than advancing past a byte
 				// boundary. A single oversized interest set is reported explicitly.
 				cursor.after = append([]byte(nil), key...)
@@ -166,7 +173,7 @@ func (d *Dispatcher) collectTopic(topic string, nowMs int64) deliveryChunk {
 				}
 				break
 			}
-			commandBytes += len(encoded) + 1
+			commandBytes += addedBytes
 		}
 
 		chunk.items = append(chunk.items, item)
@@ -255,12 +262,15 @@ func (d *Dispatcher) collectMaintenance() deliveryChunk {
 		epoch, recipients, active := d.MaintenanceRecipients(msg.Topic)
 		if active && epoch > state.Epoch {
 			item := raft.DeliveryPrepare{Key: append([]byte(nil), eventKey...), Epoch: epoch, Recipients: recipients}
-			encoded, err := json.Marshal(item)
-			if err != nil || commandBytes+len(encoded)+1 > d.Limits.Bytes {
+			addedBytes := raft.DeliveryPrepareSize(item)
+			if len(chunk.items) > 0 {
+				addedBytes++
+			}
+			if commandBytes+addedBytes > d.Limits.Bytes {
 				cursor.after = append([]byte(nil), key...)
 				break
 			}
-			commandBytes += len(encoded) + 1
+			commandBytes += addedBytes
 			chunk.items = append(chunk.items, item)
 		}
 		valid = iter.Next()

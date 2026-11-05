@@ -164,6 +164,9 @@ func (s *EventStateMachine) Update(entries []statemachine.Entry) ([]statemachine
 		}
 	}
 
+	if err := delivery.Flush(); err != nil {
+		return nil, err
+	}
 	if lastID > s.lastPersistedID {
 		if err := s.repo.PersistLastID(batch, lastID); err != nil {
 			return nil, fmt.Errorf("raft: PersistLastID: %w", err)

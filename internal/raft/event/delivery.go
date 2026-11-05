@@ -79,6 +79,7 @@ func validatePrepares(items []DeliveryPrepare) error {
 		}
 		recipients := make(map[string]bool, len(item.Recipients))
 		for _, recipient := range item.Recipients {
+			recipient = deliveryRecipient(recipient)
 			if len(recipient) <= 2 || (!strings.HasPrefix(recipient, "g:") && !strings.HasPrefix(recipient, "u:")) || recipients[recipient] {
 				return fmt.Errorf("invalid or duplicate delivery recipient")
 			}
@@ -166,11 +167,13 @@ func MarshalAckDeliveryBatchCmd(acks []DeliveryAck) ([]byte, error) {
 
 // DeliveryBatch overlays uncommitted mutations so several prepares, ACKs, and
 // deletes in one Dragonboat Update see each other, rather than stale DB reads.
+// Call Flush before committing the storage batch to persist final receipts.
 type DeliveryBatch struct {
 	db      storage.DB
 	batch   storage.Batch
 	states  map[string]*DeliveryState
 	present map[string]bool
+	dirty   map[string]bool
 }
 
 func NewDeliveryBatch(db storage.DB, batch storage.Batch) *DeliveryBatch {
@@ -188,6 +191,7 @@ func (b *DeliveryBatch) Delete(key []byte) error {
 	}
 	b.present[string(key)] = false
 	b.states[string(key)] = nil
+	delete(b.dirty, string(key))
 	return nil
 }
 
@@ -216,16 +220,86 @@ func (b *DeliveryBatch) exists(key []byte) (bool, error) {
 	return true, closer.Close()
 }
 
-func (b *DeliveryBatch) save(key []byte, state *DeliveryState) ([]byte, error) {
-	data, err := json.Marshal(state)
-	if err != nil {
-		return nil, err
-	}
-	if err := b.batch.Set(DeliveryStateKey(key), data); err != nil {
-		return nil, err
-	}
+func (b *DeliveryBatch) save(key []byte, state *DeliveryState) {
 	b.states[string(key)] = state
-	return data, nil
+	if b.dirty == nil {
+		b.dirty = make(map[string]bool)
+	}
+	b.dirty[string(key)] = true
+}
+
+// Flush serializes each surviving receipt once, after all commands in this
+// storage batch have updated the overlay. Deleted receipts require no encoding.
+func (b *DeliveryBatch) Flush() error {
+	for key := range b.dirty {
+		data, err := json.Marshal(b.states[key])
+		if err != nil {
+			return err
+		}
+		if err := b.batch.Set(DeliveryStateKey([]byte(key)), data); err != nil {
+			return err
+		}
+		delete(b.dirty, key)
+	}
+	return nil
+}
+
+// Prepare applies a legacy single-key preparation without a command/result
+// encoding. Its validation matches PrepareDeliveryCmd for log compatibility.
+func (b *DeliveryBatch) Prepare(item DeliveryPrepare) (*DeliveryState, bool, error) {
+	if len(item.Key) != 24 {
+		return nil, false, fmt.Errorf("invalid delivery key length")
+	}
+	return b.prepare(item)
+}
+
+// PrepareBatch validates all inputs before changing the overlay.
+func (b *DeliveryBatch) PrepareBatch(items []DeliveryPrepare) ([]DeliveryPrepared, [][]byte, error) {
+	if err := ValidateDeliveryPrepares(items); err != nil {
+		return nil, nil, err
+	}
+	return b.prepareBatch(items)
+}
+
+func (b *DeliveryBatch) prepareBatch(items []DeliveryPrepare) ([]DeliveryPrepared, [][]byte, error) {
+	results := make([]DeliveryPrepared, 0, len(items))
+	var deleted [][]byte
+	for _, item := range items {
+		state, removed, err := b.prepare(item)
+		if err != nil {
+			return nil, nil, err
+		}
+		results = append(results, DeliveryPrepared{Key: item.Key, State: state})
+		if removed {
+			deleted = append(deleted, item.Key)
+		}
+	}
+	return results, deleted, nil
+}
+
+// Acknowledge applies typed ACKs to the same overlay used by Raft commands.
+func (b *DeliveryBatch) Acknowledge(acks []DeliveryAck) ([][]byte, error) {
+	var deleted [][]byte
+	for _, ack := range acks {
+		state, err := b.load(ack.Key)
+		if err != nil {
+			return nil, err
+		}
+		recipient := deliveryRecipient(ack.Recipient)
+		if state == nil || !state.Needs(recipient) {
+			continue
+		}
+		state.Recipients[recipient] = true
+		if state.complete() {
+			if err := b.Delete(ack.Key); err != nil {
+				return nil, err
+			}
+			deleted = append(deleted, ack.Key)
+		} else {
+			b.save(ack.Key, state)
+		}
+	}
+	return deleted, nil
 }
 
 func (b *DeliveryBatch) Apply(cmd []byte) (statemachine.Result, [][]byte, error) {
@@ -238,17 +312,9 @@ func (b *DeliveryBatch) Apply(cmd []byte) (statemachine.Result, [][]byte, error)
 		if err != nil {
 			return statemachine.Result{}, nil, err
 		}
-		results := make([]DeliveryPrepared, 0, len(items))
-		var deleted [][]byte
-		for _, item := range items {
-			state, removed, err := b.prepare(item)
-			if err != nil {
-				return statemachine.Result{}, nil, err
-			}
-			results = append(results, DeliveryPrepared{Key: item.Key, State: state})
-			if removed {
-				deleted = append(deleted, item.Key)
-			}
+		results, deleted, err := b.prepareBatch(items)
+		if err != nil {
+			return statemachine.Result{}, nil, err
 		}
 		data, err := json.Marshal(results)
 		return statemachine.Result{Value: uint64(len(results)), Data: data}, deleted, err
@@ -257,10 +323,7 @@ func (b *DeliveryBatch) Apply(cmd []byte) (statemachine.Result, [][]byte, error)
 		if err := json.Unmarshal(cmd[1:], &prepare); err != nil {
 			return statemachine.Result{}, nil, err
 		}
-		if len(prepare.Key) != 24 {
-			return statemachine.Result{}, nil, fmt.Errorf("invalid delivery key length")
-		}
-		state, removed, err := b.prepare(prepare)
+		state, removed, err := b.Prepare(prepare)
 		if err != nil {
 			return statemachine.Result{}, nil, err
 		}
@@ -278,26 +341,8 @@ func (b *DeliveryBatch) Apply(cmd []byte) (statemachine.Result, [][]byte, error)
 		if err := json.Unmarshal(cmd[1:], &acks); err != nil {
 			return statemachine.Result{}, nil, err
 		}
-		var deleted [][]byte
-		for _, ack := range acks {
-			state, err := b.load(ack.Key)
-			if err != nil {
-				return statemachine.Result{}, nil, err
-			}
-			if state == nil || !state.Needs(ack.Recipient) {
-				continue
-			}
-			state.Recipients[ack.Recipient] = true
-			if state.complete() {
-				if err := b.Delete(ack.Key); err != nil {
-					return statemachine.Result{}, nil, err
-				}
-				deleted = append(deleted, ack.Key)
-			} else if _, err := b.save(ack.Key, state); err != nil {
-				return statemachine.Result{}, nil, err
-			}
-		}
-		return statemachine.Result{Value: uint64(len(deleted))}, deleted, nil
+		deleted, err := b.Acknowledge(acks)
+		return statemachine.Result{Value: uint64(len(deleted))}, deleted, err
 	default:
 		return statemachine.Result{}, nil, fmt.Errorf("invalid delivery command %d", cmd[0])
 	}
@@ -318,12 +363,12 @@ func (b *DeliveryBatch) prepare(prepare DeliveryPrepare) (*DeliveryState, bool, 
 		}
 		state = &DeliveryState{Epoch: prepare.Epoch, Recipients: make(map[string]bool)}
 		for _, recipient := range prepare.Recipients {
-			state.Recipients[recipient] = false
+			state.Recipients[deliveryRecipient(recipient)] = false
 		}
 	} else if prepare.Epoch > state.Epoch {
 		active := make(map[string]bool, len(prepare.Recipients))
 		for _, recipient := range prepare.Recipients {
-			active[recipient] = true
+			active[deliveryRecipient(recipient)] = true
 		}
 		// Fixed named interests and ACK bits survive re-preparation. Only
 		// vanished ephemeral universal interests are completed on epoch change.
@@ -337,6 +382,6 @@ func (b *DeliveryBatch) prepare(prepare DeliveryPrepare) (*DeliveryState, bool, 
 	if state.complete() {
 		return nil, true, b.Delete(prepare.Key)
 	}
-	_, err = b.save(prepare.Key, state)
-	return state, false, err
+	b.save(prepare.Key, state)
+	return state, false, nil
 }
