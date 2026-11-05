@@ -7,7 +7,7 @@ go 1.27.1
 require (
 	github.com/cespare/xxhash/v2 v2.3.0
 	github.com/cockroachdb/pebble/v2 v2.1.7
-	github.com/futureq-io/protocol/proto/go v0.2.0
+	github.com/futureq-io/protocol/proto/go v0.3.0
 	github.com/futureq-io/sdk/go v0.1.1
 	github.com/google/uuid v1.6.0
 	github.com/lni/dragonboat/v4 v4.0.0-20250723143628-076c7f6497dc
@@ -84,5 +84,3 @@ require (
 	golang.org/x/text v0.42.0 // indirect
 	google.golang.org/genproto v0.0.0-20230410155749-daa745c078e1 // indirect
 )
-
-replace github.com/futureq-io/protocol/proto/go => ../futureq-proto/proto/go
