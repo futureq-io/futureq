@@ -155,7 +155,7 @@ func startRun(cmd *cobra.Command, _ []string) {
 	disp.Limits = dispatcher.ScanLimits{
 		Candidates: cfg.Delivery.PrepareBatchSize, Examined: cfg.Delivery.ScanMaxKeys,
 		Bytes: int(prepareBytes), WorkTime: cfg.Delivery.ScanWorkBudget,
-		PrepareTimeout: cfg.Delivery.PrepareTimeout, Workers: cfg.Delivery.PrepareWorkers,
+		ValidationTimeout: cfg.Delivery.ValidationTimeout, Workers: cfg.Delivery.DeliveryWorkers,
 	}
 	a.Subscriptions.ApplyLocal = ledger.ApplySubscription
 	ledger.OnDelete = func(keys [][]byte) {

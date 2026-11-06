@@ -109,9 +109,15 @@ output does not increase the number of freshness slots; XXH128 is not supported.
 | `delivery.inFlightTimeout`          | `5s`    | How long an unacknowledged delivery blocks redelivery; after it expires the message is re-dispatched (at-least-once). |
 | `delivery.deleteBatchInterval`      | `500ms` | How often the deleter flushes its batch of keys to delete (one Raft proposal per batch in clustered mode). |
 | `delivery.deleteWorkers`            | `16` | Maximum concurrent ACK/delete flushes in Raft mode (1..256). Pending and in-progress completions share the existing queue bound. Standalone flushes remain serial. |
+| `delivery.deliveryWorkers`          | `2` | Delivery-worker concurrency (1..16), with at most one job per topic. Workers validate payloads, read receipts, check permissions, and queue sends. |
+| `delivery.validationTimeout`        | `250ms` | Cooperative deadline for payload validation and receipt reads, greater than zero and at most 1s. Excludes final authorization, sender queueing, and gRPC sending. |
 | `delivery.ttlsweepInterval`         | `60s`   | How often the TTL janitor sweeps the whole database for expired messages. |
 
 All four intervals and the in-flight timeout must be greater than zero.
+
+`deliveryWorkers` and `validationTimeout` replace `prepareWorkers` and
+`prepareTimeout`. Update YAML keys and environment overrides to
+`FUTUREQ_DELIVERY_DELIVERYWORKERS` and `FUTUREQ_DELIVERY_VALIDATIONTIMEOUT`.
 
 Preloading works in standalone and clustered mode. Configure it independently of
 preparation batch sizes and quorum reads:

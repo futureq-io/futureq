@@ -122,8 +122,8 @@ uses those same functions. It is not a second sender algorithm.
 
 A scan reserves result slots before dispatch. Future reservations plus retained
 future entries never exceed `preloadMaxMessages`. Due discovery has a separate
-allowance of `max(discoveryWorkers, prepareWorkers) * prepareBatchSize`, so future entries cannot exclude overdue
-arrivals. Assigned jobs have the existing `prepareWorkers * prepareBatchSize`
+allowance of `max(discoveryWorkers, deliveryWorkers) * prepareBatchSize`, so future entries cannot exclude overdue
+arrivals. Assigned jobs have the existing `deliveryWorkers * prepareBatchSize`
 bound. A heap pop clears its backing slot; sparse heaps/maps rebuild at one-quarter
 occupancy, bounding capacity by a constant factor. Topic removal clears its data
 and atomically invalidates its generation. Old scan results are admitted only to
@@ -208,7 +208,7 @@ are smaller than that default envelope. It is configurable, and internal storage
 can contain larger valid messages. None are truncated or permanently rejected by
 a byte cap. These memory figures are estimates, not universal maximums.
 
-Let `C=preloadMaxMessages`, `B=prepareBatchSize`, `W=prepareWorkers`,
+Let `C=preloadMaxMessages`, `B=prepareBatchSize`, `W=deliveryWorkers`,
 `D=discoveryWorkers`, and `Q` be
 a consumer's configured channel capacity. With defaults C=512, B=64, W=2, D=2:
 
