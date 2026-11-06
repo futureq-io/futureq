@@ -24,7 +24,7 @@ FutureQ speaks gRPC; protobuf definitions live in [futureq-io/protocol](https://
 - Exactly one `PublishBatchAck{success, error_message}` is sent per received batch — **batch-level** semantics: the batch fails atomically (no partial write) on negative delays/TTLs, a too-weak ack level, or non-leader contact in Raft mode. On failure the RPC-level gRPC status also carries the error.
 - An empty batch returns a default (unsuccessful) ack and performs no write.
 - Client half-close (EOF) ends the stream cleanly.
-- Ack levels: `QUORUM` (default; returns after Raft quorum commit), `LEADER` (returns after the leader durably persists the entry — see [ack levels](clustering.md#publish-ack-levels)), `NO_ACK` (fire-and-forget). The broker's `publish.minAckLevel` floors what clients may request.
+- Ack levels: `QUORUM` (default; returns after quorum commit and successful admission during apply), `LEADER` (returns after the leader durably persists the entry with frozen destinations — see [ack levels](clustering.md#publish-ack-levels)), `NO_ACK` (submission only, with preselected destinations). The broker's `publish.minAckLevel` floors what clients may request.
 - In Raft mode only the event-shard leader accepts writes; standalone always writes directly to storage with fsync.
 - Destinations are frozen at publication and persisted atomically with each
   payload. Every active durable group or universal subscription is included,
@@ -32,6 +32,11 @@ FutureQ speaks gRPC; protobuf definitions live in [futureq-io/protocol](https://
   publications.
 - If any topic in a batch has no subscriptions, the whole batch fails with
   `FailedPrecondition`. Call `CreateSubscription` before publishing.
+- Quorum admission uses subscription state at the publish entry in Raft order;
+  it needs no separate admission read. Leader and no-ACK modes select destinations
+  before proposal using a fresh registry read. An unroutable batch writes no
+  messages. Standalone publishes persist payload and destinations together in
+  one synchronous batch.
 
 ## CreateSubscription and Unsubscribe
 

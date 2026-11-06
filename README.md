@@ -98,8 +98,11 @@ Fan-out retention means an incomplete named group can retain a payload until it
 ACKs, reconnects and ACKs, or the message expires/is explicitly deleted. Publishing
 to a topic with no registered destinations fails with `FailedPrecondition`;
 offline groups and universal subscriptions are valid destinations. Subscriptions
-survive broker restarts until explicit unsubscribe or configured expiry. Publication
-checks event-shard registry freshness in Raft mode. Delivery reads the already committed receipt,
+survive broker restarts until explicit unsubscribe or configured expiry. Quorum
+publishes select destinations during ordered Raft apply, without an admission
+quorum read. Leader and no-ACK publishes first refresh the event-shard registry
+and freeze destinations in their log command so early acceptance has known
+delivery obligations. Each path stores payload and receipt atomically. Delivery reads the already committed receipt,
 without another preparation commit or per-batch quorum barrier, while retaining
 bounded ownership permits and actual-send fencing.
 

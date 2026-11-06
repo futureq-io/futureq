@@ -100,16 +100,24 @@ func (s *EventStateMachine) applyEntry(batch storage.Batch, delivery *DeliveryBa
 	case SubscriptionCmd:
 		result, deleted, err := delivery.ApplySubscription(cmd)
 		return result, deleted, 0, err
-	case StoreBatchCmd, StoreDeliveryBatchCmd:
+	case StoreBatchCmd, StoreDeliveryBatchCmd, PublishBatchCmd:
 		var items []StoreBatchItem
 		var err error
-		if CommandType(cmd[0]) == StoreDeliveryBatchCmd {
+		if CommandType(cmd[0]) == PublishBatchCmd {
+			items, err = UnmarshalPublishBatchCmd(cmd)
+		} else if CommandType(cmd[0]) == StoreDeliveryBatchCmd {
 			items, err = UnmarshalStoreDeliveryBatchCmd(cmd)
 		} else {
 			items, err = UnmarshalStoreBatchCmd(cmd)
 		}
 		if err != nil {
 			return statemachine.Result{}, nil, 0, fmt.Errorf("raft: invalid StoreBatchCmd: %w", err)
+		}
+		if CommandType(cmd[0]) == PublishBatchCmd {
+			result, admitted, err := delivery.bindPublishRecipients(items)
+			if err != nil || !admitted {
+				return result, nil, 0, err
+			}
 		}
 		var maxID uint64
 		for _, it := range items {
