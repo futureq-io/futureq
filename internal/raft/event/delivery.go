@@ -14,6 +14,9 @@ import (
 // Named group receipts survive disconnects and reassignment. Universal
 // subscriptions are ephemeral and lose their interest when unregistered.
 type DeliveryState struct {
+	// PublishBound rosters are committed atomically with the payload. Assignment
+	// epochs fence workers, but cannot change a message's durable destinations.
+	PublishBound bool
 	Epoch        uint64
 	Recipients   []string // sorted, unique frozen roster
 	Acknowledged []byte   // bit i corresponds to Recipients[i]

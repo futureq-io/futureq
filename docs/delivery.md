@@ -29,13 +29,17 @@ The scheduler selects exact due times independently of scans and quorum work.
 A separate bounded due allowance keeps ordinary delivery working when either
 future setting is zero and when the future cache is full.
 
-A timer wakes at eligible cached deadlines. Recipients are captured when due,
-using current ownership and epoch. Delivery workers prepare receipts, perform the
-post-preparation read barrier, validate payload versions, read current committed
-ACK state, recheck exact due time/TTL and enqueue through the existing Hub.
+A timer wakes at eligible cached deadlines. Destinations were already frozen at
+publication and committed atomically with the payload. Delivery workers read that
+receipt without another write or per-batch read barrier, validate payload
+versions, read locally applied committed ACK state, recheck exact due time/TTL
+and enqueue through the existing Hub. Clustered workers still need a valid
+ownership permit, renewed by periodic quorum reads. Lagging replicas can produce
+duplicates before observing another replica's ACK, as allowed by at-least-once.
 Valid cached data avoids a second full-payload Get/decode in final delivery;
-uncertain/invalidated data uses a counted fresh-read fallback. Preparation still
-performs existence reads. The original permit and actual-send fences remain.
+uncertain/invalidated data uses a counted fresh-read fallback. The original
+permit and actual-send fences remain. Background maintenance retires disconnected
+universal interests; it never removes an incomplete named-group obligation.
 
 Due and future cursors are independent cyclic scan positions, never completion
 watermarks. Late arrivals, retries, rejected admission and stale results recover
@@ -54,6 +58,18 @@ Each consumer registers with a topic and a group and gets a UUID and a buffered 
 | Universal     | empty        | **Fan-out**: every universal consumer receives every message; they never compete with each other or with groups. |
 
 Different groups each get an independent copy of each message. Delivery to a channel is *non-blocking*: a slow consumer with a full channel is skipped for that message (with a warning) and, if no consumer in the topic accepted it, the message is simply not marked in-flight and is retried on the next pass.
+
+A named group is durably registered on its first subscription, independently of
+its current worker sessions. Publishes include every registered named group,
+including groups with no connected workers. Their backlogs survive disconnects
+and broker restart. Groups registered after publication do not receive older
+messages. There is currently no group deletion API. TTL and explicit message
+deletion still override pending obligations.
+
+Universal subscriptions remain ephemeral: only those registered when publishing
+are included, and their interests are released after disconnect. A publish batch
+containing a topic with no durable groups or live universal subscribers is
+rejected atomically with `FailedPrecondition`.
 
 ## In-flight tracking & redelivery
 

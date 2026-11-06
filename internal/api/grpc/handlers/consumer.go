@@ -15,6 +15,7 @@ import (
 	"github.com/futureq-io/futureq/internal/app"
 	"github.com/futureq-io/futureq/internal/dispatcher"
 	"github.com/futureq-io/futureq/internal/metrics"
+	raft "github.com/futureq-io/futureq/internal/raft/event"
 	"github.com/futureq-io/futureq/pkg/raft/metadata"
 	pb "github.com/futureq-io/protocol/proto/go"
 )
@@ -62,6 +63,14 @@ func (h *ConsumerHandler) Subscribe(stream grpc.BidiStreamingServer[pb.ConsumerF
 	}
 	if init == nil {
 		return nil
+	}
+	if init.GroupId != "" {
+		ctx, cancel := context.WithTimeout(stream.Context(), 10*time.Second)
+		err := registerDeliveryGroup(ctx, init.Topic, init.GroupId)
+		cancel()
+		if err != nil {
+			return status.Errorf(codes.Unavailable, "failed to register durable group: %v", err)
+		}
 	}
 
 	// ─── Register consumer with the Hub ────────────────────────────────────────
@@ -151,6 +160,19 @@ func (h *ConsumerHandler) Subscribe(stream grpc.BidiStreamingServer[pb.ConsumerF
 	}
 
 	return nil
+}
+
+func registerDeliveryGroup(ctx context.Context, topic, group string) error {
+	a := app.A
+	if a.NodeHost == nil {
+		return raft.RegisterDeliveryGroup(a.DB, topic, group)
+	}
+	cmd, err := raft.MarshalRegisterDeliveryGroupCmd(topic, group)
+	if err != nil {
+		return err
+	}
+	_, err = a.NodeHost.SyncPropose(ctx, a.NodeHost.GetNoOPSession(a.Config().Cluster.ShardID), cmd)
+	return err
 }
 
 // readInit reads and validates the mandatory SubscribeInit first frame.

@@ -65,12 +65,14 @@ assignment based on the event ID modulo the number of consumers, ordered by node
 ID and then registration order. Consumers with an empty group ID receive
 independent copies; they do not compete with each other.
 
-Before a message's first delivery, the event shard records its recipients: one
-interest per connected named group and one per universal subscription. An ACK
+At publication, the event shard records the payload and its recipients in the
+same atomic batch: one interest per durable named group and one per live
+universal subscription. A named group becomes durable on its first subscription;
+disconnecting its workers never unregisters the group. An ACK
 completes only that interest. The payload and its receipt state are deleted
 together after all required interests finish. Recipient ACKs are batched through
 Raft, and completed groups are skipped on later scans. New subscriptions do not
-join an already prepared message's recipient list. An incomplete named-group
+join an already published message's recipient list. An incomplete named-group
 interest survives disconnects and can resume when the group reconnects.
 Universal subscriptions are ephemeral: a later scan releases their interest
 after they unregister. TTL and explicit message deletion override these interests
@@ -87,10 +89,13 @@ before serving again. Consumer timeouts and a crash before ACK persistence can
 cause duplicate deliveries, as permitted by at-least-once delivery.
 
 Fan-out retention means an incomplete named group can retain a payload until it
-ACKs, reconnects and ACKs, or the message expires/is explicitly deleted. Each newly
-prepared message adds an event-Raft write; throughput with this bookkeeping has
-not been benchmarked. Upgrading the command format requires all cluster members
-to run this version before replica consumption is enabled.
+ACKs, reconnects and ACKs, or the message expires/is explicitly deleted. Publishing
+to a topic with no registered destinations fails with `FailedPrecondition`;
+offline named groups are valid destinations. Group registration persists across
+broker restarts and currently has no deletion API. Publication performs registry
+freshness checks in Raft mode. Delivery reads the already committed receipt,
+without another preparation commit or per-batch quorum barrier, while retaining
+bounded ownership permits and actual-send fencing.
 
 ## Quick Start
 

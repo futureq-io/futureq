@@ -1,5 +1,7 @@
 module github.com/futureq-io/futureq
 
+replace github.com/futureq-io/protocol/proto/go => ../futureq-proto/proto/go
+
 go 1.27.1
 
 // replace github.com/lni/dragonboat/v4 => github.com/hertzcodes/dragonboat v4.0.0

@@ -36,7 +36,7 @@ func receiptProto(s *DeliveryState) *deliverypb.DeliveryReceipt {
 	if s == nil {
 		return nil
 	}
-	return &deliverypb.DeliveryReceipt{Epoch: s.Epoch, Recipients: s.Recipients, Acknowledged: s.Acknowledged}
+	return &deliverypb.DeliveryReceipt{PublishBound: s.PublishBound, Epoch: s.Epoch, Recipients: s.Recipients, Acknowledged: s.Acknowledged}
 }
 func receiptState(p *deliverypb.DeliveryReceipt) (*DeliveryState, error) {
 	if p == nil {
@@ -57,7 +57,7 @@ func receiptState(p *deliverypb.DeliveryReceipt) (*DeliveryState, error) {
 	if n := len(p.Recipients) % 8; n != 0 && p.Acknowledged[len(p.Acknowledged)-1]>>uint(n) != 0 {
 		return nil, fmt.Errorf("invalid receipt bitmap padding")
 	}
-	return &DeliveryState{Epoch: p.Epoch, Recipients: p.Recipients, Acknowledged: p.Acknowledged, remaining: remaining}, nil
+	return &DeliveryState{PublishBound: p.PublishBound, Epoch: p.Epoch, Recipients: p.Recipients, Acknowledged: p.Acknowledged, remaining: remaining}, nil
 }
 func marshalDeliveryState(s *DeliveryState) ([]byte, error) {
 	return proto.MarshalOptions{}.MarshalAppend(append([]byte(nil), receiptPrefix...), receiptProto(s))

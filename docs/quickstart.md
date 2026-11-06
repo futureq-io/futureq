@@ -18,6 +18,12 @@ cp config.example.yaml config.yaml   # adjust as needed
 
 A standalone node (`cluster.enabled: false`) writes directly to Pebble with a synchronous fsync per publish batch — perfect for local development. See the [gRPC API](api.md) page for how to talk to it.
 
+Before publishing to a new topic, connect a subscription with a non-empty group
+ID once. This durably registers the group. Its workers may disconnect afterward:
+publishes continue to accumulate for it until it reconnects and acknowledges
+them. A topic with no registered destinations rejects publishing. New groups
+receive only messages published after their registration.
+
 ## Run a 3-node cluster
 
 On the **first node**, enable clustering and list its bootstrap member. Use addresses that other nodes and clients can reach:

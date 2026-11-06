@@ -17,12 +17,22 @@ Replication is built on [Dragonboat v4](https://github.com/lni/dragonboat) (mult
 
 ## Event-shard commands
 
-Two binary commands (documented wire formats in `internal/raft/event/commands.go`), each big-endian, single-allocation marshal, zero-copy unmarshal:
+Event commands include the storage format in `internal/raft/event/commands.go`
+and publish-bound delivery in `internal/raft/event/published_delivery.go`:
 
 | Command             | Payload |
 | ------------------- | ------- |
 | `StoreBatchCmd (0)` | Per item: `u64 id` (leader-assigned event ID; replicas apply verbatim so keys converge) · `u64 bucket` · `u64 topicHash` · index entries · `u32 len` + pre-serialized `StoredMessage`. One publish batch = one log entry. |
 | `DeleteBatchCmd (1)`| Count + fixed 24-byte message keys — used for ACK-driven deletes and TTL expirations. |
+| `StoreDeliveryBatchCmd (8)` | Encoded store batch followed by a length-prefixed frozen receipt per message; payload and destinations commit atomically. |
+| `RegisterDeliveryGroupCmd (9)` | A durable topic/group registration key. Worker disconnects and metadata reconciliation never remove it. |
+
+Publishers catch up the event and metadata views before selecting destinations.
+The event group stores named destinations independently of the metadata group's
+live worker assignments. Publish-bound delivery therefore needs no per-batch
+preparation proposal or post-preparation read barrier. Periodic quorum reads
+still renew the bounded ownership permit, and receipt reads observe locally
+applied committed state. Lag in observing an ACK can produce duplicate delivery.
 
 `Update` applies all entries in a log batch into one Pebble batch (nothing partial on error), persists the max applied event ID and `metadata/raft/applied-index`, and fires the `OnDeleteKeys` hook so every replica clears dispatcher in-flight entries for deleted keys. Snapshots stream the whole DB as length-prefixed records; recovery clears the DB first and validates the applied index.
 
@@ -74,4 +84,6 @@ The broker enforces a configurable floor: `publish.minAckLevel` (`quorum` | `lea
 - Event IDs never regress: the last ID is persisted in the Pebble metadata keyspace and replicas observe applied IDs.
 - Committed-but-unapplied log entries are replayed on restart (Pebble WAL is off in clustered mode).
 - Snapshots restore the full DB (validated against the applied index); the metadata state machine rebuilds from its log.
-- ACKed messages can't be re-dispatched after failover because deletes are Raft-replicated.
+- Recipient completions and final deletion are Raft-replicated. A lagging
+  replica or uncertain ACK completion may cause duplicates; unacknowledged
+  named-group obligations and their payloads survive restart and reassignment.

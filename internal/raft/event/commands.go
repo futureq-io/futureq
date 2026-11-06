@@ -25,6 +25,10 @@ const (
 	ProtoPrepareDeliveryBatchCmd
 	ProtoAckDeliveryBatchCmd
 	ProtoPrepareDeliveryCmd
+
+	// Publish-time delivery and durable group registration.
+	StoreDeliveryBatchCmd
+	RegisterDeliveryGroupCmd
 )
 
 // StoreBatchItem is the minimal per-message metadata carried in a StoreBatchCmd.
@@ -44,6 +48,8 @@ type StoreBatchItem struct {
 	// Msg is the already-serialised storagepb.StoredMessage proto bytes.
 	// This slice aliases the original command buffer — do not mutate.
 	Msg []byte
+	// Receipt is used by StoreDeliveryBatchCmd only and is atomic with Msg.
+	Receipt []byte
 }
 
 // MarshalStoreBatchCmd serialises a list of items into a compact binary command.

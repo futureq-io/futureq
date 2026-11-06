@@ -2,8 +2,9 @@
 
 The dispatcher retains decoded `StoredMessage` data, including the payload.
 Storage remains authoritative; restarting discards and rebuilds the queue.
-Protocol messages, event keys, Raft commands, WAL/fsync settings, recipient
-ownership and at-least-once delivery are unchanged.
+Event keys and payload validity tracking are independent of delivery receipts.
+Publish-bound receipts persist destinations with the payload; ownership fencing
+and at-least-once retries remain mandatory.
 
 ## Ownership and work
 
@@ -15,7 +16,7 @@ flowchart LR
   P -->|outcome| S
   P --> Q[Existing bounded Hub queues and gRPC senders]
   R[One bounded permit-renewal worker] --> S
-  P -->|prepare, quorum barrier, current receipt| DB
+  P -->|local committed receipt and payload validation| DB
 ```
 
 Only the scheduler changes heaps, admission counters, cursors, fair rotation,
@@ -27,9 +28,13 @@ preparation jobs; known assigned keys are excluded from discovery and checked
 again when a result is admitted. Hub reservations remain the authority for
 individual recipient attempts after enqueue.
 
-Delivery workers check permission before preparation, prepare under the existing
-context timeout, perform the post-preparation barrier, validate cached data,
-read the current receipt, recheck TTL/exact due time and enqueue through Hub.
+Delivery workers check permission, read the publish-bound receipt, validate
+cached data, reread current local committed ACK state, recheck TTL/exact due time
+and enqueue through Hub. Publish-bound messages have no delivery-time storage
+commit or per-batch quorum read. Their payload and frozen recipients were
+committed together by the publisher. Periodic permit renewal and actual-send
+fencing still apply. Background receipt reconciliation releases vanished
+universal subscriptions while preserving all named-group obligations.
 Actual gRPC Send and pointer-based attempt fencing stay in the existing sender.
 Read barriers grant permits from **read start**, as before. The legacy no-argument
 ReadBarrier hook captures its installation context: the preparation timeout does
@@ -101,12 +106,13 @@ is no later than the token's snapshot sequence. Therefore:
    could after that Get; the change does not claim atomic delivery versus delete.
    A delete completed before validation cannot be bypassed by cached data.
 
-The final receipt is read again after the barrier. Committed recipient ACK bits
+The final receipt is read again before enqueue. Locally committed recipient ACK bits
 and receipt replacement are authoritative, even if preparation returned an older
 manifest. Missing or mismatched receipts do not send. Exact due/TTL checks and
 current Hub ownership/permit checks remain mandatory. No async delete notification
 is needed for cache safety; correctness lives at the storage mutation boundary.
-There is no new wire record or persistent version metadata.
+Payload-cache validation adds no persistent version metadata. Delivery receipts
+separately record whether their destinations were bound at publication.
 
 ## Admission, cursors and retries
 

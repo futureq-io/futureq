@@ -15,6 +15,7 @@ func decodeStoredReceipt(data []byte) (*DeliveryState, error) {
 	count := 0
 	var epoch uint64
 	var acked []byte
+	var bound bool
 	for pos := 0; pos < len(data); {
 		field, wire, n := protowire.ConsumeTag(data[pos:])
 		if n < 0 {
@@ -28,6 +29,13 @@ func decodeStoredReceipt(data []byte) (*DeliveryState, error) {
 				return nil, protowire.ParseError(m)
 			}
 			epoch = value
+			pos += m
+		case field == 4 && wire == protowire.VarintType:
+			value, m := protowire.ConsumeVarint(data[pos:])
+			if m < 0 {
+				return nil, protowire.ParseError(m)
+			}
+			bound = value != 0
 			pos += m
 		case (field == 2 || field == 3) && wire == protowire.BytesType:
 			value, m := protowire.ConsumeBytes(data[pos:])
@@ -72,5 +80,5 @@ func decodeStoredReceipt(data []byte) (*DeliveryState, error) {
 			pos += protowire.ConsumeFieldValue(field, wire, data[pos:])
 		}
 	}
-	return receiptState(&deliverypb.DeliveryReceipt{Epoch: epoch, Recipients: names, Acknowledged: append([]byte(nil), acked...)})
+	return receiptState(&deliverypb.DeliveryReceipt{PublishBound: bound, Epoch: epoch, Recipients: names, Acknowledged: append([]byte(nil), acked...)})
 }

@@ -24,6 +24,13 @@ FutureQ speaks gRPC; protobuf definitions live in [futureq-io/protocol](https://
 - Client half-close (EOF) ends the stream cleanly.
 - Ack levels: `QUORUM` (default; returns after Raft quorum commit), `LEADER` (returns after the leader durably persists the entry — see [ack levels](clustering.md#publish-ack-levels)), `NO_ACK` (fire-and-forget). The broker's `publish.minAckLevel` floors what clients may request.
 - In Raft mode only the event-shard leader accepts writes; standalone always writes directly to storage with fsync.
+- Destinations are frozen at publication and persisted atomically with each
+  payload. A named group is registered durably on its first subscription and
+  remains a destination with zero connected workers, including after restart.
+  Groups registered later receive only future publishes.
+- If any topic in a batch has no registered named groups and no live universal
+  subscribers, the entire batch fails with `FailedPrecondition` and writes
+  nothing. Connect a named subscription once before publishing to a new topic.
 
 ## Subscribe
 
@@ -33,7 +40,8 @@ FutureQ speaks gRPC; protobuf definitions live in [futureq-io/protocol](https://
 
 - The **first** frame must be `ConsumerFrame{init: SubscribeInit{topic, group_id, read_from_replica}}`.
 - Errors: non-init first frame → `InvalidArgument`; empty topic → `InvalidArgument`.
-- In Raft mode the node must be the event-shard leader → `FailedPrecondition "node is not the cluster leader"`. Standalone accepts always. (`read_from_replica` is reserved for future follower reads and currently ignored.)
+- Consumers may connect to any event replica. Cluster-wide assignments and
+  expiring ownership permits fence delivery during rebalances and partitions.
 
 ### After registration
 
@@ -45,6 +53,9 @@ FutureQ speaks gRPC; protobuf definitions live in [futureq-io/protocol](https://
     - `success = false` (NACK): nothing is deleted; the message becomes re-dispatchable immediately.
 - Any ack frame also removes the in-flight entry for that consumer. Non-ack frames after handshake are logged and skipped.
 - Client EOF ends the stream cleanly; the consumer is unregistered and its in-flight keys dropped.
+- Disconnect removes only the worker session. A non-empty named group remains
+  durably registered and retains pending deliveries; reconnect with the same
+  topic and group ID to resume. Empty-group universal subscriptions are ephemeral.
 
 ## Cluster RPCs
 

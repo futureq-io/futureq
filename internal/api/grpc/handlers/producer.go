@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"time"
 
 	"go.uber.org/zap"
@@ -45,18 +46,23 @@ func minProtoAckLevel(min config.AckLevel) pb.AckLevel {
 // ProducerHandler implements pb.FutureQProducerServer.
 type ProducerHandler struct {
 	pb.UnimplementedFutureQProducerServer
-	logger         *zap.Logger
-	timeBucketSize time.Duration
+	logger          *zap.Logger
+	timeBucketSize  time.Duration
+	localRecipients func(string) (uint64, []string, bool)
 }
 
 // NewProducerHandler returns an initialised ProducerHandler.
 // In Raft mode the handler never writes directly to Pebble; all writes go
 // through SyncPropose → state machine → Pebble.
-func NewProducerHandler(logger *zap.Logger) *ProducerHandler {
-	return &ProducerHandler{
+func NewProducerHandler(logger *zap.Logger, localRecipients ...func(string) (uint64, []string, bool)) *ProducerHandler {
+	h := &ProducerHandler{
 		logger:         logger.Named("producer"),
 		timeBucketSize: app.A.Config().Delivery.TimeBucket,
 	}
+	if len(localRecipients) > 0 {
+		h.localRecipients = localRecipients[0]
+	}
+	return h
 }
 
 // PublishStream handles a bidirectional stream where clients send PublishBatch
@@ -106,12 +112,17 @@ func (ph *ProducerHandler) processBatch(ctx context.Context, batch *pb.PublishBa
 	}
 
 	nowMs := time.Now().UnixMilli()
+	receipts, err := ph.publishReceipts(ctx, batch)
+	if err != nil {
+		metrics.PublishRequestsTotal.WithLabelValues(topicLabel, ackLevel.String(), "rejected").Inc()
+		return &pb.PublishBatchAck{Success: false}, err
+	}
 
 	var processErr error
 	if app.A.NodeHost != nil {
-		processErr = ph.processRaftBatch(ctx, batch, nowMs, ackLevel)
+		processErr = ph.processRaftBatch(ctx, batch, nowMs, ackLevel, receipts)
 	} else {
-		processErr = ph.processStandaloneBatch(batch, nowMs)
+		processErr = ph.processStandaloneBatch(batch, nowMs, receipts)
 	}
 
 	if processErr != nil {
@@ -196,6 +207,7 @@ func (ph *ProducerHandler) processRaftBatch(
 	batch *pb.PublishBatch,
 	nowMs int64,
 	ackLevel pb.AckLevel,
+	receipts map[string][]byte,
 ) error {
 	shardID := app.A.Config().Cluster.ShardID
 
@@ -217,6 +229,7 @@ func (ph *ProducerHandler) processRaftBatch(
 			Bucket:    utils.CalculateBucket(data.EnqueuedAtUnixMs+data.DelayMs, app.A.Config().Delivery.TimeBucket),
 			TopicHash: utils.TopicHash(data.Topic),
 			Msg:       dataBytes,
+			Receipt:   receipts[data.Topic],
 		}
 
 		for _, idx := range data.GetIndexes() {
@@ -234,7 +247,7 @@ func (ph *ProducerHandler) processRaftBatch(
 		return fmt.Errorf("failed to build store batch: %w", err)
 	}
 
-	cmdBytes, err := raft.MarshalStoreBatchCmd(items)
+	cmdBytes, err := raft.MarshalStoreDeliveryBatchCmd(items)
 	if err != nil {
 		return fmt.Errorf("failed to marshal StoreBatchCmd: %w", err)
 	}
@@ -294,13 +307,16 @@ func (ph *ProducerHandler) processRaftBatch(
 }
 
 // processStandaloneBatch writes the batch directly to Pebble (non-Raft mode).
-func (ph *ProducerHandler) processStandaloneBatch(batch *pb.PublishBatch, nowMs int64) error {
+func (ph *ProducerHandler) processStandaloneBatch(batch *pb.PublishBatch, nowMs int64, receipts map[string][]byte) error {
 	b := app.A.DB.NewBatch()
 	defer func() { _ = b.Close() }()
 
 	if err := ph.marshalMessages(batch, nowMs, func(data *storagepb.StoredMessage) error {
-		_, err := app.A.Repositories.Events.StoreWithBatch(b, app.A.Repositories.Events.NextID(), data)
-		return err
+		key, err := app.A.Repositories.Events.StoreWithBatch(b, app.A.Repositories.Events.NextID(), data)
+		if err != nil {
+			return err
+		}
+		return b.Set(raft.DeliveryStateKey(key), receipts[data.Topic])
 	}); err != nil {
 		return err
 	}
@@ -311,4 +327,57 @@ func (ph *ProducerHandler) processStandaloneBatch(batch *pb.PublishBatch, nowMs 
 	}
 
 	return nil
+}
+
+// publishReceipts selects durable destinations once per topic. Raft freshness
+// work belongs here, before admission, rather than on every delivery batch.
+func (ph *ProducerHandler) publishReceipts(ctx context.Context, batch *pb.PublishBatch) (map[string][]byte, error) {
+	a := app.A
+	if a.NodeHost != nil {
+		callCtx, cancel := context.WithTimeout(ctx, a.Config().Publish.ProposalTimeout)
+		defer cancel()
+		if _, err := a.NodeHost.SyncRead(callCtx, a.Config().Cluster.ShardID, nil); err != nil {
+			return nil, status.Errorf(codes.Unavailable, "delivery group registry unavailable: %v", err)
+		}
+		if err := a.MetadataSvc.SyncConsumers(callCtx); err != nil {
+			return nil, status.Errorf(codes.Unavailable, "consumer registry unavailable: %v", err)
+		}
+	}
+	result := make(map[string][]byte)
+	for _, msg := range batch.Messages {
+		if _, ok := result[msg.Topic]; ok {
+			continue
+		}
+		names, err := raft.ReadDeliveryGroups(a.DB, msg.Topic)
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "read durable groups: %v", err)
+		}
+		var epoch uint64
+		var live []string
+		active := true
+		if a.NodeHost != nil {
+			epoch, live, active = a.MetadataSM.DeliveryRecipients(msg.Topic)
+		} else if ph.localRecipients != nil {
+			epoch, live, active = ph.localRecipients(msg.Topic)
+		}
+		if !active {
+			return nil, status.Error(codes.Unavailable, "consumer assignment is changing; retry publish")
+		}
+		// Named interests come from durable registration; universal subscriptions
+		// remain session-scoped and are captured only while registered.
+		for _, name := range live {
+			if strings.HasPrefix(name, "u:") {
+				names = append(names, name)
+			}
+		}
+		if len(names) == 0 {
+			return nil, status.Errorf(codes.FailedPrecondition, "topic %q has no registered destinations", msg.Topic)
+		}
+		data, err := raft.MarshalPublishReceipt(epoch, names)
+		if err != nil {
+			return nil, status.Errorf(codes.ResourceExhausted, "publish destinations: %v", err)
+		}
+		result[msg.Topic] = data
+	}
+	return result, nil
 }

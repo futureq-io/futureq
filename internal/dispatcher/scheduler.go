@@ -176,7 +176,7 @@ func (d *Dispatcher) runPipeline(parent context.Context) {
 							result.outcome = "prepare-failed"
 						}
 						if err == nil {
-							if d.refreshPermit(ctx) {
+							if d.authorizePrepared(ctx, states) {
 								result.sent = d.deliverChunk(job.chunk, states)
 								if result.sent > 0 {
 									result.outcome = "queued"

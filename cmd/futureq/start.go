@@ -145,7 +145,8 @@ func startRun(cmd *cobra.Command, _ []string) {
 		dispatchInterval, inFlightTimeout,
 		wakeCh, logger,
 	)
-	disp.PrepareBatch = ledger.PrepareBatch
+	disp.PrepareBatch = ledger.PublishedBatch
+	disp.ReconcileBatch = ledger.ReconcileBatch
 	disp.MaintenanceRecipients = recipients
 	disp.TimeBucket = cfg.Delivery.TimeBucket
 	disp.DiscoveryWorkers = cfg.Delivery.DiscoveryWorkers
