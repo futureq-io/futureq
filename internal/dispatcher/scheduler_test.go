@@ -65,7 +65,7 @@ func (s *SchedulerSuite) TestSchedulerBusyTopicCannotExhaustDiscoveryAdmission()
 				d.PreloadLookahead, d.PreloadMaxMessages = 0, 0
 				d.Limits.Candidates = 1
 				d.Limits.Workers = workerCount
-				d.Limits.PrepareTimeout = time.Second
+				d.Limits.ValidationTimeout = time.Second
 				slow, fast := make(chan *pb.QueueMessage, 8), make(chan *pb.QueueMessage, 1)
 				d.hub.Register("slow", "a-slow", "workers", slow)
 				d.hub.Register("fast", "b-fast", "workers", fast)
@@ -206,7 +206,7 @@ func (s *SchedulerSuite) TestSchedulerLateScanCannotRetainBusyTopicAdmission() {
 
 			d, ledger := newPreloadTest(s.T(), engine)
 			d.Limits.Candidates = 1
-			d.Limits.PrepareTimeout = time.Second
+			d.Limits.ValidationTimeout = time.Second
 			slow, fast := make(chan *pb.QueueMessage, 8), make(chan *pb.QueueMessage, 1)
 			d.hub.Register("slow", "a-slow", "workers", slow)
 			d.hub.Register("fast", "b-fast", "workers", fast)
@@ -364,7 +364,7 @@ func (s *SchedulerSuite) TestSchedulerFailedTopicsReleasePrefetchDuringBackoff()
 
 	d, ledger := newPipelineTest(s.T())
 	d.Limits.Candidates = 1
-	d.Limits.PrepareTimeout = time.Second
+	d.Limits.ValidationTimeout = time.Second
 	d.interval = time.Second
 	fast := make(chan *pb.QueueMessage, 1)
 	for _, topic := range []string{"a-fail", "b-fail"} {

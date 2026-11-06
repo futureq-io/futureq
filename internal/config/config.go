@@ -124,8 +124,8 @@ type Delivery struct {
 	PrepareBatchBytes          Size          `mapstructure:"prepareBatchBytes" yaml:"prepareBatchBytes"`
 	ScanMaxKeys                int           `mapstructure:"scanMaxKeys" yaml:"scanMaxKeys"`
 	ScanWorkBudget             time.Duration `mapstructure:"scanWorkBudget" yaml:"scanWorkBudget"`
-	PrepareTimeout             time.Duration `mapstructure:"prepareTimeout" yaml:"prepareTimeout"`
-	PrepareWorkers             int           `mapstructure:"prepareWorkers" yaml:"prepareWorkers"`
+	ValidationTimeout          time.Duration `mapstructure:"validationTimeout" yaml:"validationTimeout"`
+	DeliveryWorkers            int           `mapstructure:"deliveryWorkers" yaml:"deliveryWorkers"`
 }
 
 type Observability struct {
@@ -410,8 +410,8 @@ func (c *Config) validatePublishAndDelivery() error {
 	if size, err := d.PrepareBatchBytes.Bytes(); err != nil || size < 1024 || size > 256<<10 {
 		return fmt.Errorf("delivery.prepareBatchBytes must be 1KiB..256KiB")
 	}
-	if d.ScanWorkBudget <= 0 || d.ScanWorkBudget > 50*time.Millisecond || d.PrepareTimeout <= 0 || d.PrepareTimeout > time.Second || d.PrepareWorkers < 1 || d.PrepareWorkers > 16 {
-		return fmt.Errorf("delivery requires scanWorkBudget in (0,50ms], prepareTimeout in (0,1s], and prepareWorkers in 1..16")
+	if d.ScanWorkBudget <= 0 || d.ScanWorkBudget > 50*time.Millisecond || d.ValidationTimeout <= 0 || d.ValidationTimeout > time.Second || d.DeliveryWorkers < 1 || d.DeliveryWorkers > 16 {
+		return fmt.Errorf("delivery requires scanWorkBudget in (0,50ms], validationTimeout in (0,1s], and deliveryWorkers in 1..16")
 	}
 	return nil
 }

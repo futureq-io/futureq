@@ -129,7 +129,7 @@ func (d *Dispatcher) dispatchTopic(topic string, nowMs int64) int {
 	if len(chunk.items) == 0 {
 		return 0
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), d.Limits.PrepareTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), d.Limits.ValidationTimeout)
 	defer cancel()
 	states, err := d.prepareChunk(ctx, chunk)
 	if err != nil {

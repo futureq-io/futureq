@@ -168,7 +168,7 @@ func (d *Dispatcher) runPipeline(parent context.Context) {
 						result.err = errors.New("permission expired before preparation")
 						result.outcome = "permission-lost"
 					} else {
-						callCtx, stop := context.WithTimeout(ctx, d.Limits.PrepareTimeout)
+						callCtx, stop := context.WithTimeout(ctx, d.Limits.ValidationTimeout)
 						states, err := d.prepareChunk(callCtx, job.chunk)
 						stop()
 						result.err = err
@@ -289,7 +289,7 @@ func (d *Dispatcher) runPipeline(parent context.Context) {
 		}
 		// Preparation can outlast a permit and has its own post-preparation
 		// barrier. Never require its entire budget to fit in a fresh permit.
-		budget := min(d.Limits.PrepareTimeout+d.Limits.WorkTime, ConsumerReadPermit/2)
+		budget := min(d.Limits.ValidationTimeout+d.Limits.WorkTime, ConsumerReadPermit/2)
 		if d.hub.PermitNeedsRenewal(budget) {
 			if !renewing && !now.Before(renewAfter) {
 				renew <- struct{}{}

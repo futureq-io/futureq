@@ -41,8 +41,8 @@ var defaultConfig = Config{
 		PrepareBatchBytes:          "256KiB",
 		ScanMaxKeys:                256,
 		ScanWorkBudget:             5 * time.Millisecond,
-		PrepareTimeout:             250 * time.Millisecond,
-		PrepareWorkers:             2,
+		ValidationTimeout:          250 * time.Millisecond,
+		DeliveryWorkers:            2,
 	},
 	Observability: Observability{Logging: Logger{Level: "info"}, Metrics: Metrics{Listen: "0.0.0.0:9090"}},
 }

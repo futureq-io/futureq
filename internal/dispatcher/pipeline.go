@@ -19,16 +19,16 @@ import (
 )
 
 type ScanLimits struct {
-	Candidates     int
-	Examined       int
-	Bytes          int
-	WorkTime       time.Duration
-	PrepareTimeout time.Duration
-	Workers        int
+	Candidates        int
+	Examined          int
+	Bytes             int
+	WorkTime          time.Duration
+	ValidationTimeout time.Duration
+	Workers           int
 }
 
 func DefaultScanLimits() ScanLimits {
-	return ScanLimits{Candidates: 64, Examined: 256, Bytes: raft.MaxDeliveryPrepareBytes, WorkTime: 5 * time.Millisecond, PrepareTimeout: 250 * time.Millisecond, Workers: 2}
+	return ScanLimits{Candidates: 64, Examined: 256, Bytes: raft.MaxDeliveryPrepareBytes, WorkTime: 5 * time.Millisecond, ValidationTimeout: 250 * time.Millisecond, Workers: 2}
 }
 
 type scanCursor struct {

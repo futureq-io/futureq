@@ -379,7 +379,7 @@ func (s *PreloadSuite) TestPreloadFailedRenewalDoesNotSpinOnOverdueTimer() {
 	d, _ := newPreloadTest(s.T(), "pebble")
 	d.interval = time.Second
 	d.Limits.WorkTime = time.Millisecond
-	d.Limits.PrepareTimeout = time.Second
+	d.Limits.ValidationTimeout = time.Second
 	epoch := uint64(9)
 	d.hub.SetDeliveryFence(func() (uint64, bool) { return epoch, true }, time.Second)
 	d.hub.Register("local", "orders", "workers", make(chan *pb.QueueMessage, 1))
