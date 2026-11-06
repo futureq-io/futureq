@@ -118,6 +118,7 @@ type Delivery struct {
 	PreloadMaxMessages         int           `mapstructure:"preloadMaxMessages" yaml:"preloadMaxMessages"`
 	InFlightTimeout            time.Duration `mapstructure:"inFlightTimeout" yaml:"inFlightTimeout"`
 	DeleteBatchInterval        time.Duration `mapstructure:"deleteBatchInterval" yaml:"deleteBatchInterval"`
+	DeleteWorkers              int           `mapstructure:"deleteWorkers" yaml:"deleteWorkers"`
 	TTLSweepInterval           time.Duration `mapstructure:"ttlSweepInterval" yaml:"ttlSweepInterval"`
 	PrepareBatchSize           int           `mapstructure:"prepareBatchSize" yaml:"prepareBatchSize"`
 	PrepareBatchBytes          Size          `mapstructure:"prepareBatchBytes" yaml:"prepareBatchBytes"`
@@ -399,6 +400,9 @@ func (c *Config) validatePublishAndDelivery() error {
 	}
 	if d.DispatchPollInterval <= 0 || d.InFlightTimeout <= 0 || d.DeleteBatchInterval <= 0 || d.TTLSweepInterval <= 0 {
 		return fmt.Errorf("delivery intervals and timeout must be positive")
+	}
+	if d.DeleteWorkers < 1 || d.DeleteWorkers > 256 {
+		return fmt.Errorf("delivery.deleteWorkers must be 1..256")
 	}
 	if d.PrepareBatchSize < 1 || d.PrepareBatchSize > 256 || d.ScanMaxKeys < d.PrepareBatchSize || d.ScanMaxKeys > 65536 {
 		return fmt.Errorf("delivery.prepareBatchSize must be 1..256 and scanMaxKeys must be between batch size and 65536")

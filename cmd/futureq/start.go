@@ -133,6 +133,11 @@ func startRun(cmd *cobra.Command, _ []string) {
 		}
 	}
 	deleter := dispatcher.NewDeleter(ledger, deleteInterval, logger)
+	if cfg.Cluster.Enabled {
+		// Overlap consensus waits without releasing tracking before commit
+		// or accumulating unbounded proposal goroutines during quorum loss.
+		deleter.MaxConcurrentFlushes = cfg.Delivery.DeleteWorkers
+	}
 	deleter.AcknowledgeBatch = ledger.Acknowledge
 	deleter.OnAcknowledged = hub.RemoveAcknowledgedBatch
 	disp := dispatcher.NewDispatcher(

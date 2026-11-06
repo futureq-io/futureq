@@ -35,6 +35,7 @@ var defaultConfig = Config{
 		PreloadMaxMessages:         512,
 		InFlightTimeout:            5 * time.Second,
 		DeleteBatchInterval:        500 * time.Millisecond,
+		DeleteWorkers:              16,
 		TTLSweepInterval:           time.Minute,
 		PrepareBatchSize:           64,
 		PrepareBatchBytes:          "256KiB",

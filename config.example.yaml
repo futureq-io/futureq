@@ -71,6 +71,7 @@ delivery:
   preloadMaxMessages: 512 # global full-message future-cache cap; 0 disables future caching
   inFlightTimeout: 5s
   deleteBatchInterval: 500ms
+  deleteWorkers: 16 # 1..256 concurrent ACK/delete flushes in Raft mode; standalone stays serial
   ttlSweepInterval: 1m0s
   # Each topic gets one bounded chunk at a time, with cyclic cursor wrap.
   prepareBatchSize: 64 # 1..256 candidates; new Raft command tag 4

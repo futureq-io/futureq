@@ -265,6 +265,11 @@ func (l *DeliveryLedger) applyLocal(mode storage.SyncMode, apply func(*raft.Deli
 }
 
 func (l *DeliveryLedger) DeleteKeys(keys [][]byte) error {
+	if l.propose != nil {
+		// Raft serializes application; do not hold the standalone mutation
+		// lock across the consensus wait of independent delete batches.
+		return l.backend.DeleteKeys(keys)
+	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.backend.DeleteKeys(keys)
