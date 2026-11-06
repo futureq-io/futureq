@@ -275,6 +275,13 @@ func (a *App) StartRaft(join bool, onDeleteKeys func(keys [][]byte)) error {
 	// Register the event shard with the metadata service so it publishes
 	// initial topology.
 	a.MetadataSvc.RegisterShard(cfg.Cluster.ShardID)
+	// Event callbacks only enqueue topology refreshes. Start their worker after
+	// the node address and initial topology have been published synchronously.
+	a.RegisterComponentWithShutdown()
+	go func() {
+		defer a.ComponentShutdownDone()
+		metadataSvc.Run(a.Ctx)
+	}()
 
 	return nil
 }

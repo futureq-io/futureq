@@ -244,6 +244,15 @@ func (s *Service) Maintain(ctx context.Context, now time.Time) error {
 	return err
 }
 func (s *Service) Run(ctx context.Context) {
+	// Keep lease renewal independent of slow expiry/receipt-cleanup proposals.
+	// One maintenance worker owns both scan cursors and checks each result.
+	maintenanceDone := make(chan struct{})
+	go func() {
+		defer close(maintenanceDone)
+		s.runMaintenance(ctx)
+	}()
+	defer func() { <-maintenanceDone }()
+
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 	lastRenew := time.Now()
@@ -260,7 +269,22 @@ func (s *Service) Run(ctx context.Context) {
 					lastRenew = now
 				}
 			}
-			if err := s.Maintain(callCtx, now); err != nil {
+			cancel()
+		}
+	}
+}
+
+func (s *Service) runMaintenance(ctx context.Context) {
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			callCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+			// Use a fresh time after any previous proposal wait, not a stale tick.
+			if err := s.Maintain(callCtx, time.Now()); err != nil && ctx.Err() == nil {
 				s.Logger.Warn("subscription maintenance failed", zap.Error(fmt.Errorf("maintain: %w", err)))
 			}
 			cancel()

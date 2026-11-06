@@ -82,6 +82,12 @@ second on the event leader and handles at most 256 subscription records and 256
 receipts per pass, so cleanup/expiry can take longer for larger backlogs. Message
 TTL remains independent and can remove messages even for forever subscriptions.
 
+Expiry and retired-receipt cleanup run in one background worker, independently
+of session renewal. Slow cleanup proposals cannot hold up renewal. Each worker
+checks persistence results; expiry and cleanup revalidate the current generation
+and recipient state when applied. Shutdown cancels and joins the maintenance
+worker before storage closes.
+
 ## In-flight tracking & redelivery
 
 - Queueing a message reserves its topic, group, and storage key across every member of that group. Universal consumers each retain their own independent in-flight tracking. Repeated scans cannot send a reserved message to another member of the same group.
