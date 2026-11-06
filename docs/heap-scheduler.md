@@ -36,6 +36,13 @@ committed together by the publisher. Periodic permit renewal and actual-send
 fencing still apply. Background receipt reconciliation releases vanished
 universal subscriptions while preserving all named-group obligations.
 Actual gRPC Send and pointer-based attempt fencing stay in the existing sender.
+One renewal worker reads the metadata and event shards concurrently and requires
+both reads to succeed. Renewal starts with at least half the permit remaining;
+observed read latency increases this margin without extending the permit.
+If permission expires during validation, a publish-bound batch waits in the
+scheduler with its bounded reservation and validated payloads. Delivery workers
+do not start additional reads. Resuming rechecks the current receipt, payload
+validity, due time, TTL and ownership; actual Send still checks its permit.
 Read barriers grant permits from **read start**, as before. The legacy no-argument
 ReadBarrier hook captures its installation context: the preparation timeout does
 not cancel that hook. The production hook independently bounds reads to two

@@ -94,6 +94,12 @@ func Init(cfg *config.Config, logger *zap.Logger) (*App, error) {
 
 	a.DB = s
 	a.Subscriptions = subscriptions.New(s, cfg.Delivery.Subscriptions.DisconnectTimeout, logger)
+	if cfg.Delivery.Subscriptions.RenewalWorkers > 0 {
+		a.Subscriptions.RenewalWorkers = cfg.Delivery.Subscriptions.RenewalWorkers
+	}
+	if cfg.Delivery.Subscriptions.DisconnectWorkers > 0 {
+		a.Subscriptions.DisconnectWorkers = cfg.Delivery.Subscriptions.DisconnectWorkers
+	}
 	if cfg.Cluster.Enabled {
 		a.Subscriptions.Propose = func(ctx context.Context, cmd []byte) (statemachine.Result, error) {
 			// Dragonboat requires a deadline, even when the RPC client omits one.
@@ -161,6 +167,10 @@ func (a *App) StartRaft(join bool, onDeleteKeys func(keys [][]byte)) error {
 	}
 
 	metadataSvc = metadata.NewService(nil, proposeMetadata, a.Logger)
+	metadataSvc.ConsumerReadPermit = cfg.Delivery.ReadPermit
+	if cfg.Delivery.ConsumerRemovalWorkers > 0 {
+		metadataSvc.ConsumerRemovalWorkers = cfg.Delivery.ConsumerRemovalWorkers
+	}
 	nhc.RaftEventListener = metadataSvc
 	nhc.SystemEventListener = metadataSvc
 

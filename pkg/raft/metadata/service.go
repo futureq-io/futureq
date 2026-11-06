@@ -34,9 +34,14 @@ type Service struct {
 
 	// Coalesce refresh requests by shard. One worker publishes current state,
 	// so event callbacks never block on a quorum read or a proposal.
-	topologyPending map[uint64]struct{}
-	topologyWake    chan struct{}
-	topologyMu      sync.Mutex // also serializes synchronous startup refreshes
+	topologyPending  map[uint64]struct{}
+	topologyWake     chan struct{}
+	topologyMu       sync.Mutex // also serializes synchronous startup refreshes
+	consumerRemovals chan consumerRemoval
+	// Installed before Run. Removals target independent, unique stream IDs.
+	ConsumerRemovalWorkers int
+	// Installed before consumer registration; advertised in the committed add.
+	ConsumerReadPermit time.Duration
 }
 
 // NewService creates a metadata Service. The propose function should submit
@@ -45,12 +50,14 @@ type Service struct {
 // handles any events.
 func NewService(nh *dragonboat.NodeHost, propose func(ctx context.Context, cmd []byte) error, logger *zap.Logger) *Service {
 	return &Service{
-		nh:              nh,
-		propose:         propose,
-		logger:          logger.Named("metadata_svc"),
-		shards:          make(map[uint64]struct{}),
-		topologyPending: make(map[uint64]struct{}),
-		topologyWake:    make(chan struct{}, 1),
+		nh:                     nh,
+		propose:                propose,
+		logger:                 logger.Named("metadata_svc"),
+		shards:                 make(map[uint64]struct{}),
+		topologyPending:        make(map[uint64]struct{}),
+		topologyWake:           make(chan struct{}, 1),
+		consumerRemovals:       make(chan consumerRemoval, consumerRemovalQueueSize),
+		ConsumerRemovalWorkers: 1,
 	}
 }
 
@@ -118,7 +125,11 @@ func (s *Service) ChangeConsumer(ctx context.Context, shardID uint64, topic, gro
 	if add {
 		op = "add"
 	}
-	cmd, err := marshalConsumerChange(consumerChange{Operation: op, Topic: topic, Group: group, Member: member, Required: required})
+	permit := s.ConsumerReadPermit
+	if permit <= 0 {
+		permit = time.Second
+	}
+	cmd, err := marshalConsumerChange(consumerChange{Operation: op, Topic: topic, Group: group, Member: member, Required: required, ReadPermitMs: permit.Milliseconds()})
 	if err != nil {
 		return err
 	}

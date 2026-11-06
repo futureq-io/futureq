@@ -10,9 +10,25 @@ import (
 	"github.com/lni/dragonboat/v4"
 )
 
-// ConsumerReadPermit bounds delivery after the last successful quorum read.
-// Fence proposals wait for this permit plus the configured delivery timeout.
+// ConsumerReadPermit is the default delivery permit and legacy fencing floor.
+// Production fencing uses the maximum permit registered in metadata Raft.
 const ConsumerReadPermit = time.Second
+
+// SetReadPermit is installed before serving consumers. The same duration must
+// be advertised by the metadata service when registering those consumers.
+func (h *Hub) SetReadPermit(duration time.Duration) {
+	h.deliveryMu.Lock()
+	defer h.deliveryMu.Unlock()
+	if duration > 0 {
+		h.readPermit = duration
+	}
+}
+
+func (h *Hub) DeliveryReadPermit() time.Duration {
+	h.deliveryMu.RLock()
+	defer h.deliveryMu.RUnlock()
+	return max(h.readPermit, time.Nanosecond)
+}
 
 type deliveryRecord struct {
 	message    *pb.QueueMessage
@@ -33,17 +49,34 @@ func (h *Hub) SetDeliveryTimeout(timeout time.Duration) {
 // NewConsumerReadBarrier checks both Raft shards before a replica scans. Every
 // channel send and gRPC sender checks the resulting permit's epoch and expiry.
 func NewConsumerReadBarrier(ctx context.Context, nh *dragonboat.NodeHost, sm *metadata.MetadataStateMachine, hub *Hub, shardID uint64) func() error {
+	return newConsumerReadBarrier(ctx, func(ctx context.Context, shard uint64) error {
+		_, err := nh.SyncRead(ctx, shard, nil)
+		return err
+	}, sm.ConsumerVersion, hub, shardID)
+}
+
+func newConsumerReadBarrier(ctx context.Context, read func(context.Context, uint64) error, version func() (uint64, bool), hub *Hub, shardID uint64) func() error {
 	return func() error {
 		started := time.Now()
 		callCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 		defer cancel()
-		if _, err := nh.SyncRead(callCtx, metadata.MetadataShardID, nil); err != nil {
-			return err
+		// These shards have independent read indexes. Both must succeed, but
+		// neither read needs the other's result. Join both, including on error.
+		results := make(chan error, 2)
+		for _, shard := range []uint64{metadata.MetadataShardID, shardID} {
+			go func() { results <- read(callCtx, shard) }()
 		}
-		if _, err := nh.SyncRead(callCtx, shardID, nil); err != nil {
-			return err
+		var readErr error
+		for range 2 {
+			if err := <-results; err != nil && readErr == nil {
+				readErr = err
+				cancel()
+			}
 		}
-		epoch, _ := sm.ConsumerVersion()
+		if readErr != nil {
+			return readErr
+		}
+		epoch, _ := version()
 		hub.GrantDeliveryPermit(epoch, started)
 		return nil
 	}
@@ -63,7 +96,7 @@ func (h *Hub) GrantDeliveryPermit(epoch uint64, readStarted time.Time) {
 	defer h.deliveryMu.Unlock()
 	current, active := h.version()
 	if current == epoch && active {
-		until := readStarted.Add(ConsumerReadPermit)
+		until := readStarted.Add(h.readPermit)
 		if h.permitEpoch == epoch && !until.After(h.permitUntil) {
 			return // a slower, older read cannot shorten a newer same-epoch grant
 		}
@@ -146,7 +179,7 @@ type RebalanceDrain struct {
 	since time.Time
 }
 
-func (d *RebalanceDrain) Expired(epoch uint64, pending bool, now time.Time, timeout time.Duration) bool {
+func (d *RebalanceDrain) Expired(epoch uint64, pending bool, now time.Time, timeout time.Duration, permitBound ...time.Duration) bool {
 	if !pending {
 		d.since = time.Time{}
 		return false
@@ -154,5 +187,9 @@ func (d *RebalanceDrain) Expired(epoch uint64, pending bool, now time.Time, time
 	if d.since.IsZero() || epoch != d.epoch {
 		d.epoch, d.since = epoch, now
 	}
-	return now.Sub(d.since) >= timeout+ConsumerReadPermit
+	permit := ConsumerReadPermit
+	if len(permitBound) > 0 {
+		permit = max(permit, permitBound[0])
+	}
+	return now.Sub(d.since) >= timeout+permit
 }

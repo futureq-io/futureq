@@ -435,13 +435,19 @@ func (d *Dispatcher) deliverChunk(chunk deliveryChunk, states map[string]*raft.D
 // Continue to enforce the bounded ownership permit at enqueue and actual Send.
 // Legacy preparation jobs retain their post-proposal barrier.
 func (d *Dispatcher) authorizePrepared(ctx context.Context, states map[string]*raft.DeliveryState) bool {
+	if needsPreparationBarrier(states) {
+		return d.refreshPermit(ctx)
+	}
+	// Production publish-bound jobs never wait for Raft here. The scheduler's
+	// single renewal worker refreshes authorization; expired jobs wait there.
+	return d.hub.DeliveryPermitted()
+}
+
+func needsPreparationBarrier(states map[string]*raft.DeliveryState) bool {
 	for _, state := range states {
 		if state != nil && !state.PublishBound {
-			return d.refreshPermit(ctx)
+			return true
 		}
 	}
-	if d.hub.DeliveryPermitted() {
-		return true
-	}
-	return d.refreshPermit(ctx)
+	return false
 }

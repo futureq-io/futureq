@@ -22,16 +22,19 @@ type ConsumerState struct {
 	Required   []uint64                               `json:"required"`
 	Acked      map[uint64]bool                        `json:"acked"`
 	Heartbeats map[uint64]uint64                      `json:"heartbeats,omitempty"`
+	// Never decrease: an isolated replica may still hold an earlier permit.
+	MaxReadPermitMs int64 `json:"max_read_permit_ms,omitempty"`
 }
 
 type consumerChange struct {
-	Operation string         `json:"operation"`
-	Topic     string         `json:"topic,omitempty"`
-	Group     string         `json:"group,omitempty"`
-	Member    ConsumerMember `json:"member,omitempty"`
-	NodeID    uint64         `json:"node_id,omitempty"`
-	LocalIDs  []string       `json:"local_ids,omitempty"`
-	Required  []uint64       `json:"required"`
+	Operation    string         `json:"operation"`
+	Topic        string         `json:"topic,omitempty"`
+	Group        string         `json:"group,omitempty"`
+	Member       ConsumerMember `json:"member,omitempty"`
+	NodeID       uint64         `json:"node_id,omitempty"`
+	LocalIDs     []string       `json:"local_ids,omitempty"`
+	Required     []uint64       `json:"required"`
+	ReadPermitMs int64          `json:"read_permit_ms,omitempty"`
 }
 
 type consumerAck struct {
@@ -42,6 +45,9 @@ type consumerAck struct {
 func marshalConsumerChange(change consumerChange) ([]byte, error) {
 	if change.Operation != "add" && change.Operation != "remove" && change.Operation != "reconcile" {
 		return nil, fmt.Errorf("metadata: invalid consumer operation %q", change.Operation)
+	}
+	if change.ReadPermitMs < 0 || change.ReadPermitMs > 30000 {
+		return nil, fmt.Errorf("metadata: invalid consumer read permit")
 	}
 	data, err := json.Marshal(change)
 	if err != nil {
@@ -102,7 +108,7 @@ func (c *ConsumerState) applyChange(change consumerChange) bool {
 	changed := false
 	switch change.Operation {
 	case "add":
-		if change.Topic == "" || change.Member.ID == "" {
+		if change.Topic == "" || change.Member.ID == "" || change.ReadPermitMs < 0 || change.ReadPermitMs > 30000 {
 			return false
 		}
 		if c.Groups[change.Topic] == nil {
@@ -114,6 +120,7 @@ func (c *ConsumerState) applyChange(change consumerChange) bool {
 			}
 		}
 		c.Groups[change.Topic][change.Group] = append(c.Groups[change.Topic][change.Group], change.Member)
+		c.MaxReadPermitMs = max(c.MaxReadPermitMs, change.ReadPermitMs, 1000)
 		changed = true
 	case "remove":
 		members := c.Groups[change.Topic][change.Group]

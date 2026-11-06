@@ -21,23 +21,29 @@ var ErrNotFound = errors.New("subscription not found or session expired")
 
 const SessionLease = 15 * time.Second
 const heartbeatInterval = 5 * time.Second
+const renewalWorkers = 4
+const disconnectQueueSize = 1024
 
 type Service struct {
 	DB      storage.DB
 	Propose func(context.Context, []byte) (statemachine.Result, error)
 	// ApplyLocal shares the delivery ledger's standalone mutation lock.
-	ApplyLocal            func([]byte) (statemachine.Result, error)
-	IsLeader              func() bool
-	IdleTimeout           time.Duration
-	Logger                *zap.Logger
+	ApplyLocal  func([]byte) (statemachine.Result, error)
+	IsLeader    func() bool
+	IdleTimeout time.Duration
+	Logger      *zap.Logger
+	// Worker limits are installed before Run starts.
+	RenewalWorkers        int
+	DisconnectWorkers     int
 	mu                    sync.Mutex
 	sessions              map[string]*deliverypb.SubscriptionMutation
 	localMu               sync.Mutex
 	cursor, cleanupCursor []byte
+	disconnects           chan *deliverypb.SubscriptionMutation
 }
 
 func New(db storage.DB, timeout time.Duration, logger *zap.Logger) *Service {
-	return &Service{DB: db, IdleTimeout: timeout, Logger: logger, sessions: make(map[string]*deliverypb.SubscriptionMutation)}
+	return &Service{DB: db, IdleTimeout: timeout, Logger: logger, RenewalWorkers: renewalWorkers, DisconnectWorkers: 1, sessions: make(map[string]*deliverypb.SubscriptionMutation), disconnects: make(chan *deliverypb.SubscriptionMutation, disconnectQueueSize)}
 }
 func Mutation(topic, group, subscriber string) *deliverypb.SubscriptionMutation {
 	return &deliverypb.SubscriptionMutation{Topic: topic, GroupId: group, SubscriberId: subscriber}
@@ -111,15 +117,34 @@ func (s *Service) Connect(ctx context.Context, topic, group, subscriber, session
 	return record, nil
 }
 func (s *Service) Disconnect(ctx context.Context, session string) error {
-	s.mu.Lock()
-	mutation := s.sessions[session]
-	delete(s.sessions, session)
-	s.mu.Unlock()
+	mutation := s.takeSession(session)
 	if mutation == nil {
 		return nil
 	}
 	_, err := s.command(ctx, raft.SubscriptionDisconnect, mutation)
 	return err
+}
+
+func (s *Service) takeSession(session string) *deliverypb.SubscriptionMutation {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	mutation := s.sessions[session]
+	delete(s.sessions, session)
+	return mutation
+}
+
+// DisconnectAsync stops renewal immediately. Persistence is batched by Run;
+// if its bounded queue is full, the existing session lease handles expiry.
+// Mutations carry the original generation and unique session, so a delayed
+// disconnect cannot remove a replacement session or recreated subscription.
+func (s *Service) DisconnectAsync(session string) {
+	if mutation := s.takeSession(session); mutation != nil {
+		select {
+		case s.disconnects <- mutation:
+		default:
+			s.Logger.Warn("subscription disconnect queue full; session lease will expire")
+		}
+	}
 }
 func (s *Service) Alive(recipient, session string) bool {
 	record, err := raft.ReadSubscriptionRecipient(s.DB, recipient)
@@ -132,14 +157,42 @@ func (s *Service) renew(ctx context.Context) error {
 		mutations = append(mutations, proto.Clone(mutation).(*deliverypb.SubscriptionMutation))
 	}
 	s.mu.Unlock()
-	for len(mutations) > 0 {
-		count := min(len(mutations), 256)
-		if _, err := s.command(ctx, raft.SubscriptionRenew, mutations[:count]...); err != nil {
-			return err
-		}
-		mutations = mutations[count:]
+	// Each session occurs in exactly one batch. Independent batches may finish
+	// in any order; the state machine rejects expired or disconnected sessions.
+	count := min(max(1, s.RenewalWorkers), (len(mutations)+255)/256)
+	jobs := make(chan []*deliverypb.SubscriptionMutation, count)
+	errorsCh := make(chan error, count)
+	var workers sync.WaitGroup
+	for range count {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			var firstErr error
+			for batch := range jobs {
+				_, err := s.command(ctx, raft.SubscriptionRenew, batch...)
+				if firstErr == nil {
+					firstErr = err
+				}
+			}
+			errorsCh <- firstErr
+		}()
 	}
-	return nil
+	for len(mutations) > 0 && ctx.Err() == nil {
+		n := min(len(mutations), 256)
+		select {
+		case jobs <- mutations[:n]:
+			mutations = mutations[n:]
+		case <-ctx.Done():
+		}
+	}
+	close(jobs)
+	workers.Wait()
+	close(errorsCh)
+	var result error
+	for err := range errorsCh {
+		result = errors.Join(result, err)
+	}
+	return errors.Join(result, ctx.Err())
 }
 func nextPage(db storage.DB, prefix []byte, cursor *[]byte, visit func([]byte, []byte) error) error {
 	lower := prefix
@@ -246,12 +299,15 @@ func (s *Service) Maintain(ctx context.Context, now time.Time) error {
 func (s *Service) Run(ctx context.Context) {
 	// Keep lease renewal independent of slow expiry/receipt-cleanup proposals.
 	// One maintenance worker owns both scan cursors and checks each result.
-	maintenanceDone := make(chan struct{})
-	go func() {
-		defer close(maintenanceDone)
-		s.runMaintenance(ctx)
-	}()
-	defer func() { <-maintenanceDone }()
+	var workers sync.WaitGroup
+	for _, run := range []func(context.Context){s.runMaintenance, s.runDisconnectPool} {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			run(ctx)
+		}()
+	}
+	defer workers.Wait()
 
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()

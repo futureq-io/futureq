@@ -95,7 +95,7 @@ func (c *ConsumerCoordinator) Tick(ctx context.Context, now time.Time) error {
 	epoch, pending, acked := c.sm.ConsumerStatus(c.nodeID)
 	// A slow quorum read can observe a freeze committed after this tick started.
 	// Counting that read's duration would fence an old permit prematurely.
-	expired := c.drain.Expired(epoch, pending, time.Now(), c.timeout)
+	expired := c.drain.Expired(epoch, pending, time.Now(), c.timeout, c.sm.ConsumerReadPermitBound())
 	if pending && !acked && c.hub.GroupInFlightCount() == 0 {
 		return c.svc.AcknowledgeConsumers(ctx, epoch, c.nodeID)
 	}

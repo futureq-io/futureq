@@ -34,6 +34,8 @@ const (
 type Subscriptions struct {
 	// DisconnectTimeout is the time without any connected worker before unsubscribe. Zero retains interest forever.
 	DisconnectTimeout time.Duration `mapstructure:"disconnectTimeout" yaml:"disconnectTimeout"`
+	RenewalWorkers    int           `mapstructure:"renewalWorkers" yaml:"renewalWorkers"`
+	DisconnectWorkers int           `mapstructure:"disconnectWorkers" yaml:"disconnectWorkers"`
 }
 
 type Config struct {
@@ -117,8 +119,10 @@ type Delivery struct {
 	PreloadLookahead           time.Duration `mapstructure:"preloadLookahead" yaml:"preloadLookahead"`
 	PreloadMaxMessages         int           `mapstructure:"preloadMaxMessages" yaml:"preloadMaxMessages"`
 	InFlightTimeout            time.Duration `mapstructure:"inFlightTimeout" yaml:"inFlightTimeout"`
+	ReadPermit                 time.Duration `mapstructure:"readPermit" yaml:"readPermit"`
 	DeleteBatchInterval        time.Duration `mapstructure:"deleteBatchInterval" yaml:"deleteBatchInterval"`
 	DeleteWorkers              int           `mapstructure:"deleteWorkers" yaml:"deleteWorkers"`
+	ConsumerRemovalWorkers     int           `mapstructure:"consumerRemovalWorkers" yaml:"consumerRemovalWorkers"`
 	TTLSweepInterval           time.Duration `mapstructure:"ttlSweepInterval" yaml:"ttlSweepInterval"`
 	PrepareBatchSize           int           `mapstructure:"prepareBatchSize" yaml:"prepareBatchSize"`
 	PrepareBatchBytes          Size          `mapstructure:"prepareBatchBytes" yaml:"prepareBatchBytes"`
@@ -370,6 +374,18 @@ func (c *Config) validatePublishAndDelivery() error {
 	if c.Delivery.Subscriptions.DisconnectTimeout < 0 || c.Delivery.Subscriptions.DisconnectTimeout%time.Millisecond != 0 {
 		return fmt.Errorf("delivery.subscriptions.disconnectTimeout must be zero (forever) or a positive whole number of milliseconds")
 	}
+	for _, setting := range []struct {
+		key   string
+		value int
+	}{
+		{"delivery.subscriptions.renewalWorkers", c.Delivery.Subscriptions.RenewalWorkers},
+		{"delivery.subscriptions.disconnectWorkers", c.Delivery.Subscriptions.DisconnectWorkers},
+		{"delivery.consumerRemovalWorkers", c.Delivery.ConsumerRemovalWorkers},
+	} {
+		if setting.value < 1 || setting.value > 16 {
+			return fmt.Errorf("%s must be 1..16", setting.key)
+		}
+	}
 	switch c.Publish.MinAckLevel {
 	case Quorum, Leader, NoAck:
 	default:
@@ -380,6 +396,9 @@ func (c *Config) validatePublishAndDelivery() error {
 	}
 
 	d := c.Delivery
+	if d.ReadPermit < 100*time.Millisecond || d.ReadPermit > 30*time.Second || d.ReadPermit%time.Millisecond != 0 {
+		return fmt.Errorf("delivery.readPermit must be whole milliseconds from 100ms to 30s")
+	}
 	if d.DiscoveryWorkers < 1 || d.DiscoveryWorkers > 16 {
 		return fmt.Errorf("delivery.discoveryWorkers must be 1..16")
 	}

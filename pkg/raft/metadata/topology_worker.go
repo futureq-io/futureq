@@ -2,6 +2,7 @@ package metadata
 
 import (
 	"context"
+	"sync"
 	"time"
 
 	"go.uber.org/zap"
@@ -18,9 +19,18 @@ func (s *Service) requestTopology(shardID uint64) {
 	}
 }
 
-// Run publishes event-driven topology refreshes serially and retries failures.
+// Run publishes topology refreshes and consumer removals in independent workers.
 // Call after SetNodeHost and startup registration; it stops on ctx cancellation.
 func (s *Service) Run(ctx context.Context) {
+	var workers sync.WaitGroup
+	workers.Add(1)
+	go func() {
+		defer workers.Done()
+		s.runConsumerRemovalPool(ctx, func(ctx context.Context, removal consumerRemoval) error {
+			return s.ChangeConsumer(ctx, removal.shardID, removal.topic, removal.group, removal.member, false)
+		})
+	}()
+	defer workers.Wait()
 	s.runTopology(ctx, s.updateTopology)
 }
 

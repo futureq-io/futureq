@@ -196,6 +196,7 @@ type Hub struct {
 	version         func() (uint64, bool)
 	permitEpoch     uint64
 	permitUntil     time.Time
+	readPermit      time.Duration
 	registryEpoch   uint64
 	inFlightTimeout time.Duration
 
@@ -266,6 +267,7 @@ func NewHub(strategy DispatchStrategy, logger *zap.Logger, wakeCh chan struct{})
 		deliveryRecords:    make(map[string]map[string]deliveryRecord),
 		groupInFlight:      make(map[groupDeliveryKey]string),
 		inFlightTimeout:    5 * time.Second,
+		readPermit:         ConsumerReadPermit,
 		strategy:           strategy,
 		logger:             logger.Named("hub"),
 		wakeCh:             wakeCh,

@@ -26,6 +26,8 @@ var defaultConfig = Config{
 	},
 	Publish: Publish{MinAckLevel: Quorum, ProposalTimeout: 5 * time.Second},
 	Delivery: Delivery{
+		Subscriptions:              Subscriptions{RenewalWorkers: 4, DisconnectWorkers: 1},
+		ConsumerRemovalWorkers:     1,
 		DiscoveryWorkers:           2,
 		PreloadScanIdleMaxInterval: 0 * time.Millisecond,
 		ConsumerQueueSize:          1024,
@@ -34,6 +36,7 @@ var defaultConfig = Config{
 		PreloadLookahead:           0,
 		PreloadMaxMessages:         512,
 		InFlightTimeout:            5 * time.Second,
+		ReadPermit:                 time.Second,
 		DeleteBatchInterval:        500 * time.Millisecond,
 		DeleteWorkers:              16,
 		TTLSweepInterval:           time.Minute,

@@ -76,7 +76,10 @@ recreated name from affecting new deliveries.
 duration auto-unsubscribes after the last worker disconnects. Connected but idle
 workers do not expire. Creation without workers starts the disconnect clock.
 Worker sessions have a 15-second lease, renewed every 5 seconds in batches per
-broker. After an unclean exit, disconnect starts at the last lease deadline;
+broker, with at most 256 sessions per batch and four concurrent renewal batches
+by default (`delivery.subscriptions.renewalWorkers`, 1..16).
+Each batch checks its result independently; failure does not skip other batches.
+After an unclean exit, disconnect starts at the last lease deadline;
 expiry then waits the configured disconnect timeout. Maintenance runs each
 second on the event leader and handles at most 256 subscription records and 256
 receipts per pass, so cleanup/expiry can take longer for larger backlogs. Message
@@ -86,7 +89,19 @@ Expiry and retired-receipt cleanup run in one background worker, independently
 of session renewal. Slow cleanup proposals cannot hold up renewal. Each worker
 checks persistence results; expiry and cleanup revalidate the current generation
 and recipient state when applied. Shutdown cancels and joins the maintenance
-worker before storage closes.
+workers before storage closes.
+
+Stream teardown stops local session renewal immediately and queues persistence
+to a disconnect pool (up to 256 sessions per command). It defaults to one worker;
+`delivery.subscriptions.disconnectWorkers` accepts 1..16. Its shared queue holds at
+most 1024 sessions; failed commands retry. A full queue or shutdown falls back
+to lease expiry, so the automatic unsubscribe clock can start later.
+Raft consumer membership removal defaults to one background worker; configure
+`delivery.consumerRemovalWorkers` from 1..16. Its shared queue remains bounded at
+1024 entries. Local unregister still happens first under the registry lock.
+Removals target unique stream IDs; delayed retries cannot remove a replacement
+stream. Periodic node reconciliation repairs overflow or interrupted removals.
+Consumer registration and rebalance activation retain their completion checks.
 
 ## In-flight tracking & redelivery
 

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/futureq-io/futureq/internal/metrics"
+	raft "github.com/futureq-io/futureq/internal/raft/event"
 	"github.com/futureq-io/futureq/internal/storage"
 	"go.uber.org/zap"
 )
@@ -37,14 +38,21 @@ type discoveryResult struct {
 	after           []byte
 }
 type deliveryJob struct {
-	chunk deliveryChunk
-	owner *topicPreload
+	chunk  deliveryChunk
+	owner  *topicPreload
+	states map[string]*raft.DeliveryState // non-nil only when resuming prepared work
 }
 type deliveryResult struct {
 	outcome string
 	job     deliveryJob
 	sent    int
 	err     error
+	pending bool
+}
+
+type permitRenewal struct {
+	ok      bool
+	elapsed time.Duration
 }
 
 func (d *Dispatcher) discover(job discoveryJob) discoveryResult {
@@ -127,7 +135,7 @@ func (d *Dispatcher) runPipeline(parent context.Context) {
 	jobs := make(chan deliveryJob, d.Limits.Workers)
 	results := make(chan deliveryResult, d.Limits.Workers)
 	renew := make(chan struct{}, 1)
-	renewed := make(chan bool, 1)
+	renewed := make(chan permitRenewal, 1)
 	var workers sync.WaitGroup
 	for range discoveryWorkers {
 		workers.Add(1)
@@ -164,13 +172,20 @@ func (d *Dispatcher) runPipeline(parent context.Context) {
 						return
 					}
 					result := deliveryResult{job: job, outcome: "not-ready"}
-					if (job.owner.valid != nil && !job.owner.valid.Load()) || !d.hub.DeliveryPermitted() {
+					if job.owner.valid != nil && !job.owner.valid.Load() {
+						result.outcome = "permission-lost"
+					} else if !d.hub.DeliveryPermitted() {
 						result.err = errors.New("permission expired before preparation")
 						result.outcome = "permission-lost"
+						result.pending = true
 					} else {
-						callCtx, stop := context.WithTimeout(ctx, d.Limits.ValidationTimeout)
-						states, err := d.prepareChunk(callCtx, job.chunk)
-						stop()
+						states := job.states
+						var err error
+						if states == nil {
+							callCtx, stop := context.WithTimeout(ctx, d.Limits.ValidationTimeout)
+							states, err = d.prepareChunk(callCtx, job.chunk)
+							stop()
+						}
 						result.err = err
 						if err != nil {
 							result.outcome = "prepare-failed"
@@ -183,14 +198,21 @@ func (d *Dispatcher) runPipeline(parent context.Context) {
 								}
 							} else {
 								result.outcome = "permission-lost"
+								if !needsPreparationBarrier(states) {
+									result.pending = true
+									result.job.states = states
+								}
 							}
 						}
 					}
 					metrics.DeliveryWorkerOutcomesTotal.WithLabelValues(result.outcome).Inc()
 					// Do not retain payloads in outcome channels after enqueue. Job identity
 					// is sufficient to release reservations and reject stale completions.
-					result.job.chunk.payloads = nil
-					result.job.chunk.items = nil
+					if !result.pending {
+						result.job.chunk.payloads = nil
+						result.job.chunk.items = nil
+						result.job.states = nil
+					}
 					select {
 					case results <- result:
 					case <-ctx.Done():
@@ -208,9 +230,10 @@ func (d *Dispatcher) runPipeline(parent context.Context) {
 			case <-ctx.Done():
 				return
 			case <-renew:
+				started := time.Now()
 				ok := d.refreshPermit(ctx)
 				select {
-				case renewed <- ok:
+				case renewed <- permitRenewal{ok: ok, elapsed: time.Since(started)}:
 				case <-ctx.Done():
 					return
 				}
@@ -233,6 +256,9 @@ func (d *Dispatcher) runPipeline(parent context.Context) {
 		d.preloads = make(map[string]*topicPreload)
 	}
 	busy := make(map[string]*topicPreload)
+	// Waiting jobs retain their bounded reservation and validated payloads.
+	// They occupy no worker and are rechecked at enqueue and actual send.
+	pending := make(map[string]deliveryJob)
 	scanning := make(map[string]*topicPreload)
 	assigned := make(map[string]map[[24]byte]bool)
 	nextScan := make(map[string]time.Time)
@@ -247,6 +273,8 @@ func (d *Dispatcher) runPipeline(parent context.Context) {
 	dueCapacity := max(discoveryWorkers, d.Limits.Workers) * d.Limits.Candidates
 	rotation := 0
 	permitReady, renewing := false, false
+	permitDuration := d.hub.DeliveryReadPermit()
+	renewBudget := permitDuration / 2
 	var renewAfter time.Time
 	var housekeepAfter time.Time
 	ticker := time.NewTicker(d.interval)
@@ -287,9 +315,9 @@ func (d *Dispatcher) runPipeline(parent context.Context) {
 				delete(d.cursors, topic)
 			}
 		}
-		// Preparation can outlast a permit and has its own post-preparation
-		// barrier. Never require its entire budget to fit in a fresh permit.
-		budget := min(d.Limits.ValidationTimeout+d.Limits.WorkTime, ConsumerReadPermit/2)
+		// Start renewal early enough to overlap observed quorum latency with
+		// useful delivery. Its duration is always measured from read start.
+		budget := max(renewBudget, min(d.Limits.ValidationTimeout+d.Limits.WorkTime, permitDuration/2))
 		if d.hub.PermitNeedsRenewal(budget) {
 			if !renewing && !now.Before(renewAfter) {
 				renew <- struct{}{}
@@ -303,6 +331,10 @@ func (d *Dispatcher) runPipeline(parent context.Context) {
 		}
 		if !permitReady || !d.hub.DeliveryPermitted() {
 			return
+		}
+		for topic, job := range pending {
+			jobs <- job
+			delete(pending, topic)
 		}
 		if d.MaintenanceRecipients != nil {
 			topics = append(topics, maintenanceTopic)
@@ -436,14 +468,19 @@ func (d *Dispatcher) runPipeline(parent context.Context) {
 		case <-ticker.C:
 		case <-d.wakeCh:
 		case <-deadline:
-		case ok := <-renewed:
+		case renewal := <-renewed:
 			renewing = false
-			permitReady = ok
-			if !ok {
+			permitReady = renewal.ok
+			renewBudget = min(permitDuration-min(d.interval, permitDuration/10), max(permitDuration/2, 2*renewal.elapsed+d.interval))
+			if !renewal.ok {
 				renewAfter = time.Now().Add(d.interval)
 			}
 		case result := <-results:
 			topic := result.job.chunk.topic
+			if result.pending && busy[topic] == result.job.owner {
+				pending[topic] = result.job
+				break
+			}
 			if busy[topic] == result.job.owner {
 				delete(busy, topic)
 				delete(busyDue, topic)
