@@ -21,6 +21,7 @@ import (
 	"github.com/futureq-io/futureq/internal/raft/leaderpersist"
 	"github.com/futureq-io/futureq/internal/repository"
 	"github.com/futureq-io/futureq/internal/storage"
+	"github.com/futureq-io/futureq/internal/subscriptions"
 	"github.com/futureq-io/futureq/pkg/raft/metadata"
 )
 
@@ -33,10 +34,11 @@ type Repositories struct {
 }
 
 type App struct {
-	cfg      *config.Config
-	DB       storage.DB
-	NodeHost *dragonboat.NodeHost
-	Ctx      context.Context
+	Subscriptions *subscriptions.Service
+	cfg           *config.Config
+	DB            storage.DB
+	NodeHost      *dragonboat.NodeHost
+	Ctx           context.Context
 	// ShutCtx is the 10-second shutdown window context. It is populated by
 	// WithGracefulShutdown immediately before a.Ctx is cancelled, so any
 	// goroutine watching a.Ctx.Done() can safely read ShutCtx.
@@ -91,6 +93,19 @@ func Init(cfg *config.Config, logger *zap.Logger) (*App, error) {
 	}
 
 	a.DB = s
+	a.Subscriptions = subscriptions.New(s, cfg.Delivery.Subscriptions.DisconnectTimeout, logger)
+	if cfg.Cluster.Enabled {
+		a.Subscriptions.Propose = func(ctx context.Context, cmd []byte) (statemachine.Result, error) {
+			// Dragonboat requires a deadline, even when the RPC client omits one.
+			ctx, cancel := context.WithTimeout(ctx, cfg.Publish.ProposalTimeout)
+			defer cancel()
+			return a.NodeHost.SyncPropose(ctx, a.NodeHost.GetNoOPSession(cfg.Cluster.ShardID), cmd)
+		}
+		a.Subscriptions.IsLeader = func() bool {
+			id, _, valid, err := a.NodeHost.GetLeaderID(cfg.Cluster.ShardID)
+			return err == nil && valid && id == cfg.Cluster.NodeID
+		}
+	}
 
 	A = a
 

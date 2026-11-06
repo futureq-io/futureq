@@ -3,6 +3,7 @@ package dispatcher
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -235,6 +236,24 @@ func (d *Dispatcher) collectMaintenance() deliveryChunk {
 			valid = iter.Next()
 			continue
 		}
+		state, err := raft.UnmarshalDeliveryState(value)
+		if err != nil {
+			valid = iter.Next()
+			continue
+		}
+		if state.PublishBound {
+			pendingUniversal := false
+			for _, name := range state.Recipients {
+				if strings.HasPrefix(name, "u:") && state.Needs(name) {
+					pendingUniversal = true
+					break
+				}
+			}
+			if !pendingUniversal {
+				valid = iter.Next()
+				continue // named groups never need epoch-based receipt writes
+			}
+		}
 
 		eventKey := key[len(prefix):]
 		payload, closer, err := d.db.Get(eventKey)
@@ -309,6 +328,9 @@ func (d *Dispatcher) prepareChunk(ctx context.Context, chunk deliveryChunk) (map
 	if len(chunk.items) == 0 {
 		return nil, nil
 	}
+	if chunk.maintenance && d.ReconcileBatch != nil {
+		return d.ReconcileBatch(ctx, chunk.items)
+	}
 	if d.PrepareBatch != nil {
 		return d.PrepareBatch(ctx, chunk.items)
 	}
@@ -375,7 +397,7 @@ func (d *Dispatcher) deliverChunk(chunk deliveryChunk, states map[string]*raft.D
 		// snapshot can replace receipts while retaining the same event key.
 		if d.PrepareBatch != nil || d.PrepareDelivery != nil {
 			current, err := raft.ReadDeliveryState(d.db, item.Key)
-			if err != nil || current == nil || current.Epoch != item.Epoch {
+			if err != nil || current == nil || (!current.PublishBound && current.Epoch != item.Epoch) {
 				continue
 			}
 			manifest = current
@@ -406,4 +428,20 @@ func (d *Dispatcher) deliverChunk(chunk deliveryChunk, states map[string]*raft.D
 		}
 	}
 	return delivered
+}
+
+// A publish-bound receipt was applied atomically with its payload on this
+// replica. No delivery-time write or read-after-write catch-up is required.
+// Continue to enforce the bounded ownership permit at enqueue and actual Send.
+// Legacy preparation jobs retain their post-proposal barrier.
+func (d *Dispatcher) authorizePrepared(ctx context.Context, states map[string]*raft.DeliveryState) bool {
+	for _, state := range states {
+		if state != nil && !state.PublishBound {
+			return d.refreshPermit(ctx)
+		}
+	}
+	if d.hub.DeliveryPermitted() {
+		return true
+	}
+	return d.refreshPermit(ctx)
 }

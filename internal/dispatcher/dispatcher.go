@@ -44,6 +44,7 @@ type Dispatcher struct {
 	ReadBarrier                func() error
 	PrepareDelivery            func(string, []byte) (*raft.DeliveryState, error) // legacy single-key hook
 	PrepareBatch               func(context.Context, []raft.DeliveryPrepare) (map[string]*raft.DeliveryState, error)
+	ReconcileBatch             func(context.Context, []raft.DeliveryPrepare) (map[string]*raft.DeliveryState, error)
 	MaintenanceRecipients      func(string) (uint64, []string, bool)
 	Limits                     ScanLimits
 	TimeBucket                 time.Duration
@@ -135,7 +136,7 @@ func (d *Dispatcher) dispatchTopic(topic string, nowMs int64) int {
 		d.logger.Warn("failed to prepare delivery batch", zap.Error(err))
 		return 0
 	}
-	if !d.refreshPermit(ctx) {
+	if !d.authorizePrepared(ctx, states) {
 		return 0
 	}
 	return d.deliverChunk(chunk, states)

@@ -29,13 +29,17 @@ The scheduler selects exact due times independently of scans and quorum work.
 A separate bounded due allowance keeps ordinary delivery working when either
 future setting is zero and when the future cache is full.
 
-A timer wakes at eligible cached deadlines. Recipients are captured when due,
-using current ownership and epoch. Delivery workers prepare receipts, perform the
-post-preparation read barrier, validate payload versions, read current committed
-ACK state, recheck exact due time/TTL and enqueue through the existing Hub.
+A timer wakes at eligible cached deadlines. Destinations were already frozen at
+publication and committed atomically with the payload. Delivery workers read that
+receipt without another write or per-batch read barrier, validate payload
+versions, read locally applied committed ACK state, recheck exact due time/TTL
+and enqueue through the existing Hub. Clustered workers still need a valid
+ownership permit, renewed by periodic quorum reads. Lagging replicas can produce
+duplicates before observing another replica's ACK, as allowed by at-least-once.
 Valid cached data avoids a second full-payload Get/decode in final delivery;
-uncertain/invalidated data uses a counted fresh-read fallback. Preparation still
-performs existence reads. The original permit and actual-send fences remain.
+uncertain/invalidated data uses a counted fresh-read fallback. The original
+permit and actual-send fences remain. Background subscription maintenance
+releases obligations only after explicit unsubscribe or configured expiry. Disconnect alone never releases interest.
 
 Due and future cursors are independent cyclic scan positions, never completion
 watermarks. Late arrivals, retries, rejected admission and stale results recover
@@ -46,14 +50,37 @@ replay, overwrite and snapshot replacement before old data can validate.
 
 ## Hub & consumer groups
 
-Each consumer registers with a topic and a group and gets a UUID and a buffered channel (capacity 1024). Delivery semantics per topic:
+A durable subscription is created with `CreateSubscription`, independently of
+worker connections. Set exactly one of:
 
-| Consumer kind | `group_id`   | Behavior |
-| ------------- | ------------ | -------- |
-| Grouped       | non-empty    | **Competing**: exactly one consumer in the group receives each message, chosen round-robin; the pointer rotates per group on every dispatch. |
-| Universal     | empty        | **Fan-out**: every universal consumer receives every message; they never compete with each other or with groups. |
+| Identity | Behavior |
+| --- | --- |
+| `group_id` | Workers sharing the group compete for one delivery per message. |
+| `subscriber_id` | Stable universal identity with an independent copy; reconnect with the same ID. Multiple workers on that ID share its one backlog. |
 
-Different groups each get an independent copy of each message. Delivery to a channel is *non-blocking*: a slow consumer with a full channel is skipped for that message (with a warning) and, if no consumer in the topic accepted it, the message is simply not marked in-flight and is retried on the next pass.
+`Subscribe` only attaches a worker to an existing subscription; it cannot create
+or recreate interest. The server confirms binding in the stream's initial
+metadata. Consumer groups and universal subscribers use the same durable
+lifecycle in standalone and Raft mode. Destinations are frozen at publication,
+including offline subscriptions, and never expanded by retry or reconnect. A
+batch containing a topic without subscriptions is rejected atomically with
+`FailedPrecondition`.
+
+`Unsubscribe` immediately deactivates the subscription in the event shard;
+bounded background cleanup discards its pending deliveries and preserves other
+subscriptions' interests. Buffered/in-flight sends can overlap removal until
+workers observe it. A generation-specific recipient prevents old ACKs or a
+recreated name from affecting new deliveries.
+
+`delivery.subscriptions.disconnectTimeout` is `0s` by default (forever). A positive
+duration auto-unsubscribes after the last worker disconnects. Connected but idle
+workers do not expire. Creation without workers starts the disconnect clock.
+Worker sessions have a 15-second lease, renewed every 5 seconds in batches per
+broker. After an unclean exit, disconnect starts at the last lease deadline;
+expiry then waits the configured disconnect timeout. Maintenance runs each
+second on the event leader and handles at most 256 subscription records and 256
+receipts per pass, so cleanup/expiry can take longer for larger backlogs. Message
+TTL remains independent and can remove messages even for forever subscriptions.
 
 ## In-flight tracking & redelivery
 

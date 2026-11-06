@@ -358,7 +358,7 @@ func (h *Hub) DispatchPrepared(topic string, msg *pb.QueueMessage, deliveryTag [
 		metrics.DeliveryRejectedTotal.WithLabelValues("permit").Inc()
 		return nil
 	}
-	if manifest != nil && h.version != nil && manifest.Epoch != h.permitEpoch {
+	if manifest != nil && !manifest.PublishBound && h.version != nil && manifest.Epoch != h.permitEpoch {
 		metrics.DeliveryRejectedTotal.WithLabelValues("epoch").Inc()
 		return nil
 	}

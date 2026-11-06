@@ -65,16 +65,24 @@ assignment based on the event ID modulo the number of consumers, ordered by node
 ID and then registration order. Consumers with an empty group ID receive
 independent copies; they do not compete with each other.
 
-Before a message's first delivery, the event shard records its recipients: one
-interest per connected named group and one per universal subscription. An ACK
-completes only that interest. The payload and its receipt state are deleted
-together after all required interests finish. Recipient ACKs are batched through
-Raft, and completed groups are skipped on later scans. New subscriptions do not
-join an already prepared message's recipient list. An incomplete named-group
-interest survives disconnects and can resume when the group reconnects.
-Universal subscriptions are ephemeral: a later scan releases their interest
-after they unregister. TTL and explicit message deletion override these interests
-and remove the message across the cluster.
+Create durable interest with `CreateSubscription` before opening the `Subscribe`
+consumer stream. Set exactly one of `group_id` (competing workers) or
+`subscriber_id` (a stable universal subscriber identity). Separate universal IDs
+receive independent copies; connections using the same identity share its backlog.
+
+At publication, the event shard records the payload and every active subscription
+in the same atomic batch, including subscriptions with no connected workers. An
+ACK completes only that subscription's interest. The payload is removed after
+all required interests finish. New subscriptions do not receive older messages.
+Both groups and universal subscribers retain their backlog across disconnects
+and broker restart.
+
+`Unsubscribe` removes durable interest and discards only that subscription's
+pending deliveries. Cleanup is asynchronous, and sends already in flight may
+still arrive. Recreating a name creates a fresh generation with no old backlog.
+`delivery.subscriptions.disconnectTimeout` optionally unsubscribes interests with
+no connected workers; its default `0s` retains them forever. Message TTL and
+explicit message deletion still override pending obligations.
 
 Consumer membership changes pause delivery until replicas drain or time out
 their old deliveries. A replica must pass fresh quorum reads for both metadata
@@ -87,10 +95,16 @@ before serving again. Consumer timeouts and a crash before ACK persistence can
 cause duplicate deliveries, as permitted by at-least-once delivery.
 
 Fan-out retention means an incomplete named group can retain a payload until it
-ACKs, reconnects and ACKs, or the message expires/is explicitly deleted. Each newly
-prepared message adds an event-Raft write; throughput with this bookkeeping has
-not been benchmarked. Upgrading the command format requires all cluster members
-to run this version before replica consumption is enabled.
+ACKs, reconnects and ACKs, or the message expires/is explicitly deleted. Publishing
+to a topic with no registered destinations fails with `FailedPrecondition`;
+offline groups and universal subscriptions are valid destinations. Subscriptions
+survive broker restarts until explicit unsubscribe or configured expiry. Quorum
+publishes select destinations during ordered Raft apply, without an admission
+quorum read. Leader and no-ACK publishes first refresh the event-shard registry
+and freeze destinations in their log command so early acceptance has known
+delivery obligations. Each path stores payload and receipt atomically. Delivery reads the already committed receipt,
+without another preparation commit or per-batch quorum barrier, while retaining
+bounded ownership permits and actual-send fencing.
 
 ## Quick Start
 
@@ -190,6 +204,8 @@ FutureQ speaks gRPC; protobuf definitions live in [`futureq-io/protocol`](https:
 | RPC                | Type                | Description                                        |
 | ------------------ | ------------------- | -------------------------------------------------- |
 | `PublishStream`    | bidi streaming      | Publish batches of delayed messages; receive per-batch acks |
+| `CreateSubscription` | unary | Create durable group or universal interest without a worker connection |
+| `Unsubscribe` | unary | Remove interest and discard its pending deliveries |
 | `Subscribe`        | bidi streaming      | Receive messages for a topic/consumer group; ack over the same stream |
 | `GetClusterInfo`   | unary               | Cluster topology, leader and member metadata       |
 | `JoinCluster`      | unary               | Add a node to the event shard and metadata group   |

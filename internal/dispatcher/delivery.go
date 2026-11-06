@@ -27,10 +27,47 @@ type DeliveryLedger struct {
 	ProposeContext func(context.Context, []byte) (statemachine.Result, error)
 }
 
+// PublishedBatch is the production delivery path. Missing or unbound receipts
+// never cause a new roster to be inferred from connected workers.
+func (l *DeliveryLedger) PublishedBatch(ctx context.Context, items []raft.DeliveryPrepare) (map[string]*raft.DeliveryState, error) {
+	started := time.Now()
+	defer func() {
+		metrics.DeliveryPrepareDurationMs.WithLabelValues("batch").Observe(float64(time.Since(started).Microseconds()) / 1000)
+	}()
+	states := make(map[string]*raft.DeliveryState, len(items))
+	for _, item := range items {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		state, err := raft.ReadDeliveryState(l.db, item.Key)
+		if err != nil {
+			return nil, err
+		}
+		if state != nil && !state.PublishBound {
+			return nil, fmt.Errorf("message lacks a publish-bound receipt")
+		}
+		states[string(item.Key)] = state
+		if state != nil {
+			metrics.DeliveryManifestHitsTotal.Inc()
+		}
+	}
+	return states, nil
+}
+
 // PrepareBatch returns committed states keyed by event key. Inputs carry one
 // immutable epoch/recipient view captured by the scheduler. Timeouts are
 // uncertain completion: retries use the same idempotent preparation command.
 func (l *DeliveryLedger) PrepareBatch(ctx context.Context, items []raft.DeliveryPrepare) (map[string]*raft.DeliveryState, error) {
+	return l.prepareBatch(ctx, items, false)
+}
+
+// ReconcileBatch retires vanished universal interests off the delivery path.
+// Named interests stay frozen, including groups with no connected workers.
+func (l *DeliveryLedger) ReconcileBatch(ctx context.Context, items []raft.DeliveryPrepare) (map[string]*raft.DeliveryState, error) {
+	return l.prepareBatch(ctx, items, true)
+}
+
+func (l *DeliveryLedger) prepareBatch(ctx context.Context, items []raft.DeliveryPrepare, reconcile bool) (map[string]*raft.DeliveryState, error) {
 	started := time.Now()
 	defer func() {
 		elapsed := float64(time.Since(started).Microseconds()) / 1000
@@ -53,7 +90,7 @@ func (l *DeliveryLedger) PrepareBatch(ctx context.Context, items []raft.Delivery
 		if err != nil {
 			return nil, err
 		}
-		if state != nil && state.Epoch >= item.Epoch {
+		if state != nil && (state.Epoch >= item.Epoch || (state.PublishBound && !reconcile)) {
 			states[string(item.Key)] = state
 			metrics.DeliveryManifestHitsTotal.Inc()
 		} else {
@@ -231,4 +268,16 @@ func (l *DeliveryLedger) DeleteKeys(keys [][]byte) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.backend.DeleteKeys(keys)
+}
+
+// ApplySubscription shares the standalone receipt lock with ACK and deletion.
+func (l *DeliveryLedger) ApplySubscription(cmd []byte) (statemachine.Result, error) {
+	var result statemachine.Result
+	err := l.applyLocal(storage.Sync, func(batch *raft.DeliveryBatch) ([][]byte, error) {
+		var deleted [][]byte
+		var err error
+		result, deleted, err = batch.ApplySubscription(cmd)
+		return deleted, err
+	})
+	return result, err
 }

@@ -7,13 +7,17 @@ import (
 	"strings"
 
 	"github.com/futureq-io/futureq/internal/storage"
+	deliverypb "github.com/futureq-io/protocol/proto/go/delivery"
 	"github.com/lni/dragonboat/v4/statemachine"
 )
 
 // DeliveryState shares one payload across independent logical deliveries.
-// Named group receipts survive disconnects and reassignment. Universal
-// subscriptions are ephemeral and lose their interest when unregistered.
+// Group and universal subscriptions use generation-specific durable recipients.
+// Disconnect and assignment changes never remove their delivery obligations.
 type DeliveryState struct {
+	// PublishBound rosters are committed atomically with the payload. Assignment
+	// epochs fence workers, but cannot change a message's durable destinations.
+	PublishBound bool
 	Epoch        uint64
 	Recipients   []string // sorted, unique frozen roster
 	Acknowledged []byte   // bit i corresponds to Recipients[i]
@@ -136,11 +140,12 @@ func MarshalAckDeliveryBatchCmd(acks []DeliveryAck) ([]byte, error) {
 // deletes in one Dragonboat Update see each other, rather than stale DB reads.
 // Call Flush before committing the storage batch to persist final receipts.
 type DeliveryBatch struct {
-	db      storage.DB
-	batch   storage.Batch
-	states  map[string]*DeliveryState
-	present map[string]bool
-	dirty   map[string]bool
+	subscriptions map[string]*deliverypb.SubscriptionRecord
+	db            storage.DB
+	batch         storage.Batch
+	states        map[string]*DeliveryState
+	present       map[string]bool
+	dirty         map[string]bool
 }
 
 func NewDeliveryBatch(db storage.DB, batch storage.Batch) *DeliveryBatch {

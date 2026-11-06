@@ -97,17 +97,42 @@ func (s *EventStateMachine) applyEntry(batch storage.Batch, delivery *DeliveryBa
 	}
 
 	switch CommandType(cmd[0]) {
-	case StoreBatchCmd:
-		items, err := UnmarshalStoreBatchCmd(cmd)
+	case SubscriptionCmd:
+		result, deleted, err := delivery.ApplySubscription(cmd)
+		return result, deleted, 0, err
+	case StoreBatchCmd, StoreDeliveryBatchCmd, PublishBatchCmd:
+		var items []StoreBatchItem
+		var err error
+		if CommandType(cmd[0]) == PublishBatchCmd {
+			items, err = UnmarshalPublishBatchCmd(cmd)
+		} else if CommandType(cmd[0]) == StoreDeliveryBatchCmd {
+			items, err = UnmarshalStoreDeliveryBatchCmd(cmd)
+		} else {
+			items, err = UnmarshalStoreBatchCmd(cmd)
+		}
 		if err != nil {
 			return statemachine.Result{}, nil, 0, fmt.Errorf("raft: invalid StoreBatchCmd: %w", err)
 		}
+		if CommandType(cmd[0]) == PublishBatchCmd {
+			result, admitted, err := delivery.bindPublishRecipients(items)
+			if err != nil || !admitted {
+				return result, nil, 0, err
+			}
+		}
 		var maxID uint64
 		for _, it := range items {
-			if _, err := s.repo.StoreRawWithBatch(batch, it.ID, it.Bucket, it.TopicHash, it.Indexes, it.Msg); err != nil {
+			key, err := s.repo.StoreRawWithBatch(batch, it.ID, it.Bucket, it.TopicHash, it.Indexes, it.Msg)
+			if err != nil {
 				return statemachine.Result{}, nil, 0, fmt.Errorf("raft: StoreRawWithBatch: %w", err)
 			}
 			delivery.ObserveStore(utils.EventKey(it.Bucket, it.TopicHash, it.ID))
+			if len(it.Receipt) > 0 {
+				state, err := UnmarshalDeliveryState(it.Receipt)
+				if err != nil {
+					return statemachine.Result{}, nil, 0, err
+				}
+				delivery.save(key, state)
+			}
 			if it.ID > maxID {
 				maxID = it.ID
 			}

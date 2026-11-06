@@ -21,6 +21,7 @@ import (
 	"github.com/futureq-io/futureq/pkg/utils"
 	pb "github.com/futureq-io/protocol/proto/go"
 	storagepb "github.com/futureq-io/protocol/proto/go/storage"
+	"github.com/lni/dragonboat/v4/statemachine"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -53,10 +54,11 @@ type ProducerHandler struct {
 // In Raft mode the handler never writes directly to Pebble; all writes go
 // through SyncPropose → state machine → Pebble.
 func NewProducerHandler(logger *zap.Logger) *ProducerHandler {
-	return &ProducerHandler{
+	h := &ProducerHandler{
 		logger:         logger.Named("producer"),
 		timeBucketSize: app.A.Config().Delivery.TimeBucket,
 	}
+	return h
 }
 
 // PublishStream handles a bidirectional stream where clients send PublishBatch
@@ -94,8 +96,16 @@ func (ph *ProducerHandler) processBatch(ctx context.Context, batch *pb.PublishBa
 	if len(batch.Messages) == 0 {
 		return &pb.PublishBatchAck{}, nil
 	}
+	for _, message := range batch.Messages {
+		if message == nil || message.Topic == "" {
+			return &pb.PublishBatchAck{Success: false}, status.Error(codes.InvalidArgument, "publish topic must not be empty")
+		}
+	}
 
 	ackLevel := batch.GetAckLevel()
+	if ackLevel != pb.AckLevel_ACK_LEVEL_QUORUM && ackLevel != pb.AckLevel_ACK_LEVEL_LEADER && ackLevel != pb.AckLevel_ACK_LEVEL_NO_ACK {
+		return &pb.PublishBatchAck{Success: false}, status.Error(codes.InvalidArgument, "unknown ack level")
+	}
 	topicLabel := batchTopicLabel(batch)
 	start := time.Now()
 
@@ -106,12 +116,23 @@ func (ph *ProducerHandler) processBatch(ctx context.Context, batch *pb.PublishBa
 	}
 
 	nowMs := time.Now().UnixMilli()
+	var receipts map[string][]byte
+	// Quorum publishes decide admission in the ordered event state machine.
+	// Standalone and early ACKs must bind destinations before storing/submitting.
+	if app.A.NodeHost == nil || ackLevel != pb.AckLevel_ACK_LEVEL_QUORUM {
+		var err error
+		receipts, err = ph.publishReceipts(ctx, batch)
+		if err != nil {
+			metrics.PublishRequestsTotal.WithLabelValues(topicLabel, ackLevel.String(), "rejected").Inc()
+			return &pb.PublishBatchAck{Success: false}, err
+		}
+	}
 
 	var processErr error
 	if app.A.NodeHost != nil {
-		processErr = ph.processRaftBatch(ctx, batch, nowMs, ackLevel)
+		processErr = ph.processRaftBatch(ctx, batch, nowMs, ackLevel, receipts)
 	} else {
-		processErr = ph.processStandaloneBatch(batch, nowMs)
+		processErr = ph.processStandaloneBatch(batch, nowMs, receipts)
 	}
 
 	if processErr != nil {
@@ -166,6 +187,9 @@ func (ph *ProducerHandler) marshalMessages(
 	fn func(data *storagepb.StoredMessage) error,
 ) error {
 	for i, msg := range batch.Messages {
+		if msg == nil || msg.Topic == "" {
+			return status.Error(codes.InvalidArgument, "publish topic must not be empty")
+		}
 		if msg.DelayMs < 0 {
 			return fmt.Errorf("negative delays are not allowed! delay: %d, topic: %s message_idx: %d", msg.DelayMs, msg.Topic, i)
 		}
@@ -196,6 +220,7 @@ func (ph *ProducerHandler) processRaftBatch(
 	batch *pb.PublishBatch,
 	nowMs int64,
 	ackLevel pb.AckLevel,
+	receipts map[string][]byte,
 ) error {
 	shardID := app.A.Config().Cluster.ShardID
 
@@ -217,6 +242,7 @@ func (ph *ProducerHandler) processRaftBatch(
 			Bucket:    utils.CalculateBucket(data.EnqueuedAtUnixMs+data.DelayMs, app.A.Config().Delivery.TimeBucket),
 			TopicHash: utils.TopicHash(data.Topic),
 			Msg:       dataBytes,
+			Receipt:   receipts[data.Topic],
 		}
 
 		for _, idx := range data.GetIndexes() {
@@ -234,7 +260,13 @@ func (ph *ProducerHandler) processRaftBatch(
 		return fmt.Errorf("failed to build store batch: %w", err)
 	}
 
-	cmdBytes, err := raft.MarshalStoreBatchCmd(items)
+	var cmdBytes []byte
+	var err error
+	if ackLevel == pb.AckLevel_ACK_LEVEL_QUORUM {
+		cmdBytes, err = raft.MarshalPublishBatchCmd(items)
+	} else {
+		cmdBytes, err = raft.MarshalStoreDeliveryBatchCmd(items)
+	}
 	if err != nil {
 		return fmt.Errorf("failed to marshal StoreBatchCmd: %w", err)
 	}
@@ -270,15 +302,23 @@ func (ph *ProducerHandler) processRaftBatch(
 		select {
 		case <-persistedCh:
 			ph.logger.Debug("leader has persisted and acked")
-		case <-rs.AppliedC():
-			proposeErr = fmt.Errorf("leader-ack propose failed before persist")
+		case result := <-rs.AppliedC():
+			// Apply completion also proves persistence. Both channels may be
+			// ready when we wake, so selecting apply is not itself a failure.
+			if !result.Completed() {
+				proposeErr = errors.New("leader-ack proposal did not complete")
+			}
 		case <-propCtx.Done():
 			proposeErr = fmt.Errorf("leader-ack wait cancelled: %w", propCtx.Err())
 		}
 	default:
 		propCtx, cancel := context.WithTimeout(ctx, proposalTimeout)
 		session := app.A.NodeHost.GetNoOPSession(shardID)
-		_, proposeErr = app.A.NodeHost.SyncPropose(propCtx, session, cmdBytes)
+		var result statemachine.Result
+		result, proposeErr = app.A.NodeHost.SyncPropose(propCtx, session, cmdBytes)
+		if proposeErr == nil {
+			proposeErr = raft.CheckPublishResult(result, len(items))
+		}
 		cancel()
 	}
 
@@ -287,6 +327,14 @@ func (ph *ProducerHandler) processRaftBatch(
 	)
 
 	if proposeErr != nil {
+		var rejection *raft.PublishRejectedError
+		if errors.As(proposeErr, &rejection) {
+			code := codes.FailedPrecondition
+			if rejection.Reason == raft.PublishTooManyDestinations {
+				code = codes.ResourceExhausted
+			}
+			return status.Error(code, rejection.Error())
+		}
 		return fmt.Errorf("failed to do raft proposal: %w", proposeErr)
 	}
 
@@ -294,13 +342,16 @@ func (ph *ProducerHandler) processRaftBatch(
 }
 
 // processStandaloneBatch writes the batch directly to Pebble (non-Raft mode).
-func (ph *ProducerHandler) processStandaloneBatch(batch *pb.PublishBatch, nowMs int64) error {
+func (ph *ProducerHandler) processStandaloneBatch(batch *pb.PublishBatch, nowMs int64, receipts map[string][]byte) error {
 	b := app.A.DB.NewBatch()
 	defer func() { _ = b.Close() }()
 
 	if err := ph.marshalMessages(batch, nowMs, func(data *storagepb.StoredMessage) error {
-		_, err := app.A.Repositories.Events.StoreWithBatch(b, app.A.Repositories.Events.NextID(), data)
-		return err
+		key, err := app.A.Repositories.Events.StoreWithBatch(b, app.A.Repositories.Events.NextID(), data)
+		if err != nil {
+			return err
+		}
+		return b.Set(raft.DeliveryStateKey(key), receipts[data.Topic])
 	}); err != nil {
 		return err
 	}
@@ -311,4 +362,36 @@ func (ph *ProducerHandler) processStandaloneBatch(batch *pb.PublishBatch, nowMs 
 	}
 
 	return nil
+}
+
+// publishReceipts binds standalone and early-ACK destinations before acceptance.
+// Only the early-ACK Raft path performs this admission quorum read.
+func (ph *ProducerHandler) publishReceipts(ctx context.Context, batch *pb.PublishBatch) (map[string][]byte, error) {
+	a := app.A
+	if a.NodeHost != nil {
+		callCtx, cancel := context.WithTimeout(ctx, a.Config().Publish.ProposalTimeout)
+		defer cancel()
+		if _, err := a.NodeHost.SyncRead(callCtx, a.Config().Cluster.ShardID, nil); err != nil {
+			return nil, status.Errorf(codes.Unavailable, "subscription registry unavailable: %v", err)
+		}
+	}
+	result := make(map[string][]byte)
+	for _, msg := range batch.Messages {
+		if _, ok := result[msg.Topic]; ok {
+			continue
+		}
+		names, err := raft.ReadSubscriptionRecipients(a.DB, msg.Topic)
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "read durable subscriptions: %v", err)
+		}
+		if len(names) == 0 {
+			return nil, status.Errorf(codes.FailedPrecondition, "topic %q has no registered destinations", msg.Topic)
+		}
+		data, err := raft.MarshalPublishReceipt(0, names)
+		if err != nil {
+			return nil, status.Errorf(codes.ResourceExhausted, "publish destinations: %v", err)
+		}
+		result[msg.Topic] = data
+	}
+	return result, nil
 }

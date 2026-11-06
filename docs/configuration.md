@@ -145,3 +145,15 @@ before retaining an existing large count: this cache now owns payload data.
 - `cluster.raft.rtt` must be whole milliseconds ≥1ms.
 - Unknown `publish.minAckLevel` values fail startup.
 - `storage.pebble.walEnabled: false` is only legal for clustered disk nodes.
+
+### delivery.subscriptions
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `delivery.subscriptions.disconnectTimeout` | `0s` | Duration without any connected worker before automatic unsubscribe and pending-delivery discard. `0s` retains group and universal subscriptions forever. Positive values must be whole milliseconds. Connected idle workers do not expire. |
+
+Environment override: `FUTUREQ_DELIVERY_SUBSCRIPTIONS_DISCONNECTTIMEOUT=24h`.
+Message TTL still applies. A never-connected subscription starts its timer at
+creation; a crashed broker's connections are recognized through session lease
+expiry before the disconnect timeout starts. Expiry and backlog cleanup are
+asynchronous and bounded per maintenance pass.

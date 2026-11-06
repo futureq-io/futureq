@@ -29,8 +29,8 @@ One binary, two operating modes, selected by `cluster.enabled`:
 | --------------------- | ------------------------------------------------ | -------------------------- |
 | Writes               | Direct Pebble batch, fsynced per publish batch   | One Raft log entry per publish batch, applied by the on-disk state machine on every replica |
 | Deletes              | Direct storage batch                             | `DeleteBatchCmd` proposed through Raft — replicated, so a new leader can't resurrect ACKed messages |
-| Dispatch             | Always                                           | Only on the event-shard leader |
-| Consume              | Always                                           | Only on the leader (client SDKs learn the leader's address from the metadata group) |
+| Dispatch             | Always                                           | On replicas with active local consumers and a valid ownership permit |
+| Consume              | Always                                           | Any event replica, using committed group assignments |
 | Membership           | —                                                | Event shard + metadata group (shard 0), joined over gRPC |
 
 ## Write path
@@ -38,16 +38,22 @@ One binary, two operating modes, selected by `cluster.enabled`:
 1. A producer sends a `PublishBatch` over the `PublishStream` bidi stream.
 2. The broker validates (no negative delays/TTLs; batch ack level ≥ broker minimum) and wraps each message into a serialized `StoredMessage`.
 3. The leader assigns each message a **monotonic event ID** (persisted across restarts), computes its **time bucket** from `enqueue time + delay`, and hashes the topic.
-4. Clustered mode: the whole batch becomes a single `StoreBatchCmd` Raft log entry; replicas apply it verbatim so keys converge. Standalone: one Pebble batch, committed with fsync.
-5. The message lands in storage under a 24-byte [time-bucketed key](storage.md) (`topicHash · bucket · eventID`) plus optional secondary indexes.
+4. Snapshot all durable named destinations (including offline groups) and live
+   universal subscriptions. Reject the whole batch if any topic has no destinations.
+5. Clustered mode: one `StoreDeliveryBatchCmd` commits both payloads and frozen
+   receipts through Raft. Standalone: one storage batch commits both with fsync.
+6. The message lands in storage under a 24-byte [time-bucketed key](storage.md) (`topicHash · bucket · eventID`) plus optional secondary indexes.
 
 ## Read path
 
 Reads are **push-based** — consumers never poll the broker:
 
-1. A consumer opens a `Subscribe` bidi stream with topic and group; the hub registers it.
+1. A consumer opens a `Subscribe` bidi stream with topic and group. A named
+   group is durably registered in the event store before its worker is exposed.
 2. The [dispatcher](delivery.md) periodically scans *only topics with active consumers* for due buckets (a pure range scan that never touches future buckets).
-3. Due messages fan out through the hub: every consumer group gets one copy, round-robin within the group; universal consumers each get every message.
+3. Due messages fan out to the destinations frozen at publication. Local committed
+   receipts and ACK bits require no delivery-time preparation commit. Worker
+   selection still uses current assignments and expiring ownership permits.
 4. Delivered messages become *in-flight* until ACKed; after `inFlightTimeout` they are re-dispatched (at-least-once).
 
 ## Delete path

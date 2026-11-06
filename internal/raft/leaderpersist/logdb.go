@@ -56,7 +56,22 @@ func (l *logDB) SaveRaftState(updates []pb.Update, shardID uint64) error {
 	for i := range updates {
 		ud := &updates[i]
 		for j := range ud.EntriesToSave {
-			cmd := ud.EntriesToSave[j].Cmd
+			entry := &ud.EntriesToSave[j]
+			cmd := entry.Cmd
+			switch entry.Type {
+			case pb.ApplicationEntry:
+			case pb.EncodedEntry:
+				// The pinned Dragonboat version wraps uncompressed commands in
+				// a v0 header byte, even when entry compression is disabled.
+				// FutureQ uses NoCompression. Unknown encodings must not notify
+				// a waiter for a different payload; completed apply is the fallback.
+				if len(cmd) == 0 || cmd[0] != 0 {
+					continue
+				}
+				cmd = cmd[1:]
+			default:
+				continue
+			}
 			if len(cmd) == 0 {
 				continue
 			}

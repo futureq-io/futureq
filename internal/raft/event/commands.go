@@ -25,6 +25,13 @@ const (
 	ProtoPrepareDeliveryBatchCmd
 	ProtoAckDeliveryBatchCmd
 	ProtoPrepareDeliveryCmd
+
+	// Publish-time delivery and durable group registration.
+	StoreDeliveryBatchCmd
+	SubscriptionCmd
+
+	// Quorum publish: destinations are selected at this Raft log entry.
+	PublishBatchCmd
 )
 
 // StoreBatchItem is the minimal per-message metadata carried in a StoreBatchCmd.
@@ -44,6 +51,8 @@ type StoreBatchItem struct {
 	// Msg is the already-serialised storagepb.StoredMessage proto bytes.
 	// This slice aliases the original command buffer — do not mutate.
 	Msg []byte
+	// Receipt is used by StoreDeliveryBatchCmd only and is atomic with Msg.
+	Receipt []byte
 }
 
 // MarshalStoreBatchCmd serialises a list of items into a compact binary command.
@@ -119,11 +128,15 @@ func MarshalStoreBatchCmd(items []StoreBatchItem) ([]byte, error) {
 // The Msg and Indexes slices in the returned items alias the input data slice — they are
 // zero-copy views into the Dragonboat log buffer. Callers must not mutate them.
 func UnmarshalStoreBatchCmd(data []byte) ([]StoreBatchItem, error) {
+	return unmarshalStoreBatch(data, StoreBatchCmd)
+}
+
+func unmarshalStoreBatch(data []byte, commandType CommandType) ([]StoreBatchItem, error) {
 	if len(data) < 1+8 {
 		return nil, fmt.Errorf("raft: StoreBatchCmd too short: %d bytes", len(data))
 	}
-	if CommandType(data[0]) != StoreBatchCmd {
-		return nil, fmt.Errorf("raft: expected StoreBatchCmd (0), got %d", data[0])
+	if CommandType(data[0]) != commandType {
+		return nil, fmt.Errorf("raft: expected command %d, got %d", commandType, data[0])
 	}
 
 	count := binary.BigEndian.Uint64(data[1:9])

@@ -31,6 +31,11 @@ const (
 	DefaultPayloadCacheHash  = PayloadCacheHashFNV
 )
 
+type Subscriptions struct {
+	// DisconnectTimeout is the time without any connected worker before unsubscribe. Zero retains interest forever.
+	DisconnectTimeout time.Duration `mapstructure:"disconnectTimeout" yaml:"disconnectTimeout"`
+}
+
 type Config struct {
 	ConfigVersion int           `mapstructure:"configVersion" yaml:"configVersion"`
 	API           API           `mapstructure:"api" yaml:"api"`
@@ -103,6 +108,7 @@ type Publish struct {
 }
 
 type Delivery struct {
+	Subscriptions              Subscriptions `mapstructure:"subscriptions" yaml:"subscriptions"`
 	DiscoveryWorkers           int           `mapstructure:"discoveryWorkers" yaml:"discoveryWorkers"`
 	PreloadScanIdleMaxInterval time.Duration `mapstructure:"preloadScanIdleMaxInterval" yaml:"preloadScanIdleMaxInterval"`
 	ConsumerQueueSize          int           `mapstructure:"consumerQueueSize" yaml:"consumerQueueSize"`
@@ -360,6 +366,9 @@ func (c *Config) validatePayloadCacheSlots() error {
 }
 
 func (c *Config) validatePublishAndDelivery() error {
+	if c.Delivery.Subscriptions.DisconnectTimeout < 0 || c.Delivery.Subscriptions.DisconnectTimeout%time.Millisecond != 0 {
+		return fmt.Errorf("delivery.subscriptions.disconnectTimeout must be zero (forever) or a positive whole number of milliseconds")
+	}
 	switch c.Publish.MinAckLevel {
 	case Quorum, Leader, NoAck:
 	default:
