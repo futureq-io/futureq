@@ -38,8 +38,8 @@ ownership permit, renewed by periodic quorum reads. Lagging replicas can produce
 duplicates before observing another replica's ACK, as allowed by at-least-once.
 Valid cached data avoids a second full-payload Get/decode in final delivery;
 uncertain/invalidated data uses a counted fresh-read fallback. The original
-permit and actual-send fences remain. Background maintenance retires disconnected
-universal interests; it never removes an incomplete named-group obligation.
+permit and actual-send fences remain. Background subscription maintenance
+releases obligations only after explicit unsubscribe or configured expiry. Disconnect alone never releases interest.
 
 Due and future cursors are independent cyclic scan positions, never completion
 watermarks. Late arrivals, retries, rejected admission and stale results recover
@@ -50,26 +50,37 @@ replay, overwrite and snapshot replacement before old data can validate.
 
 ## Hub & consumer groups
 
-Each consumer registers with a topic and a group and gets a UUID and a buffered channel (capacity 1024). Delivery semantics per topic:
+A durable subscription is created with `CreateSubscription`, independently of
+worker connections. Set exactly one of:
 
-| Consumer kind | `group_id`   | Behavior |
-| ------------- | ------------ | -------- |
-| Grouped       | non-empty    | **Competing**: exactly one consumer in the group receives each message, chosen round-robin; the pointer rotates per group on every dispatch. |
-| Universal     | empty        | **Fan-out**: every universal consumer receives every message; they never compete with each other or with groups. |
+| Identity | Behavior |
+| --- | --- |
+| `group_id` | Workers sharing the group compete for one delivery per message. |
+| `subscriber_id` | Stable universal identity with an independent copy; reconnect with the same ID. Multiple workers on that ID share its one backlog. |
 
-Different groups each get an independent copy of each message. Delivery to a channel is *non-blocking*: a slow consumer with a full channel is skipped for that message (with a warning) and, if no consumer in the topic accepted it, the message is simply not marked in-flight and is retried on the next pass.
+`Subscribe` only attaches a worker to an existing subscription; it cannot create
+or recreate interest. The server confirms binding in the stream's initial
+metadata. Consumer groups and universal subscribers use the same durable
+lifecycle in standalone and Raft mode. Destinations are frozen at publication,
+including offline subscriptions, and never expanded by retry or reconnect. A
+batch containing a topic without subscriptions is rejected atomically with
+`FailedPrecondition`.
 
-A named group is durably registered on its first subscription, independently of
-its current worker sessions. Publishes include every registered named group,
-including groups with no connected workers. Their backlogs survive disconnects
-and broker restart. Groups registered after publication do not receive older
-messages. There is currently no group deletion API. TTL and explicit message
-deletion still override pending obligations.
+`Unsubscribe` immediately deactivates the subscription in the event shard;
+bounded background cleanup discards its pending deliveries and preserves other
+subscriptions' interests. Buffered/in-flight sends can overlap removal until
+workers observe it. A generation-specific recipient prevents old ACKs or a
+recreated name from affecting new deliveries.
 
-Universal subscriptions remain ephemeral: only those registered when publishing
-are included, and their interests are released after disconnect. A publish batch
-containing a topic with no durable groups or live universal subscribers is
-rejected atomically with `FailedPrecondition`.
+`delivery.subscriptions.disconnectTimeout` is `0s` by default (forever). A positive
+duration auto-unsubscribes after the last worker disconnects. Connected but idle
+workers do not expire. Creation without workers starts the disconnect clock.
+Worker sessions have a 15-second lease, renewed every 5 seconds in batches per
+broker. After an unclean exit, disconnect starts at the last lease deadline;
+expiry then waits the configured disconnect timeout. Maintenance runs each
+second on the event leader and handles at most 256 subscription records and 256
+receipts per pass, so cleanup/expiry can take longer for larger backlogs. Message
+TTL remains independent and can remove messages even for forever subscriptions.
 
 ## In-flight tracking & redelivery
 

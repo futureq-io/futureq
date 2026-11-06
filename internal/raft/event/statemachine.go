@@ -97,15 +97,9 @@ func (s *EventStateMachine) applyEntry(batch storage.Batch, delivery *DeliveryBa
 	}
 
 	switch CommandType(cmd[0]) {
-	case RegisterDeliveryGroupCmd:
-		key, err := registerDeliveryGroupKey(cmd)
-		if err != nil {
-			return statemachine.Result{}, nil, 0, err
-		}
-		if err := batch.Set(key, []byte{1}); err != nil {
-			return statemachine.Result{}, nil, 0, err
-		}
-		return statemachine.Result{Value: 1}, nil, 0, nil
+	case SubscriptionCmd:
+		result, deleted, err := delivery.ApplySubscription(cmd)
+		return result, deleted, 0, err
 	case StoreBatchCmd, StoreDeliveryBatchCmd:
 		var items []StoreBatchItem
 		var err error

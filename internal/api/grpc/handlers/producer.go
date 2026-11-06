@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"strings"
 	"time"
 
 	"go.uber.org/zap"
@@ -46,21 +45,17 @@ func minProtoAckLevel(min config.AckLevel) pb.AckLevel {
 // ProducerHandler implements pb.FutureQProducerServer.
 type ProducerHandler struct {
 	pb.UnimplementedFutureQProducerServer
-	logger          *zap.Logger
-	timeBucketSize  time.Duration
-	localRecipients func(string) (uint64, []string, bool)
+	logger         *zap.Logger
+	timeBucketSize time.Duration
 }
 
 // NewProducerHandler returns an initialised ProducerHandler.
 // In Raft mode the handler never writes directly to Pebble; all writes go
 // through SyncPropose → state machine → Pebble.
-func NewProducerHandler(logger *zap.Logger, localRecipients ...func(string) (uint64, []string, bool)) *ProducerHandler {
+func NewProducerHandler(logger *zap.Logger) *ProducerHandler {
 	h := &ProducerHandler{
 		logger:         logger.Named("producer"),
 		timeBucketSize: app.A.Config().Delivery.TimeBucket,
-	}
-	if len(localRecipients) > 0 {
-		h.localRecipients = localRecipients[0]
 	}
 	return h
 }
@@ -337,10 +332,7 @@ func (ph *ProducerHandler) publishReceipts(ctx context.Context, batch *pb.Publis
 		callCtx, cancel := context.WithTimeout(ctx, a.Config().Publish.ProposalTimeout)
 		defer cancel()
 		if _, err := a.NodeHost.SyncRead(callCtx, a.Config().Cluster.ShardID, nil); err != nil {
-			return nil, status.Errorf(codes.Unavailable, "delivery group registry unavailable: %v", err)
-		}
-		if err := a.MetadataSvc.SyncConsumers(callCtx); err != nil {
-			return nil, status.Errorf(codes.Unavailable, "consumer registry unavailable: %v", err)
+			return nil, status.Errorf(codes.Unavailable, "subscription registry unavailable: %v", err)
 		}
 	}
 	result := make(map[string][]byte)
@@ -348,32 +340,14 @@ func (ph *ProducerHandler) publishReceipts(ctx context.Context, batch *pb.Publis
 		if _, ok := result[msg.Topic]; ok {
 			continue
 		}
-		names, err := raft.ReadDeliveryGroups(a.DB, msg.Topic)
+		names, err := raft.ReadSubscriptionRecipients(a.DB, msg.Topic)
 		if err != nil {
-			return nil, status.Errorf(codes.Internal, "read durable groups: %v", err)
-		}
-		var epoch uint64
-		var live []string
-		active := true
-		if a.NodeHost != nil {
-			epoch, live, active = a.MetadataSM.DeliveryRecipients(msg.Topic)
-		} else if ph.localRecipients != nil {
-			epoch, live, active = ph.localRecipients(msg.Topic)
-		}
-		if !active {
-			return nil, status.Error(codes.Unavailable, "consumer assignment is changing; retry publish")
-		}
-		// Named interests come from durable registration; universal subscriptions
-		// remain session-scoped and are captured only while registered.
-		for _, name := range live {
-			if strings.HasPrefix(name, "u:") {
-				names = append(names, name)
-			}
+			return nil, status.Errorf(codes.Internal, "read durable subscriptions: %v", err)
 		}
 		if len(names) == 0 {
 			return nil, status.Errorf(codes.FailedPrecondition, "topic %q has no registered destinations", msg.Topic)
 		}
-		data, err := raft.MarshalPublishReceipt(epoch, names)
+		data, err := raft.MarshalPublishReceipt(0, names)
 		if err != nil {
 			return nil, status.Errorf(codes.ResourceExhausted, "publish destinations: %v", err)
 		}

@@ -4,18 +4,19 @@ import (
 	"context"
 	"errors"
 	"io"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	grpcmetadata "google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
 	"github.com/futureq-io/futureq/internal/app"
 	"github.com/futureq-io/futureq/internal/dispatcher"
 	"github.com/futureq-io/futureq/internal/metrics"
-	raft "github.com/futureq-io/futureq/internal/raft/event"
 	"github.com/futureq-io/futureq/pkg/raft/metadata"
 	pb "github.com/futureq-io/protocol/proto/go"
 )
@@ -47,7 +48,7 @@ func NewConsumerHandler(logger *zap.Logger, hub *dispatcher.Hub, deleter *dispat
 //  3. The server pushes QueueMessage frames as messages become eligible.
 //
 // Group semantics:
-//   - Empty group_id: universal consumer — receives every message on the topic.
+//   - Empty group_id requires a stable subscriber_id for durable universal delivery.
 //   - Non-empty group_id: competing consumer — races with other consumers in
 //     the same group; only one receives each message.
 //
@@ -64,17 +65,25 @@ func (h *ConsumerHandler) Subscribe(stream grpc.BidiStreamingServer[pb.ConsumerF
 	if init == nil {
 		return nil
 	}
-	if init.GroupId != "" {
-		ctx, cancel := context.WithTimeout(stream.Context(), 10*time.Second)
-		err := registerDeliveryGroup(ctx, init.Topic, init.GroupId)
-		cancel()
-		if err != nil {
-			return status.Errorf(codes.Unavailable, "failed to register durable group: %v", err)
-		}
-	}
-
-	// ─── Register consumer with the Hub ────────────────────────────────────────
 	consumerID := uuid.New().String()
+	service := app.A.Subscriptions
+	callCtx, callCancel := context.WithTimeout(stream.Context(), 10*time.Second)
+	subscription, err := service.Connect(callCtx, init.Topic, init.GroupId, init.SubscriberId, consumerID)
+	callCancel()
+	if err != nil {
+		return subscriptionError(err)
+	}
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := service.Disconnect(ctx, consumerID); err != nil {
+			h.logger.Warn("subscription disconnect failed; session lease will expire", zap.Error(err))
+		}
+	}()
+	// Each durable interest is an independent logical group internally. Its UUID
+	// generation isolates old ACKs and assignments after unsubscribe/recreate.
+	init.GroupId = strings.TrimPrefix(subscription.Recipient, "g:")
+
 	ch := make(chan *pb.QueueMessage, app.A.Config().Delivery.ConsumerQueueSize)
 	clusteredGroup := app.A.NodeHost != nil
 	if clusteredGroup {
@@ -130,17 +139,39 @@ func (h *ConsumerHandler) Subscribe(stream grpc.BidiStreamingServer[pb.ConsumerF
 		}
 	}
 
+	if err := stream.SendHeader(grpcmetadata.Pairs("subscription-generation", subscription.Recipient)); err != nil {
+		return err
+	}
+
 	h.logger.Info("consumer connected",
 		zap.String("id", consumerID),
 		zap.String("topic", init.Topic),
 		zap.String("group_id", init.GroupId),
-		zap.Bool("universal", init.GroupId == ""),
+		zap.Bool("universal", init.SubscriberId != ""),
 	)
 
 	ctx, cancel := context.WithCancel(stream.Context())
 	defer cancel()
 
-	errCh := make(chan error, 2)
+	errCh := make(chan error, 3)
+	go func() {
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if !service.Alive(subscription.Recipient, consumerID) {
+					select {
+					case errCh <- status.Error(codes.NotFound, "subscription removed or session expired"):
+					case <-ctx.Done():
+					}
+					return
+				}
+			}
+		}
+	}()
 
 	// ─── Sender goroutine: push messages to the consumer ─────────────────────
 	go h.sender(ctx, stream, consumerID, ch, errCh)
@@ -156,23 +187,13 @@ func (h *ConsumerHandler) Subscribe(stream grpc.BidiStreamingServer[pb.ConsumerF
 			zap.String("topic", init.Topic),
 			zap.String("group_id", init.GroupId),
 		)
+		if status.Code(err) != codes.Unknown {
+			return err
+		}
 		return status.Errorf(codes.Internal, "stream error: %v", err)
 	}
 
 	return nil
-}
-
-func registerDeliveryGroup(ctx context.Context, topic, group string) error {
-	a := app.A
-	if a.NodeHost == nil {
-		return raft.RegisterDeliveryGroup(a.DB, topic, group)
-	}
-	cmd, err := raft.MarshalRegisterDeliveryGroupCmd(topic, group)
-	if err != nil {
-		return err
-	}
-	_, err = a.NodeHost.SyncPropose(ctx, a.NodeHost.GetNoOPSession(a.Config().Cluster.ShardID), cmd)
-	return err
 }
 
 // readInit reads and validates the mandatory SubscribeInit first frame.
@@ -194,7 +215,9 @@ func (h *ConsumerHandler) readInit(stream grpc.BidiStreamingServer[pb.ConsumerFr
 		return nil, status.Errorf(codes.InvalidArgument, "SubscribeInit.topic must not be empty")
 	}
 
-	// group_id may be empty — that registers a universal (fan-out) consumer.
+	if err := validateSubscription(&pb.SubscriptionRequest{Topic: init.Topic, GroupId: init.GroupId, SubscriberId: init.SubscriberId}); err != nil {
+		return nil, err
+	}
 
 	return init, nil
 }

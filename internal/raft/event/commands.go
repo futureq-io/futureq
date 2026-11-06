@@ -28,7 +28,7 @@ const (
 
 	// Publish-time delivery and durable group registration.
 	StoreDeliveryBatchCmd
-	RegisterDeliveryGroupCmd
+	SubscriptionCmd
 )
 
 // StoreBatchItem is the minimal per-message metadata carried in a StoreBatchCmd.

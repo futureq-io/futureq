@@ -10,6 +10,7 @@ import (
 	"github.com/futureq-io/futureq/pkg/raft/metadata"
 	"github.com/futureq-io/futureq/pkg/utils"
 	pb "github.com/futureq-io/protocol/proto/go"
+	deliverypb "github.com/futureq-io/protocol/proto/go/delivery"
 	storagepb "github.com/futureq-io/protocol/proto/go/storage"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/proto"
@@ -105,27 +106,27 @@ func TestPublishBoundRaftFollowerReconnectAndRestart(t *testing.T) {
 		reader := NewDeliveryLedger(node.db, nil, nil, nil)
 		node.dispatcher.PrepareBatch = reader.PublishedBatch
 	}
-	a := c.subscribe(1, "a", "a")
-	c.subscribe(2, "b", "b")
+	a := c.subscribe(1, "a", "s:a")
+	c.subscribe(2, "b", "s:b")
 	c.activate()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	node := c.nodes[1]
 	for _, group := range []string{"a", "b"} {
-		cmd, err := raft.MarshalRegisterDeliveryGroupCmd("orders", group)
+		cmd, err := raft.MarshalSubscriptionCommand(&deliverypb.SubscriptionCommand{Operation: raft.SubscriptionCreate, NowMs: time.Now().UnixMilli(), Mutations: []*deliverypb.SubscriptionMutation{{Topic: "orders", GroupId: group, Recipient: "g:s:" + group}}})
 		require.NoError(t, err)
 		_, err = node.nh.SyncPropose(ctx, node.nh.GetNoOPSession(replicaTestShard), cmd)
 		require.NoError(t, err)
 	}
 	c.nodes[2].hub.Unregister("b")
-	require.NoError(t, c.nodes[2].svc.ChangeConsumer(ctx, replicaTestShard, "orders", "b", metadata.ConsumerMember{ID: "b", NodeID: 2}, false))
+	require.NoError(t, c.nodes[2].svc.ChangeConsumer(ctx, replicaTestShard, "orders", "s:b", metadata.ConsumerMember{ID: "b", NodeID: 2}, false))
 	c.activate()
 	c.sync()
-	names, err := raft.ReadDeliveryGroups(node.db, "orders")
+	names, err := raft.ReadSubscriptionRecipients(node.db, "orders")
 	require.NoError(t, err)
-	require.Equal(t, []string{"g:a", "g:b"}, names)
+	require.Equal(t, []string{"g:s:a", "g:s:b"}, names)
 	_, receiptNames, _ := node.sm.DeliveryRecipients("orders")
-	require.Equal(t, []string{"g:a"}, receiptNames, "live membership excludes B")
+	require.Equal(t, []string{"g:s:a"}, receiptNames, "live membership excludes B")
 	epoch, _ := node.sm.ConsumerVersion()
 	receipt, err := raft.MarshalPublishReceipt(epoch, names)
 	require.NoError(t, err)
@@ -140,19 +141,19 @@ func TestPublishBoundRaftFollowerReconnectAndRestart(t *testing.T) {
 	c.sync()
 	require.Equal(t, 1, node.dispatcher.dispatchAll())
 	msg := receiveReplicaMessage(t, a)
-	c.ack(1, "a", "a", msg)
+	c.ack(1, "a", "s:a", msg)
 	c.sync()
 	c.stop(2)
 	c.start(2, true)
 	reader := NewDeliveryLedger(c.nodes[2].db, nil, nil, nil)
 	c.nodes[2].dispatcher.PrepareBatch = reader.PublishedBatch
-	b := c.subscribe(2, "b-new-session", "b")
+	b := c.subscribe(2, "b-new-session", "s:b")
 	c.activate()
 	state, err := raft.ReadDeliveryState(c.nodes[2].db, msg.DeliveryTag)
 	require.NoError(t, err)
 	require.True(t, state.PublishBound)
-	require.True(t, state.Needs("g:b"))
-	require.False(t, state.Needs("g:a"))
+	require.True(t, state.Needs("g:s:b"))
+	require.False(t, state.Needs("g:s:a"))
 	require.Equal(t, 1, c.nodes[2].dispatcher.dispatchAll())
 	require.Equal(t, msg.DeliveryTag, receiveReplicaMessage(t, b).DeliveryTag)
 }

@@ -58,6 +58,10 @@ publish:
   proposalTimeout: 5s
 
 delivery:
+  subscriptions:
+    # No workers connected for this duration: discard the subscription/backlog.
+    # 0s retains group and universal interests forever; message TTL still applies.
+    disconnectTimeout: 0s
   discoveryWorkers: 2 # 1..16 independent storage scan workers
   preloadScanIdleMaxInterval: 0s # 0 disables speculative idle backoff; due scans keep their poll cadence
   consumerQueueSize: 1024 # 1..65536 messages per consumer sender queue

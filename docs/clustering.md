@@ -13,7 +13,7 @@ Replication is built on [Dragonboat v4](https://github.com/lni/dragonboat) (mult
 
 !!! note
 
-    In clustered mode the **Pebble WAL is disabled** — the Raft log is the authoritative write-ahead log, and Dragonboat replays committed-but-unapplied entries on restart.
+    In clustered mode the application **Pebble WAL may be disabled** with `storage.pebble.walEnabled: false`. The durable Raft log supplies recovery; the state machine flushes data and its applied index at synchronization points and replays the missing committed suffix after restart.
 
 ## Event-shard commands
 
@@ -25,11 +25,13 @@ and publish-bound delivery in `internal/raft/event/published_delivery.go`:
 | `StoreBatchCmd (0)` | Per item: `u64 id` (leader-assigned event ID; replicas apply verbatim so keys converge) · `u64 bucket` · `u64 topicHash` · index entries · `u32 len` + pre-serialized `StoredMessage`. One publish batch = one log entry. |
 | `DeleteBatchCmd (1)`| Count + fixed 24-byte message keys — used for ACK-driven deletes and TTL expirations. |
 | `StoreDeliveryBatchCmd (8)` | Encoded store batch followed by a length-prefixed frozen receipt per message; payload and destinations commit atomically. |
-| `RegisterDeliveryGroupCmd (9)` | A durable topic/group registration key. Worker disconnects and metadata reconciliation never remove it. |
+| `SubscriptionCmd (9)` | Protobuf subscription create/remove, worker connect/disconnect, batched session renewal, conditional idle expiry, and bounded retired-recipient cleanup. |
 
-Publishers catch up the event and metadata views before selecting destinations.
-The event group stores named destinations independently of the metadata group's
-live worker assignments. Publish-bound delivery therefore needs no per-batch
+Publishers catch up the event view before selecting durable destinations. The
+event group stores group and universal subscriptions independently of the metadata
+group's live worker assignments. Subscription records, session leases and retired
+generation markers are included in snapshots. Unsubscribe and expiry cannot be
+undone by a stale worker reconnect or receipt-cleanup command. Publish-bound delivery therefore needs no per-batch
 preparation proposal or post-preparation read barrier. Periodic quorum reads
 still renew the bounded ownership permit, and receipt reads observe locally
 applied committed state. Lag in observing an ACK can produce duplicate delivery.
@@ -82,7 +84,7 @@ The broker enforces a configurable floor: `publish.minAckLevel` (`quorum` | `lea
 ## Restart & recovery
 
 - Event IDs never regress: the last ID is persisted in the Pebble metadata keyspace and replicas observe applied IDs.
-- Committed-but-unapplied log entries are replayed on restart (Pebble WAL is off in clustered mode).
+- Committed-but-unapplied log entries are replayed on restart (including when application Pebble WAL is disabled).
 - Snapshots restore the full DB (validated against the applied index); the metadata state machine rebuilds from its log.
 - Recipient completions and final deletion are Raft-replicated. A lagging
   replica or uncertain ACK completion may cause duplicates; unacknowledged

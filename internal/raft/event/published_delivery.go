@@ -1,103 +1,11 @@
 package raft
 
 import (
-	"bytes"
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"strings"
 	"unicode/utf8"
-
-	"github.com/futureq-io/futureq/internal/storage"
 )
-
-var deliveryGroupPrefix = []byte("metadata/delivery-groups/")
-
-// A length-prefixed topic makes arbitrary topic/group names collision-free.
-func deliveryGroupTopicPrefix(topic string) []byte {
-	p := make([]byte, len(deliveryGroupPrefix)+4+len(topic))
-	copy(p, deliveryGroupPrefix)
-	binary.BigEndian.PutUint32(p[len(deliveryGroupPrefix):], uint32(len(topic)))
-	copy(p[len(deliveryGroupPrefix)+4:], topic)
-	return p
-}
-
-func deliveryGroupKey(topic, group string) ([]byte, error) {
-	if topic == "" || group == "" || !utf8.ValidString(topic) || !utf8.ValidString(group) || uint64(len(topic)) > uint64(^uint32(0)) {
-		return nil, fmt.Errorf("invalid durable delivery group")
-	}
-	return append(deliveryGroupTopicPrefix(topic), group...), nil
-}
-
-// MarshalRegisterDeliveryGroupCmd registers an obligation independently of any
-// connected workers. Disconnect, fencing and reconciliation never remove it.
-func MarshalRegisterDeliveryGroupCmd(topic, group string) ([]byte, error) {
-	key, err := deliveryGroupKey(topic, group)
-	if err != nil {
-		return nil, err
-	}
-	return append([]byte{byte(RegisterDeliveryGroupCmd)}, key...), nil
-}
-
-func registerDeliveryGroupKey(cmd []byte) ([]byte, error) {
-	min := 1 + len(deliveryGroupPrefix) + 4
-	if len(cmd) < min || CommandType(cmd[0]) != RegisterDeliveryGroupCmd || !bytes.HasPrefix(cmd[1:], deliveryGroupPrefix) {
-		return nil, fmt.Errorf("invalid delivery group command")
-	}
-	key := cmd[1:]
-	n := uint64(binary.BigEndian.Uint32(key[len(deliveryGroupPrefix):]))
-	start := len(deliveryGroupPrefix) + 4
-	if n == 0 || n >= uint64(len(key)-start) {
-		return nil, fmt.Errorf("invalid delivery group lengths")
-	}
-	if _, err := deliveryGroupKey(string(key[start:start+int(n)]), string(key[start+int(n):])); err != nil {
-		return nil, err
-	}
-	return key, nil
-}
-
-// RegisterDeliveryGroup is the standalone equivalent of the Raft command. It
-// must finish durably before exposing a named subscription to publishers.
-func RegisterDeliveryGroup(db storage.DB, topic, group string) error {
-	key, err := deliveryGroupKey(topic, group)
-	if err != nil {
-		return err
-	}
-	_, closer, err := db.Get(key)
-	if err == nil {
-		return closer.Close()
-	}
-	if !errors.Is(err, storage.ErrNotFound) {
-		return err
-	}
-	batch := db.NewBatch()
-	defer batch.Close() //nolint:errcheck
-	if err := batch.Set(key, []byte{1}); err != nil {
-		return err
-	}
-	return batch.Commit(storage.Sync)
-}
-
-// ReadDeliveryGroups returns all durable named destinations, including those
-// with no live workers. The snapshot is the publish's group-selection point.
-func ReadDeliveryGroups(db storage.DB, topic string) ([]string, error) {
-	prefix := deliveryGroupTopicPrefix(topic)
-	upper := append(append([]byte(nil), prefix...), 0xff)
-	iter, err := db.NewIter(&storage.IterOptions{LowerBound: prefix, UpperBound: upper})
-	if err != nil {
-		return nil, err
-	}
-	defer iter.Close() //nolint:errcheck
-	var names []string
-	for valid := iter.First(); valid; valid = iter.Next() {
-		key := iter.Key()
-		if !bytes.HasPrefix(key, prefix) || len(key) == len(prefix) {
-			return nil, fmt.Errorf("invalid durable group key")
-		}
-		names = append(names, "g:"+string(key[len(prefix):]))
-	}
-	return names, iter.Error()
-}
 
 // MarshalPublishReceipt freezes destinations before the payload is committed.
 func MarshalPublishReceipt(epoch uint64, recipients []string) ([]byte, error) {

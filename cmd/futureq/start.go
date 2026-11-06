@@ -90,11 +90,6 @@ func startRun(cmd *cobra.Command, _ []string) {
 	wakeCh := make(chan struct{}, 1)
 	strategy := dispatcher.NewRoundRobinStrategy()
 	hub := dispatcher.NewHub(strategy, logger, wakeCh)
-	if !cfg.Cluster.Enabled {
-		if err := hub.RestoreStandaloneEpoch(a.DB); err != nil {
-			logger.Fatal("failed to restore standalone delivery epoch", zap.Error(err))
-		}
-	}
 
 	inFlightTimeout := cfg.Delivery.InFlightTimeout
 	deleteInterval := cfg.Delivery.DeleteBatchInterval
@@ -146,8 +141,6 @@ func startRun(cmd *cobra.Command, _ []string) {
 		wakeCh, logger,
 	)
 	disp.PrepareBatch = ledger.PublishedBatch
-	disp.ReconcileBatch = ledger.ReconcileBatch
-	disp.MaintenanceRecipients = recipients
 	disp.TimeBucket = cfg.Delivery.TimeBucket
 	disp.DiscoveryWorkers = cfg.Delivery.DiscoveryWorkers
 	disp.PreloadScanIdleMaxInterval = cfg.Delivery.PreloadScanIdleMaxInterval
@@ -159,6 +152,7 @@ func startRun(cmd *cobra.Command, _ []string) {
 		Bytes: int(prepareBytes), WorkTime: cfg.Delivery.ScanWorkBudget,
 		PrepareTimeout: cfg.Delivery.PrepareTimeout, Workers: cfg.Delivery.PrepareWorkers,
 	}
+	a.Subscriptions.ApplyLocal = ledger.ApplySubscription
 	ledger.OnDelete = func(keys [][]byte) {
 		disp.RemoveInFlightBatch(keys)
 		hub.RemoveDeletedBatch(keys)
@@ -211,6 +205,9 @@ func startRun(cmd *cobra.Command, _ []string) {
 			consumerMetadataLoop(a.Ctx, a, hub, logger)
 		}()
 	}
+
+	a.RegisterComponentWithShutdown()
+	go func() { defer a.ComponentShutdownDone(); a.Subscriptions.Run(a.Ctx) }()
 
 	// ── TTL Janitor ───────────────────────────────────────────────────────────
 	janitor := dispatcher.NewTTLJanitor(a.DB, deleter, janitorInterval, logger)

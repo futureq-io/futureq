@@ -269,3 +269,15 @@ func (l *DeliveryLedger) DeleteKeys(keys [][]byte) error {
 	defer l.mu.Unlock()
 	return l.backend.DeleteKeys(keys)
 }
+
+// ApplySubscription shares the standalone receipt lock with ACK and deletion.
+func (l *DeliveryLedger) ApplySubscription(cmd []byte) (statemachine.Result, error) {
+	var result statemachine.Result
+	err := l.applyLocal(storage.Sync, func(batch *raft.DeliveryBatch) ([][]byte, error) {
+		var deleted [][]byte
+		var err error
+		result, deleted, err = batch.ApplySubscription(cmd)
+		return deleted, err
+	})
+	return result, err
+}
