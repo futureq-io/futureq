@@ -96,6 +96,9 @@ func Init(cfg *config.Config, logger *zap.Logger) (*App, error) {
 	a.Subscriptions = subscriptions.New(s, cfg.Delivery.Subscriptions.DisconnectTimeout, logger)
 	if cfg.Cluster.Enabled {
 		a.Subscriptions.Propose = func(ctx context.Context, cmd []byte) (statemachine.Result, error) {
+			// Dragonboat requires a deadline, even when the RPC client omits one.
+			ctx, cancel := context.WithTimeout(ctx, cfg.Publish.ProposalTimeout)
+			defer cancel()
 			return a.NodeHost.SyncPropose(ctx, a.NodeHost.GetNoOPSession(cfg.Cluster.ShardID), cmd)
 		}
 		a.Subscriptions.IsLeader = func() bool {
