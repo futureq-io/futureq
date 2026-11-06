@@ -1,7 +1,5 @@
 module github.com/futureq-io/futureq
 
-replace github.com/futureq-io/protocol/proto/go => ../futureq-proto/proto/go
-
 go 1.27.1
 
 // replace github.com/lni/dragonboat/v4 => github.com/hertzcodes/dragonboat v4.0.0
@@ -9,7 +7,7 @@ go 1.27.1
 require (
 	github.com/cespare/xxhash/v2 v2.3.0
 	github.com/cockroachdb/pebble/v2 v2.1.7
-	github.com/futureq-io/protocol/proto/go v0.3.0
+	github.com/futureq-io/protocol/proto/go v0.4.0
 	github.com/google/uuid v1.6.0
 	github.com/lni/dragonboat/v4 v4.0.0-20250723143628-076c7f6497dc
 	github.com/prometheus/client_golang v1.25.0

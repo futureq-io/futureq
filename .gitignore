@@ -26,3 +26,4 @@ testing/cmd/*
 futureq-bench
 .gitnexusignore
 CLAUDE.mdsite/
+testing
