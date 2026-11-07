@@ -31,6 +31,17 @@ type Service struct {
 	mu     sync.Mutex
 	epoch  uint64
 	shards map[uint64]struct{} // tracks which shards we know about
+
+	// Coalesce refresh requests by shard. One worker publishes current state,
+	// so event callbacks never block on a quorum read or a proposal.
+	topologyPending  map[uint64]struct{}
+	topologyWake     chan struct{}
+	topologyMu       sync.Mutex // also serializes synchronous startup refreshes
+	consumerRemovals chan consumerRemoval
+	// Installed before Run. Removals target independent, unique stream IDs.
+	ConsumerRemovalWorkers int
+	// Installed before consumer registration; advertised in the committed add.
+	ConsumerReadPermit time.Duration
 }
 
 // NewService creates a metadata Service. The propose function should submit
@@ -39,10 +50,14 @@ type Service struct {
 // handles any events.
 func NewService(nh *dragonboat.NodeHost, propose func(ctx context.Context, cmd []byte) error, logger *zap.Logger) *Service {
 	return &Service{
-		nh:      nh,
-		propose: propose,
-		logger:  logger.Named("metadata_svc"),
-		shards:  make(map[uint64]struct{}),
+		nh:                     nh,
+		propose:                propose,
+		logger:                 logger.Named("metadata_svc"),
+		shards:                 make(map[uint64]struct{}),
+		topologyPending:        make(map[uint64]struct{}),
+		topologyWake:           make(chan struct{}, 1),
+		consumerRemovals:       make(chan consumerRemoval, consumerRemovalQueueSize),
+		ConsumerRemovalWorkers: 1,
 	}
 }
 
@@ -110,7 +125,11 @@ func (s *Service) ChangeConsumer(ctx context.Context, shardID uint64, topic, gro
 	if add {
 		op = "add"
 	}
-	cmd, err := marshalConsumerChange(consumerChange{Operation: op, Topic: topic, Group: group, Member: member, Required: required})
+	permit := s.ConsumerReadPermit
+	if permit <= 0 {
+		permit = time.Second
+	}
+	cmd, err := marshalConsumerChange(consumerChange{Operation: op, Topic: topic, Group: group, Member: member, Required: required, ReadPermitMs: permit.Milliseconds()})
 	if err != nil {
 		return err
 	}
@@ -161,11 +180,7 @@ func (s *Service) LeaderUpdated(info raftio.LeaderInfo) {
 		zap.Uint64("term", info.Term),
 	)
 
-	s.mu.Lock()
-	s.shards[info.ShardID] = struct{}{}
-	s.mu.Unlock()
-
-	s.publishTopology(info.ShardID)
+	s.requestTopology(info.ShardID)
 }
 
 // ─── ISystemEventListener ────────────────────────────────────────────────────
@@ -181,11 +196,7 @@ func (s *Service) MembershipChanged(info raftio.NodeInfo) {
 		zap.Uint64("replica_id", info.ReplicaID),
 	)
 
-	s.mu.Lock()
-	s.shards[info.ShardID] = struct{}{}
-	s.mu.Unlock()
-
-	s.publishTopology(info.ShardID)
+	s.requestTopology(info.ShardID)
 }
 
 // NodeHostShuttingDown is called when the NodeHost is shutting down.
@@ -199,7 +210,7 @@ func (s *Service) NodeDeleted(info raftio.NodeInfo) {
 	if info.ShardID == MetadataShardID {
 		return
 	}
-	s.publishTopology(info.ShardID)
+	s.requestTopology(info.ShardID)
 }
 
 // NodeReady is called when a shard replica is ready.
@@ -207,10 +218,7 @@ func (s *Service) NodeReady(info raftio.NodeInfo) {
 	if info.ShardID == MetadataShardID {
 		return
 	}
-	s.mu.Lock()
-	s.shards[info.ShardID] = struct{}{}
-	s.mu.Unlock()
-	s.publishTopology(info.ShardID)
+	s.requestTopology(info.ShardID)
 }
 
 // ConnectionEstablished is called when a connection is established.
@@ -251,21 +259,32 @@ func (s *Service) LogDBCompacted(info raftio.EntryInfo) {}
 // publishTopology queries Dragonboat for the current shard topology and
 // proposes it to the metadata Raft group.
 func (s *Service) publishTopology(shardID uint64) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	if err := s.updateTopology(context.Background(), shardID); err != nil {
+		s.logger.Error("failed to publish topology", zap.Uint64("shard_id", shardID), zap.Error(err))
+		s.requestTopology(shardID)
+	}
+}
+
+func (s *Service) updateTopology(parent context.Context, shardID uint64) error {
+	s.topologyMu.Lock()
+	defer s.topologyMu.Unlock()
+	ctx, cancel := context.WithTimeout(parent, 5*time.Second)
 	defer cancel()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	nh := s.nh
+	s.mu.Unlock()
 
 	// Get membership info.
-	membership, err := s.nh.SyncGetShardMembership(ctx, shardID)
+	membership, err := nh.SyncGetShardMembership(ctx, shardID)
 	if err != nil {
-		s.logger.Error("failed to get shard membership",
-			zap.Uint64("shard_id", shardID),
-			zap.Error(err),
-		)
-		return
+		return fmt.Errorf("get shard membership: %w", err)
 	}
 
 	// Get leader info.
-	leaderID, term, valid, err := s.nh.GetLeaderID(shardID)
+	leaderID, term, valid, err := nh.GetLeaderID(shardID)
 	if err != nil || !valid {
 		leaderID = 0
 		term = 0
@@ -308,16 +327,11 @@ func (s *Service) publishTopology(shardID uint64) {
 
 	cmd, err := MarshalUpdateTopologyCmd(topo)
 	if err != nil {
-		s.logger.Error("failed to marshal topology command", zap.Error(err))
-		return
+		return err
 	}
 
 	if err := s.propose(ctx, cmd); err != nil {
-		s.logger.Error("failed to propose topology update",
-			zap.Uint64("shard_id", shardID),
-			zap.Error(err),
-		)
-		return
+		return err
 	}
 
 	s.logger.Debug("published topology",
@@ -325,6 +339,7 @@ func (s *Service) publishTopology(shardID uint64) {
 		zap.Uint64("leader_id", leaderID),
 		zap.Uint64("epoch", epoch),
 	)
+	return nil
 }
 
 // RefreshAll re-publishes topology for all known shards.

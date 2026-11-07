@@ -34,6 +34,8 @@ const (
 type Subscriptions struct {
 	// DisconnectTimeout is the time without any connected worker before unsubscribe. Zero retains interest forever.
 	DisconnectTimeout time.Duration `mapstructure:"disconnectTimeout" yaml:"disconnectTimeout"`
+	RenewalWorkers    int           `mapstructure:"renewalWorkers" yaml:"renewalWorkers"`
+	DisconnectWorkers int           `mapstructure:"disconnectWorkers" yaml:"disconnectWorkers"`
 }
 
 type Config struct {
@@ -117,14 +119,17 @@ type Delivery struct {
 	PreloadLookahead           time.Duration `mapstructure:"preloadLookahead" yaml:"preloadLookahead"`
 	PreloadMaxMessages         int           `mapstructure:"preloadMaxMessages" yaml:"preloadMaxMessages"`
 	InFlightTimeout            time.Duration `mapstructure:"inFlightTimeout" yaml:"inFlightTimeout"`
+	ReadPermit                 time.Duration `mapstructure:"readPermit" yaml:"readPermit"`
 	DeleteBatchInterval        time.Duration `mapstructure:"deleteBatchInterval" yaml:"deleteBatchInterval"`
+	DeleteWorkers              int           `mapstructure:"deleteWorkers" yaml:"deleteWorkers"`
+	ConsumerRemovalWorkers     int           `mapstructure:"consumerRemovalWorkers" yaml:"consumerRemovalWorkers"`
 	TTLSweepInterval           time.Duration `mapstructure:"ttlSweepInterval" yaml:"ttlSweepInterval"`
 	PrepareBatchSize           int           `mapstructure:"prepareBatchSize" yaml:"prepareBatchSize"`
 	PrepareBatchBytes          Size          `mapstructure:"prepareBatchBytes" yaml:"prepareBatchBytes"`
 	ScanMaxKeys                int           `mapstructure:"scanMaxKeys" yaml:"scanMaxKeys"`
 	ScanWorkBudget             time.Duration `mapstructure:"scanWorkBudget" yaml:"scanWorkBudget"`
-	PrepareTimeout             time.Duration `mapstructure:"prepareTimeout" yaml:"prepareTimeout"`
-	PrepareWorkers             int           `mapstructure:"prepareWorkers" yaml:"prepareWorkers"`
+	ValidationTimeout          time.Duration `mapstructure:"validationTimeout" yaml:"validationTimeout"`
+	DeliveryWorkers            int           `mapstructure:"deliveryWorkers" yaml:"deliveryWorkers"`
 }
 
 type Observability struct {
@@ -369,6 +374,18 @@ func (c *Config) validatePublishAndDelivery() error {
 	if c.Delivery.Subscriptions.DisconnectTimeout < 0 || c.Delivery.Subscriptions.DisconnectTimeout%time.Millisecond != 0 {
 		return fmt.Errorf("delivery.subscriptions.disconnectTimeout must be zero (forever) or a positive whole number of milliseconds")
 	}
+	for _, setting := range []struct {
+		key   string
+		value int
+	}{
+		{"delivery.subscriptions.renewalWorkers", c.Delivery.Subscriptions.RenewalWorkers},
+		{"delivery.subscriptions.disconnectWorkers", c.Delivery.Subscriptions.DisconnectWorkers},
+		{"delivery.consumerRemovalWorkers", c.Delivery.ConsumerRemovalWorkers},
+	} {
+		if setting.value < 1 || setting.value > 16 {
+			return fmt.Errorf("%s must be 1..16", setting.key)
+		}
+	}
 	switch c.Publish.MinAckLevel {
 	case Quorum, Leader, NoAck:
 	default:
@@ -379,6 +396,9 @@ func (c *Config) validatePublishAndDelivery() error {
 	}
 
 	d := c.Delivery
+	if d.ReadPermit < 100*time.Millisecond || d.ReadPermit > 30*time.Second || d.ReadPermit%time.Millisecond != 0 {
+		return fmt.Errorf("delivery.readPermit must be whole milliseconds from 100ms to 30s")
+	}
 	if d.DiscoveryWorkers < 1 || d.DiscoveryWorkers > 16 {
 		return fmt.Errorf("delivery.discoveryWorkers must be 1..16")
 	}
@@ -400,14 +420,17 @@ func (c *Config) validatePublishAndDelivery() error {
 	if d.DispatchPollInterval <= 0 || d.InFlightTimeout <= 0 || d.DeleteBatchInterval <= 0 || d.TTLSweepInterval <= 0 {
 		return fmt.Errorf("delivery intervals and timeout must be positive")
 	}
+	if d.DeleteWorkers < 1 || d.DeleteWorkers > 256 {
+		return fmt.Errorf("delivery.deleteWorkers must be 1..256")
+	}
 	if d.PrepareBatchSize < 1 || d.PrepareBatchSize > 256 || d.ScanMaxKeys < d.PrepareBatchSize || d.ScanMaxKeys > 65536 {
 		return fmt.Errorf("delivery.prepareBatchSize must be 1..256 and scanMaxKeys must be between batch size and 65536")
 	}
 	if size, err := d.PrepareBatchBytes.Bytes(); err != nil || size < 1024 || size > 256<<10 {
 		return fmt.Errorf("delivery.prepareBatchBytes must be 1KiB..256KiB")
 	}
-	if d.ScanWorkBudget <= 0 || d.ScanWorkBudget > 50*time.Millisecond || d.PrepareTimeout <= 0 || d.PrepareTimeout > time.Second || d.PrepareWorkers < 1 || d.PrepareWorkers > 16 {
-		return fmt.Errorf("delivery requires scanWorkBudget in (0,50ms], prepareTimeout in (0,1s], and prepareWorkers in 1..16")
+	if d.ScanWorkBudget <= 0 || d.ScanWorkBudget > 50*time.Millisecond || d.ValidationTimeout <= 0 || d.ValidationTimeout > time.Second || d.DeliveryWorkers < 1 || d.DeliveryWorkers > 16 {
+		return fmt.Errorf("delivery requires scanWorkBudget in (0,50ms], validationTimeout in (0,1s], and deliveryWorkers in 1..16")
 	}
 	return nil
 }

@@ -87,7 +87,7 @@ func TestPreparationExpiryRenewsButPendingEpochAndMinorityReject(t *testing.T) {
 
 func TestSlowPreparationDoesNotStarveAnotherTopicAndCancels(t *testing.T) {
 	d, ledger := newPipelineTest(t)
-	d.Limits.PrepareTimeout = time.Minute
+	d.Limits.ValidationTimeout = time.Minute
 	ch := make(chan *pb.QueueMessage, 1)
 	d.hub.Register("slow", "a-slow", "workers", make(chan *pb.QueueMessage, 1))
 	d.hub.Register("fast", "b-fast", "workers", ch)

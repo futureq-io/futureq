@@ -3,14 +3,24 @@ package metadata
 import (
 	"context"
 	"sort"
+	"time"
 )
+
+// ConsumerReadPermitBound is read after metadata quorum catch-up before fencing.
+// Keeping the maximum through removal and snapshots protects permits held by
+// isolated replicas, even when nodes use different configured durations.
+func (s *MetadataStateMachine) ConsumerReadPermitBound() time.Duration {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return max(time.Second, time.Duration(s.consumers.MaxReadPermitMs)*time.Millisecond)
+}
 
 // TopicDeliveryView is an immutable copy of one committed assignment. Member
 // order is the same order used by ConsumerGroup and deliveryOrdinal ownership.
 type TopicDeliveryView struct {
-	Epoch uint64
-	Active bool
-	Groups map[string][]ConsumerMember
+	Epoch      uint64
+	Active     bool
+	Groups     map[string][]ConsumerMember
 	Recipients []string
 }
 
@@ -18,12 +28,18 @@ func (s *MetadataStateMachine) TopicDeliverySnapshot(topic string) TopicDelivery
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	view := TopicDeliveryView{Epoch: s.consumers.Epoch, Active: !s.consumers.Pending, Groups: make(map[string][]ConsumerMember)}
-	if !view.Active { return view }
+	if !view.Active {
+		return view
+	}
 	for group, members := range s.consumers.Groups[topic] {
 		view.Groups[group] = append([]ConsumerMember(nil), members...)
 		if group == "" {
-			for _, member := range members { view.Recipients = append(view.Recipients, DeliveryRecipient("", member.ID)) }
-		} else if len(members) > 0 { view.Recipients = append(view.Recipients, DeliveryRecipient(group, "")) }
+			for _, member := range members {
+				view.Recipients = append(view.Recipients, DeliveryRecipient("", member.ID))
+			}
+		} else if len(members) > 0 {
+			view.Recipients = append(view.Recipients, DeliveryRecipient(group, ""))
+		}
 	}
 	sort.Strings(view.Recipients)
 	return view

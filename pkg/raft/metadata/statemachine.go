@@ -23,7 +23,7 @@ type MetadataStateMachine struct {
 	barrierMu sync.RWMutex
 	// consumerBarrier excludes a local delivery while membership changes.
 	// Set once during startup, before subscriptions are accepted.
-	consumerBarrier func(func())
+	consumerBarrier func(func() bool)
 	logger          *zap.Logger
 }
 
@@ -65,7 +65,7 @@ func (s *MetadataStateMachine) Update(entry statemachine.Entry) (statemachine.Re
 			if len(s.consumers.Groups) > 0 {
 				s.consumers.applyTopology(consumerNodes(topo))
 			}
-		})
+		}, false)
 
 		s.logger.Debug("topology updated",
 			zap.Uint64("shard_id", topo.ShardID),
@@ -85,7 +85,7 @@ func (s *MetadataStateMachine) Update(entry statemachine.Entry) (statemachine.Re
 			s.mu.Lock()
 			changed = s.consumers.applyChange(change)
 			s.mu.Unlock()
-		})
+		}, false)
 		if changed {
 			return statemachine.Result{Value: 1}, nil
 		}
@@ -115,7 +115,7 @@ func (s *MetadataStateMachine) Update(entry statemachine.Entry) (statemachine.Re
 			if !s.consumers.Pending && s.consumers.Epoch == probe.Epoch && len(s.consumers.Groups) > 0 {
 				s.consumers.startRebalance(s.consumers.Required)
 			}
-		})
+		}, false)
 		return statemachine.Result{Value: 1}, nil
 
 	case ConsumerAckCmd:
@@ -138,7 +138,7 @@ func (s *MetadataStateMachine) Update(entry statemachine.Entry) (statemachine.Re
 			s.mu.Lock()
 			defer s.mu.Unlock()
 			s.consumers.fence(ack.Epoch)
-		})
+		}, false)
 		return statemachine.Result{Value: 1}, nil
 
 	case RegisterNodeAddrCmd:
@@ -177,18 +177,25 @@ func consumerNodes(topo *ShardTopology) []uint64 {
 
 // SetConsumerBarrier installs the local delivery fence used on membership
 // changes. It must be installed before accepting consumer streams.
-func (s *MetadataStateMachine) SetConsumerBarrier(barrier func(func())) {
+func (s *MetadataStateMachine) SetConsumerBarrier(barrier func(func() bool)) {
 	s.barrierMu.Lock()
 	s.consumerBarrier = barrier
 	s.barrierMu.Unlock()
 }
 
-func (s *MetadataStateMachine) withConsumerBarrier(apply func()) {
+// Actual changes are always applied with sends excluded. A no-op preserves
+// the permit; snapshot recovery forces invalidation even at the same epoch.
+func (s *MetadataStateMachine) withConsumerBarrier(apply func(), force bool) {
 	s.barrierMu.RLock()
 	barrier := s.consumerBarrier
 	s.barrierMu.RUnlock()
 	if barrier != nil {
-		barrier(apply)
+		barrier(func() bool {
+			epoch, active := s.ConsumerVersion()
+			apply()
+			nextEpoch, nextActive := s.ConsumerVersion()
+			return force || epoch != nextEpoch || active != nextActive
+		})
 	} else {
 		apply()
 	}
@@ -352,7 +359,7 @@ func (s *MetadataStateMachine) SaveSnapshot(w io.Writer, _ statemachine.ISnapsho
 // RecoverFromSnapshot rebuilds the in-memory state from a snapshot reader.
 func (s *MetadataStateMachine) RecoverFromSnapshot(r io.Reader, _ []statemachine.SnapshotFile, _ <-chan struct{}) error {
 	var result error
-	s.withConsumerBarrier(func() { result = s.recoverSnapshot(r) })
+	s.withConsumerBarrier(func() { result = s.recoverSnapshot(r) }, true)
 	return result
 }
 

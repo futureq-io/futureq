@@ -108,9 +108,32 @@ output does not increase the number of freshness slots; XXH128 is not supported.
 | `delivery.preloadMaxMessages`       | `512`   | Maximum retained/reserved full-message future entries across topics, `0..1048576`. `0` disables future caching; bounded due delivery continues. Payload sizes determine memory use. |
 | `delivery.inFlightTimeout`          | `5s`    | How long an unacknowledged delivery blocks redelivery; after it expires the message is re-dispatched (at-least-once). |
 | `delivery.deleteBatchInterval`      | `500ms` | How often the deleter flushes its batch of keys to delete (one Raft proposal per batch in clustered mode). |
+| `delivery.deleteWorkers`            | `16` | Maximum concurrent ACK/delete flushes in Raft mode (1..256). Pending and in-progress completions share the existing queue bound. Standalone flushes remain serial. |
+| `delivery.subscriptions.renewalWorkers` | `4` | Concurrent session renewal batches (1..16), at most 256 sessions per batch. |
+| `delivery.subscriptions.disconnectWorkers` | `1` | Concurrent session disconnect batches (1..16), at most 256 sessions per batch. |
+| `delivery.consumerRemovalWorkers` | `1` | Concurrent Raft consumer membership removals (1..16), targeting unique disconnected stream IDs. |
+| `delivery.deliveryWorkers`          | `2` | Delivery-worker concurrency (1..16), with at most one job per topic. Workers validate payloads, read receipts, check permissions, and queue sends. |
+| `delivery.validationTimeout`        | `250ms` | Cooperative deadline for payload validation and receipt reads, greater than zero and at most 1s. Excludes final authorization, sender queueing, and gRPC sending. |
 | `delivery.ttlsweepInterval`         | `60s`   | How often the TTL janitor sweeps the whole database for expired messages. |
 
 All four intervals and the in-flight timeout must be greater than zero.
+
+Worker counts are applied at startup and require a restart to change. Environment
+overrides for the new pools are `FUTUREQ_DELIVERY_SUBSCRIPTIONS_RENEWALWORKERS`,
+`FUTUREQ_DELIVERY_SUBSCRIPTIONS_DISCONNECTWORKERS`, and
+`FUTUREQ_DELIVERY_CONSUMERREMOVALWORKERS`. Disconnect and consumer-removal queues
+remain bounded at 1024 entries each, shared by the workers. Each disconnect
+worker can additionally hold one batch of at most 256 sessions; each removal
+worker holds one command. Standalone writes still share the storage mutation
+lock, so increasing these counts primarily helps Raft proposal waits.
+
+Permit renewal remains one shared worker to coalesce reads. Topology publishing
+and subscription expiry/receipt cleanup each retain one worker to serialize
+epochs and own their scan cursors. Their worker counts are fixed.
+
+`deliveryWorkers` and `validationTimeout` replace `prepareWorkers` and
+`prepareTimeout`. Update YAML keys and environment overrides to
+`FUTUREQ_DELIVERY_DELIVERYWORKERS` and `FUTUREQ_DELIVERY_VALIDATIONTIMEOUT`.
 
 Preloading works in standalone and clustered mode. Configure it independently of
 preparation batch sizes and quorum reads:

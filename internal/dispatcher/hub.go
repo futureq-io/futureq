@@ -196,6 +196,7 @@ type Hub struct {
 	version         func() (uint64, bool)
 	permitEpoch     uint64
 	permitUntil     time.Time
+	readPermit      time.Duration
 	registryEpoch   uint64
 	inFlightTimeout time.Duration
 
@@ -243,6 +244,16 @@ func (h *Hub) WithRebalanceBarrier(apply func()) {
 	apply()
 }
 
+// WithConsumerBarrier excludes sends while metadata is applied, revoking the
+// permit only when ownership/activation changed (or a snapshot was restored).
+func (h *Hub) WithConsumerBarrier(apply func() bool) {
+	h.deliveryMu.Lock()
+	defer h.deliveryMu.Unlock()
+	if apply() {
+		h.permitUntil = time.Time{}
+	}
+}
+
 // LocalConsumerIDs returns the subscriptions to retain when reconciling a
 // restarted node's stale group members in metadata Raft.
 func (h *Hub) LocalConsumerIDs() []string {
@@ -266,6 +277,7 @@ func NewHub(strategy DispatchStrategy, logger *zap.Logger, wakeCh chan struct{})
 		deliveryRecords:    make(map[string]map[string]deliveryRecord),
 		groupInFlight:      make(map[groupDeliveryKey]string),
 		inFlightTimeout:    5 * time.Second,
+		readPermit:         ConsumerReadPermit,
 		strategy:           strategy,
 		logger:             logger.Named("hub"),
 		wakeCh:             wakeCh,

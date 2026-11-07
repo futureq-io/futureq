@@ -36,6 +36,13 @@ committed together by the publisher. Periodic permit renewal and actual-send
 fencing still apply. Background receipt reconciliation releases vanished
 universal subscriptions while preserving all named-group obligations.
 Actual gRPC Send and pointer-based attempt fencing stay in the existing sender.
+One renewal worker reads the metadata and event shards concurrently and requires
+both reads to succeed. Renewal starts with at least half the permit remaining;
+observed read latency increases this margin without extending the permit.
+If permission expires during validation, a publish-bound batch waits in the
+scheduler with its bounded reservation and validated payloads. Delivery workers
+do not start additional reads. Resuming rechecks the current receipt, payload
+validity, due time, TTL and ownership; actual Send still checks its permit.
 Read barriers grant permits from **read start**, as before. The legacy no-argument
 ReadBarrier hook captures its installation context: the preparation timeout does
 not cancel that hook. The production hook independently bounds reads to two
@@ -122,8 +129,8 @@ uses those same functions. It is not a second sender algorithm.
 
 A scan reserves result slots before dispatch. Future reservations plus retained
 future entries never exceed `preloadMaxMessages`. Due discovery has a separate
-allowance of `max(discoveryWorkers, prepareWorkers) * prepareBatchSize`, so future entries cannot exclude overdue
-arrivals. Assigned jobs have the existing `prepareWorkers * prepareBatchSize`
+allowance of `max(discoveryWorkers, deliveryWorkers) * prepareBatchSize`, so future entries cannot exclude overdue
+arrivals. Assigned jobs have the existing `deliveryWorkers * prepareBatchSize`
 bound. A heap pop clears its backing slot; sparse heaps/maps rebuild at one-quarter
 occupancy, bounding capacity by a constant factor. Topic removal clears its data
 and atomically invalidates its generation. Old scan results are admitted only to
@@ -208,7 +215,7 @@ are smaller than that default envelope. It is configurable, and internal storage
 can contain larger valid messages. None are truncated or permanently rejected by
 a byte cap. These memory figures are estimates, not universal maximums.
 
-Let `C=preloadMaxMessages`, `B=prepareBatchSize`, `W=prepareWorkers`,
+Let `C=preloadMaxMessages`, `B=prepareBatchSize`, `W=deliveryWorkers`,
 `D=discoveryWorkers`, and `Q` be
 a consumer's configured channel capacity. With defaults C=512, B=64, W=2, D=2:
 

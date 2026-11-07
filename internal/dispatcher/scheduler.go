@@ -10,18 +10,19 @@ import (
 	"time"
 
 	"github.com/futureq-io/futureq/internal/metrics"
+	raft "github.com/futureq-io/futureq/internal/raft/event"
 	"github.com/futureq-io/futureq/internal/storage"
 	"go.uber.org/zap"
 )
 
 // Discovery has its own slots: preparation/quorum latency never prevents a
 // ready heap deadline or another topic's scan from being scheduled. Ranges of
-// the same topic never overlap concurrently. No mutable scheduler state is
-// passed to workers; cursors are acknowledged only with their matching result.
+// the same topic never overlap concurrently. Workers share only the synchronized
+// key index; cursors are acknowledged only with their matching result.
 type discoveryJob struct {
 	revision              uint64
 	repairGeneration      uint64
-	known                 map[[24]byte]bool
+	assigned              map[[24]byte]bool // immutable, bounded delivery batch
 	topic                 string
 	owner                 *topicPreload
 	cursor                scanCursor
@@ -37,19 +38,26 @@ type discoveryResult struct {
 	after           []byte
 }
 type deliveryJob struct {
-	chunk deliveryChunk
-	owner *topicPreload
+	chunk  deliveryChunk
+	owner  *topicPreload
+	states map[string]*raft.DeliveryState // non-nil only when resuming prepared work
 }
 type deliveryResult struct {
 	outcome string
 	job     deliveryJob
 	sent    int
 	err     error
+	pending bool
+}
+
+type permitRenewal struct {
+	ok      bool
+	elapsed time.Duration
 }
 
 func (d *Dispatcher) discover(job discoveryJob) discoveryResult {
 	// Construct a scanner adapter rather than copying a Dispatcher (sync.Map).
-	scanner := &Dispatcher{scanOnly: true, skipKeys: job.known, db: d.db, hub: d.hub, deleter: d.deleter, logger: d.logger,
+	scanner := &Dispatcher{scanOnly: true, skipKeys: func(key [24]byte) bool { return job.assigned[key] || job.owner.hasKey(key) }, db: d.db, hub: d.hub, deleter: d.deleter, logger: d.logger,
 		TimeBucket: d.TimeBucket, Limits: d.Limits, PreloadLookahead: d.PreloadLookahead,
 		PreloadMaxMessages: job.futureSlots, MaintenanceRecipients: d.MaintenanceRecipients,
 		cursors: map[string]*scanCursor{job.topic: &job.cursor}}
@@ -61,7 +69,7 @@ func (d *Dispatcher) discover(job discoveryJob) discoveryResult {
 		metrics.DeliveryRepairScansTotal.Inc()
 		chunk = scanner.collectTopic(job.topic, time.Now().UnixMilli())
 	}
-	p := &topicPreload{epoch: job.owner.epoch, after: job.futureAfter, keys: job.known}
+	p := &topicPreload{epoch: job.owner.epoch, after: job.futureAfter}
 	// Future scans have independent work budgets and run even with productive
 	// due traffic, provided the scheduler reserved future admission first.
 	exhausted := false
@@ -80,13 +88,10 @@ func (d *Dispatcher) admitCandidate(p *topicPreload, c preloadCandidate) bool {
 	if !c.ready && c.payload.validity.Invalidated() {
 		return false
 	}
-	if p.keys[c.key] {
+	if p.hasKey(c.key) {
 		return false
 	}
-	if p.keys == nil {
-		p.keys = make(map[[24]byte]bool)
-	}
-	p.keys[c.key] = true
+	p.addKey(c.key)
 	heap.Push(&p.items, c)
 	if c.ready {
 		p.readyCount++
@@ -127,7 +132,7 @@ func (d *Dispatcher) runPipeline(parent context.Context) {
 	jobs := make(chan deliveryJob, d.Limits.Workers)
 	results := make(chan deliveryResult, d.Limits.Workers)
 	renew := make(chan struct{}, 1)
-	renewed := make(chan bool, 1)
+	renewed := make(chan permitRenewal, 1)
 	var workers sync.WaitGroup
 	for range discoveryWorkers {
 		workers.Add(1)
@@ -164,13 +169,20 @@ func (d *Dispatcher) runPipeline(parent context.Context) {
 						return
 					}
 					result := deliveryResult{job: job, outcome: "not-ready"}
-					if (job.owner.valid != nil && !job.owner.valid.Load()) || !d.hub.DeliveryPermitted() {
+					if job.owner.valid != nil && !job.owner.valid.Load() {
+						result.outcome = "permission-lost"
+					} else if !d.hub.DeliveryPermitted() {
 						result.err = errors.New("permission expired before preparation")
 						result.outcome = "permission-lost"
+						result.pending = true
 					} else {
-						callCtx, stop := context.WithTimeout(ctx, d.Limits.PrepareTimeout)
-						states, err := d.prepareChunk(callCtx, job.chunk)
-						stop()
+						states := job.states
+						var err error
+						if states == nil {
+							callCtx, stop := context.WithTimeout(ctx, d.Limits.ValidationTimeout)
+							states, err = d.prepareChunk(callCtx, job.chunk)
+							stop()
+						}
 						result.err = err
 						if err != nil {
 							result.outcome = "prepare-failed"
@@ -183,14 +195,21 @@ func (d *Dispatcher) runPipeline(parent context.Context) {
 								}
 							} else {
 								result.outcome = "permission-lost"
+								if !needsPreparationBarrier(states) {
+									result.pending = true
+									result.job.states = states
+								}
 							}
 						}
 					}
 					metrics.DeliveryWorkerOutcomesTotal.WithLabelValues(result.outcome).Inc()
 					// Do not retain payloads in outcome channels after enqueue. Job identity
 					// is sufficient to release reservations and reject stale completions.
-					result.job.chunk.payloads = nil
-					result.job.chunk.items = nil
+					if !result.pending {
+						result.job.chunk.payloads = nil
+						result.job.chunk.items = nil
+						result.job.states = nil
+					}
 					select {
 					case results <- result:
 					case <-ctx.Done():
@@ -208,9 +227,10 @@ func (d *Dispatcher) runPipeline(parent context.Context) {
 			case <-ctx.Done():
 				return
 			case <-renew:
+				started := time.Now()
 				ok := d.refreshPermit(ctx)
 				select {
-				case renewed <- ok:
+				case renewed <- permitRenewal{ok: ok, elapsed: time.Since(started)}:
 				case <-ctx.Done():
 					return
 				}
@@ -233,6 +253,9 @@ func (d *Dispatcher) runPipeline(parent context.Context) {
 		d.preloads = make(map[string]*topicPreload)
 	}
 	busy := make(map[string]*topicPreload)
+	// Waiting jobs retain their bounded reservation and validated payloads.
+	// They occupy no worker and are rechecked at enqueue and actual send.
+	pending := make(map[string]deliveryJob)
 	scanning := make(map[string]*topicPreload)
 	assigned := make(map[string]map[[24]byte]bool)
 	nextScan := make(map[string]time.Time)
@@ -247,6 +270,8 @@ func (d *Dispatcher) runPipeline(parent context.Context) {
 	dueCapacity := max(discoveryWorkers, d.Limits.Workers) * d.Limits.Candidates
 	rotation := 0
 	permitReady, renewing := false, false
+	permitDuration := d.hub.DeliveryReadPermit()
+	renewBudget := permitDuration / 2
 	var renewAfter time.Time
 	var housekeepAfter time.Time
 	ticker := time.NewTicker(d.interval)
@@ -287,9 +312,9 @@ func (d *Dispatcher) runPipeline(parent context.Context) {
 				delete(d.cursors, topic)
 			}
 		}
-		// Preparation can outlast a permit and has its own post-preparation
-		// barrier. Never require its entire budget to fit in a fresh permit.
-		budget := min(d.Limits.PrepareTimeout+d.Limits.WorkTime, ConsumerReadPermit/2)
+		// Start renewal early enough to overlap observed quorum latency with
+		// useful delivery. Its duration is always measured from read start.
+		budget := max(renewBudget, min(d.Limits.ValidationTimeout+d.Limits.WorkTime, permitDuration/2))
 		if d.hub.PermitNeedsRenewal(budget) {
 			if !renewing && !now.Before(renewAfter) {
 				renew <- struct{}{}
@@ -303,6 +328,10 @@ func (d *Dispatcher) runPipeline(parent context.Context) {
 		}
 		if !permitReady || !d.hub.DeliveryPermitted() {
 			return
+		}
+		for topic, job := range pending {
+			jobs <- job
+			delete(pending, topic)
 		}
 		if d.MaintenanceRecipients != nil {
 			topics = append(topics, maintenanceTopic)
@@ -322,7 +351,9 @@ func (d *Dispatcher) runPipeline(parent context.Context) {
 			} else {
 				view := d.hub.InterestView(topic)
 				if !view.Active {
-					d.dropPreload(topic)
+					// The permit may expire after the scheduling check above.
+					// Preserve validated work until renewal; prunePreloads fences
+					// actual epoch/activation changes independently of the permit.
 					continue
 				}
 				p = d.preloads[topic]
@@ -382,18 +413,12 @@ func (d *Dispatcher) runPipeline(parent context.Context) {
 			if current := d.cursors[topic]; current != nil {
 				cursor = *current
 				cursor.after = append([]byte(nil), current.after...)
+				cursor.upper = append([]byte(nil), current.upper...)
 			}
 			scanning[topic] = p
 			reservedDue += dueSlots
 			reservedFuture += futureSlots
-			known := make(map[[24]byte]bool, len(p.keys)+len(assigned[topic]))
-			for key := range p.keys {
-				known[key] = true
-			}
-			for key := range assigned[topic] {
-				known[key] = true
-			}
-			scanJobs <- discoveryJob{revision: revision, repairGeneration: p.repairGeneration, known: known, topic: topic, owner: p, cursor: cursor, futureAfter: append([]byte(nil), p.after...), futureSlots: futureSlots, dueSlots: dueSlots}
+			scanJobs <- discoveryJob{revision: revision, repairGeneration: p.repairGeneration, assigned: assigned[topic], topic: topic, owner: p, cursor: cursor, futureAfter: append([]byte(nil), p.after...), futureSlots: futureSlots, dueSlots: dueSlots}
 			rotation = (start + offset + 1) % len(topics)
 		}
 		d.observePreload()
@@ -436,14 +461,19 @@ func (d *Dispatcher) runPipeline(parent context.Context) {
 		case <-ticker.C:
 		case <-d.wakeCh:
 		case <-deadline:
-		case ok := <-renewed:
+		case renewal := <-renewed:
 			renewing = false
-			permitReady = ok
-			if !ok {
+			permitReady = renewal.ok
+			renewBudget = min(permitDuration-min(d.interval, permitDuration/10), max(permitDuration/2, 2*renewal.elapsed+d.interval))
+			if !renewal.ok {
 				renewAfter = time.Now().Add(d.interval)
 			}
 		case result := <-results:
 			topic := result.job.chunk.topic
+			if result.pending && busy[topic] == result.job.owner {
+				pending[topic] = result.job
+				break
+			}
 			if busy[topic] == result.job.owner {
 				delete(busy, topic)
 				delete(busyDue, topic)

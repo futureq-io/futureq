@@ -133,6 +133,11 @@ func startRun(cmd *cobra.Command, _ []string) {
 		}
 	}
 	deleter := dispatcher.NewDeleter(ledger, deleteInterval, logger)
+	if cfg.Cluster.Enabled {
+		// Overlap consensus waits without releasing tracking before commit
+		// or accumulating unbounded proposal goroutines during quorum loss.
+		deleter.MaxConcurrentFlushes = cfg.Delivery.DeleteWorkers
+	}
 	deleter.AcknowledgeBatch = ledger.Acknowledge
 	deleter.OnAcknowledged = hub.RemoveAcknowledgedBatch
 	disp := dispatcher.NewDispatcher(
@@ -150,7 +155,7 @@ func startRun(cmd *cobra.Command, _ []string) {
 	disp.Limits = dispatcher.ScanLimits{
 		Candidates: cfg.Delivery.PrepareBatchSize, Examined: cfg.Delivery.ScanMaxKeys,
 		Bytes: int(prepareBytes), WorkTime: cfg.Delivery.ScanWorkBudget,
-		PrepareTimeout: cfg.Delivery.PrepareTimeout, Workers: cfg.Delivery.PrepareWorkers,
+		ValidationTimeout: cfg.Delivery.ValidationTimeout, Workers: cfg.Delivery.DeliveryWorkers,
 	}
 	a.Subscriptions.ApplyLocal = ledger.ApplySubscription
 	ledger.OnDelete = func(keys [][]byte) {
@@ -190,7 +195,8 @@ func startRun(cmd *cobra.Command, _ []string) {
 		hub.SetGroupMembership(a.MetadataSM.ConsumerGroup)
 		hub.SetDeliveryView(a.MetadataSM.TopicDeliverySnapshot)
 		hub.SetDeliveryFence(a.MetadataSM.ConsumerVersion, inFlightTimeout)
-		a.MetadataSM.SetConsumerBarrier(hub.WithRebalanceBarrier)
+		hub.SetReadPermit(cfg.Delivery.ReadPermit)
+		a.MetadataSM.SetConsumerBarrier(hub.WithConsumerBarrier)
 		disp.ReadBarrier = dispatcher.NewConsumerReadBarrier(a.Ctx, a.NodeHost, a.MetadataSM, hub, cfg.Cluster.ShardID)
 		// Clear subscriptions from an earlier process before this node serves
 		// new streams. A crash cannot run the stream's unregister defer.

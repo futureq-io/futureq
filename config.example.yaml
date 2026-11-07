@@ -62,6 +62,8 @@ delivery:
     # No workers connected for this duration: discard the subscription/backlog.
     # 0s retains group and universal interests forever; message TTL still applies.
     disconnectTimeout: 0s
+    renewalWorkers: 4 # 1..16 concurrent renewal batches, up to 256 sessions each
+    disconnectWorkers: 1 # 1..16 concurrent disconnect batches; shared bounded queue
   discoveryWorkers: 2 # 1..16 independent storage scan workers
   preloadScanIdleMaxInterval: 0s # 0 disables speculative idle backoff; due scans keep their poll cadence
   consumerQueueSize: 1024 # 1..65536 messages per consumer sender queue
@@ -70,15 +72,18 @@ delivery:
   preloadLookahead: 0s # future caching is opt-in; try 100ms after workload evaluation
   preloadMaxMessages: 512 # global full-message future-cache cap; 0 disables future caching
   inFlightTimeout: 5s
+  readPermit: 1s # Raft delivery authorization from quorum-read start; 100ms..30s, whole milliseconds
   deleteBatchInterval: 500ms
+  deleteWorkers: 16 # 1..256 concurrent ACK/delete flushes in Raft mode; standalone stays serial
+  consumerRemovalWorkers: 1 # 1..16 concurrent Raft consumer membership removals
   ttlSweepInterval: 1m0s
   # Each topic gets one bounded chunk at a time, with cyclic cursor wrap.
   prepareBatchSize: 64 # 1..256 candidates; new Raft command tag 4
   prepareBatchBytes: 256KiB # command cap and local scan byte budget
   scanMaxKeys: 256 # includes remote owners, in-flight keys, and skipped keys
   scanWorkBudget: 5ms # local work only; iterators close before proposal waits
-  prepareTimeout: 250ms # uncertain completion is retried idempotently
-  prepareWorkers: 2 # bounded jobs; at most one per topic
+  validationTimeout: 250ms # cooperative deadline for payload validation and receipt reads
+  deliveryWorkers: 2 # bounded delivery jobs; at most one per topic
 
 observability:
   logging:

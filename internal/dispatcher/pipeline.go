@@ -19,20 +19,21 @@ import (
 )
 
 type ScanLimits struct {
-	Candidates     int
-	Examined       int
-	Bytes          int
-	WorkTime       time.Duration
-	PrepareTimeout time.Duration
-	Workers        int
+	Candidates        int
+	Examined          int
+	Bytes             int
+	WorkTime          time.Duration
+	ValidationTimeout time.Duration
+	Workers           int
 }
 
 func DefaultScanLimits() ScanLimits {
-	return ScanLimits{Candidates: 64, Examined: 256, Bytes: raft.MaxDeliveryPrepareBytes, WorkTime: 5 * time.Millisecond, PrepareTimeout: 250 * time.Millisecond, Workers: 2}
+	return ScanLimits{Candidates: 64, Examined: 256, Bytes: raft.MaxDeliveryPrepareBytes, WorkTime: 5 * time.Millisecond, ValidationTimeout: 250 * time.Millisecond, Workers: 2}
 }
 
 type scanCursor struct {
 	after []byte
+	upper []byte // fixed exclusive end of this repair pass
 	epoch uint64
 }
 type deliveryChunk struct {
@@ -68,7 +69,7 @@ func (d *Dispatcher) refreshPermit(ctx context.Context) bool {
 }
 
 // A cursor is strictly a scan position, never a completion watermark. Exhausting
-// the current due range wraps it to the beginning, revisiting insertions behind
+// a fixed snapshot endpoint wraps it to the beginning, revisiting insertions behind
 // it, failed proposals/sends, NACKs, and timeout retries. Epoch changes reset it.
 // Every examined key consumes work, including remote owners and in-flight keys.
 func (d *Dispatcher) collectTopic(topic string, nowMs int64) deliveryChunk {
@@ -91,7 +92,11 @@ func (d *Dispatcher) collectTopic(topic string, nowMs int64) deliveryChunk {
 	if len(cursor.after) > 0 {
 		lower = cursor.after
 	}
-	iter, err := d.db.NewIter(&storage.IterOptions{LowerBound: lower, UpperBound: utils.DueUpperBound(hash, utils.CalculateBucket(nowMs, d.TimeBucket))})
+	upper := cursor.upper
+	if len(upper) == 0 {
+		upper = utils.DueUpperBound(hash, utils.CalculateBucket(nowMs, d.TimeBucket))
+	}
+	iter, err := d.db.NewIter(&storage.IterOptions{LowerBound: lower, UpperBound: upper})
 	if err != nil {
 		d.logger.Error("delivery iterator failed", zap.Error(err))
 		return chunk
@@ -99,6 +104,11 @@ func (d *Dispatcher) collectTopic(topic string, nowMs int64) deliveryChunk {
 	defer iter.Close() //nolint:errcheck
 	examined, bytesRead := 0, 0
 	var commandSize raft.DeliveryPrepareSizer
+	// Freeze a concrete key boundary from this iterator's snapshot. A moving
+	// publishing tail (even within the same time bucket) cannot extend this pass.
+	if len(cursor.upper) == 0 && iter.Last() {
+		cursor.upper = append(append([]byte(nil), iter.Key()...), 0)
+	}
 	valid := iter.First()
 	for valid {
 		// Iterator setup may consume the entire time budget. Examine one key
@@ -118,7 +128,7 @@ func (d *Dispatcher) collectTopic(topic string, nowMs int64) deliveryChunk {
 			continue
 		}
 		metrics.DeliveryScannedKeysTotal.Inc()
-		if d.skipKeys[[24]byte(key)] {
+		if d.skipKeys != nil && d.skipKeys([24]byte(key)) {
 			valid = iter.Next()
 			continue
 		}
@@ -177,11 +187,11 @@ func (d *Dispatcher) collectTopic(topic string, nowMs int64) deliveryChunk {
 		valid = iter.Next()
 	}
 	if !valid {
-		cursor.after = nil
+		cursor.after, cursor.upper = nil, nil
 	}
 	if err := iter.Error(); err != nil {
 		d.logger.Error("delivery scan failed", zap.Error(err))
-		cursor.after = nil
+		cursor.after, cursor.upper = nil, nil
 	}
 	return chunk
 }
@@ -435,13 +445,19 @@ func (d *Dispatcher) deliverChunk(chunk deliveryChunk, states map[string]*raft.D
 // Continue to enforce the bounded ownership permit at enqueue and actual Send.
 // Legacy preparation jobs retain their post-proposal barrier.
 func (d *Dispatcher) authorizePrepared(ctx context.Context, states map[string]*raft.DeliveryState) bool {
+	if needsPreparationBarrier(states) {
+		return d.refreshPermit(ctx)
+	}
+	// Production publish-bound jobs never wait for Raft here. The scheduler's
+	// single renewal worker refreshes authorization; expired jobs wait there.
+	return d.hub.DeliveryPermitted()
+}
+
+func needsPreparationBarrier(states map[string]*raft.DeliveryState) bool {
 	for _, state := range states {
 		if state != nil && !state.PublishBound {
-			return d.refreshPermit(ctx)
+			return true
 		}
 	}
-	if d.hub.DeliveryPermitted() {
-		return true
-	}
-	return d.refreshPermit(ctx)
+	return false
 }

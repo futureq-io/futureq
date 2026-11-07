@@ -30,8 +30,8 @@ type inFlightEntry struct {
 //   - Performs TTL checks at dispatch time; expired messages are batched for deletion
 //   - Snapshot-based iteration (never blocks concurrent writes)
 type Dispatcher struct {
-	skipKeys        map[[24]byte]bool // immutable snapshot, isolated discovery adapter only
-	scanOnly        bool              // isolated worker adapter never publishes scheduler gauges
+	skipKeys        func([24]byte) bool // synchronized preload lookup, isolated discovery adapter only
+	scanOnly        bool                // isolated worker adapter never publishes scheduler gauges
 	db              storage.DB
 	hub             *Hub
 	deleter         *Deleter
@@ -129,7 +129,7 @@ func (d *Dispatcher) dispatchTopic(topic string, nowMs int64) int {
 	if len(chunk.items) == 0 {
 		return 0
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), d.Limits.PrepareTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), d.Limits.ValidationTimeout)
 	defer cancel()
 	states, err := d.prepareChunk(ctx, chunk)
 	if err != nil {

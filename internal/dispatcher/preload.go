@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"container/heap"
 	"io"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -95,10 +96,37 @@ type topicPreload struct {
 	epoch            uint64
 	after            []byte // independent of the live due cursor; never a watermark
 	items            candidateHeap
+	keyMu            sync.RWMutex // protects keys only; never held across storage or Hub calls
 	keys             map[[24]byte]bool
 	scanNext         bool
 	futureScanAfter  time.Time // scheduler-owned speculative scan deadline
 	futureScanIdle   time.Duration
+}
+
+// Discovery reads this small synchronized index without copying the entire
+// preload. Heaps and accounting remain exclusively scheduler-owned.
+func (p *topicPreload) hasKey(key [24]byte) bool {
+	p.keyMu.RLock()
+	defer p.keyMu.RUnlock()
+	return p.keys[key]
+}
+func (p *topicPreload) addKey(key [24]byte) {
+	p.keyMu.Lock()
+	defer p.keyMu.Unlock()
+	if p.keys == nil {
+		p.keys = make(map[[24]byte]bool)
+	}
+	p.keys[key] = true
+}
+func (p *topicPreload) removeKey(key [24]byte) {
+	p.keyMu.Lock()
+	defer p.keyMu.Unlock()
+	delete(p.keys, key)
+}
+func (p *topicPreload) clearKeys() {
+	p.keyMu.Lock()
+	defer p.keyMu.Unlock()
+	p.keys = nil
 }
 
 // collectScheduledTopic alternates cached chunks with live due scans. Even a
@@ -155,7 +183,7 @@ func (d *Dispatcher) collectPreloaded(topic string, p *topicPreload, view Intere
 			break // retain this candidate for a subsequent bounded chunk
 		}
 		heap.Pop(&p.items)
-		delete(p.keys, candidate.key)
+		p.removeKey(candidate.key)
 		if candidate.ready {
 			p.readyCount--
 			d.readyCount--
@@ -236,7 +264,7 @@ func (d *Dispatcher) preloadTopic(topic string, p *topicPreload, view InterestVi
 		p.after = append(append([]byte(nil), key...), 0)
 		if len(key) == 24 {
 			scanned++
-			if p.keys[[24]byte(key)] {
+			if p.hasKey([24]byte(key)) || (d.skipKeys != nil && d.skipKeys([24]byte(key))) {
 				valid = iter.Next()
 				continue
 			}
@@ -266,11 +294,8 @@ func (d *Dispatcher) preloadTopic(topic string, p *topicPreload, view InterestVi
 				candidate.payload = payload
 				candidate.due = msg.EnqueuedAtUnixMs + msg.DelayMs
 				if candidate.due > nowMs && candidate.due <= horizon && !d.isExpired(msg, nowMs) {
-					if p.keys == nil {
-						p.keys = make(map[[24]byte]bool)
-					}
 					heap.Push(&p.items, candidate)
-					p.keys[candidate.key] = true
+					p.addKey(candidate.key)
 					d.preloadCount++
 					loaded++
 				}
@@ -296,7 +321,8 @@ func (d *Dispatcher) dropPreload(topic string) {
 				d.preloadCount--
 			}
 		}
-		p.items, p.keys = nil, nil
+		p.items = nil
+		p.clearKeys()
 		p.readyCount = 0
 		delete(d.preloads, topic)
 	}
@@ -338,6 +364,8 @@ func (d *Dispatcher) observePreload() {
 // compact bounds backing capacity and clears drained maps without keeping
 // payload references in unused heap slots.
 func (p *topicPreload) compact() {
+	p.keyMu.Lock()
+	defer p.keyMu.Unlock()
 	if len(p.items) == 0 {
 		p.items, p.keys = nil, nil // release capacity when a topic drains
 	} else if len(p.items) <= cap(p.items)/4 {
@@ -362,7 +390,7 @@ func (d *Dispatcher) releaseReady(topic string, p *topicPreload) {
 	kept := p.items[:0]
 	for _, candidate := range p.items {
 		if candidate.ready {
-			delete(p.keys, candidate.key)
+			p.removeKey(candidate.key)
 			d.readyCount--
 			p.readyCount--
 		} else {

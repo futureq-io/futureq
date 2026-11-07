@@ -62,6 +62,14 @@ Reads are **push-based** — consumers never poll the broker:
 2. The [deleter](delivery.md#deleter) accumulates keys and flushes them every `deleteBatchInterval` as one batched delete — a single Raft proposal in clustered mode — amortizing LSM tombstone costs.
 3. Failed delete batches are retried on the next flush.
 
+## Topology refreshes
+
+Raft event callbacks queue topology refreshes for a single background worker.
+Repeated events for a shard are combined; each refresh reads current membership
+and leader state, waits for metadata application, and retries failures. Startup
+publication stays synchronous. Consumer registration, quorum reads, ownership
+permits, and rebalance/fencing barriers retain their completion checks.
+
 ## Components
 
 | Component          | Location                   | Role |

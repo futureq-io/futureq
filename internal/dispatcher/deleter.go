@@ -85,6 +85,10 @@ type Deleter struct {
 	logger   *zap.Logger
 	interval time.Duration
 
+	// MaxConcurrentFlushes allows persistence waits to overlap. Values <= 1
+	// keep serial flushing. Set before Run; standalone storage stays serial.
+	MaxConcurrentFlushes int
+
 	mu         sync.Mutex
 	pending    [][]byte
 	acks       []raft.DeliveryAck
@@ -184,18 +188,43 @@ func (d *Deleter) TryMarkAcknowledged(key []byte, recipient string) bool {
 	return true
 }
 
-// Run starts the batched delete loop. It blocks until ctx is cancelled.
+// Run starts the batched delete loop. It waits for outstanding flushes and
+// makes one final flush before returning on cancellation.
 func (d *Deleter) Run(ctx context.Context) {
 	ticker := time.NewTicker(d.interval)
 	defer ticker.Stop()
+	var workers sync.WaitGroup
+	slots := make(chan struct{}, max(1, d.MaxConcurrentFlushes))
 
 	for {
 		select {
 		case <-ctx.Done():
+			workers.Wait()
 			d.flush()
 			return
 		case <-ticker.C:
-			d.flush()
+			if d.MaxConcurrentFlushes <= 1 {
+				d.flush()
+				continue
+			}
+			d.mu.Lock()
+			pending := len(d.acks) > 0 || len(d.pending) > 0
+			d.mu.Unlock()
+			if !pending {
+				continue
+			}
+			select {
+			case slots <- struct{}{}:
+				workers.Add(1)
+				go func() {
+					defer workers.Done()
+					defer func() { <-slots }()
+					d.flush()
+				}()
+			default:
+				// Leave work queued until a later tick; proposals in progress
+				// still count toward MaxPendingCompletions.
+			}
 		}
 	}
 }

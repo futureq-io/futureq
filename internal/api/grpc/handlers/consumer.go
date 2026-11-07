@@ -73,13 +73,7 @@ func (h *ConsumerHandler) Subscribe(stream grpc.BidiStreamingServer[pb.ConsumerF
 	if err != nil {
 		return subscriptionError(err)
 	}
-	defer func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		if err := service.Disconnect(ctx, consumerID); err != nil {
-			h.logger.Warn("subscription disconnect failed; session lease will expire", zap.Error(err))
-		}
-	}()
+	defer service.DisconnectAsync(consumerID)
 	// Each durable interest is an independent logical group internally. Its UUID
 	// generation isolates old ACKs and assignments after unsubscribe/recreate.
 	init.GroupId = strings.TrimPrefix(subscription.Recipient, "g:")
@@ -110,10 +104,9 @@ func (h *ConsumerHandler) Subscribe(stream grpc.BidiStreamingServer[pb.ConsumerF
 		if clusteredGroup {
 			if err := h.hub.WithConsumerRegistry(func() error {
 				h.hub.Unregister(consumerID)
-				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-				defer cancel()
 				member := metadata.ConsumerMember{ID: consumerID, NodeID: app.A.Config().Cluster.NodeID}
-				return app.A.MetadataSvc.ChangeConsumer(ctx, app.A.Config().Cluster.ShardID, init.Topic, init.GroupId, member, false)
+				app.A.MetadataSvc.RemoveConsumerAsync(app.A.Config().Cluster.ShardID, init.Topic, init.GroupId, member)
+				return nil
 			}); err != nil {
 				h.logger.Warn("failed to unregister consumer; reconciliation will retry", zap.Error(err))
 			}

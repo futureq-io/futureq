@@ -264,12 +264,32 @@ type boltIterator struct {
 }
 
 func (bi *boltIterator) First() bool {
+	bi.done = false
 	var k, v []byte
 	if bi.lower != nil {
 		k, v = bi.cursor.Seek(bi.lower)
 	} else {
 		k, v = bi.cursor.First()
 	}
+	return bi.set(k, v)
+}
+
+func (bi *boltIterator) Last() bool {
+	var k, v []byte
+	if bi.upper == nil {
+		k, v = bi.cursor.Last()
+	} else {
+		k, _ = bi.cursor.Seek(bi.upper)
+		if k == nil {
+			k, v = bi.cursor.Last()
+		} else {
+			k, v = bi.cursor.Prev()
+		}
+	}
+	if bi.lower != nil && k != nil && bytes.Compare(k, bi.lower) < 0 {
+		k, v = nil, nil
+	}
+	bi.done = false
 	return bi.set(k, v)
 }
 

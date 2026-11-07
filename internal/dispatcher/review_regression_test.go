@@ -12,7 +12,7 @@ import (
 
 func TestReviewRenewalAllowsLongPreparationBudget(t *testing.T) {
 	d, _ := newPipelineTest(t)
-	d.Limits.PrepareTimeout = time.Second
+	d.Limits.ValidationTimeout = time.Second
 	d.hub.SetDeliveryFence(func() (uint64, bool) { return 1, true }, time.Second)
 	ch := make(chan *pb.QueueMessage, 1)
 	d.hub.Register("local", "orders", "workers", ch)
