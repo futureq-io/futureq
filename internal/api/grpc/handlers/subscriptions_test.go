@@ -22,7 +22,17 @@ import (
 )
 
 func TestDurableSubscriptionRPCAndOfflineUniversalDelivery(t *testing.T) {
-	a, hub, producer, _ := openPublishTest(t, "pebble")
+	for _, engine := range []string{"pebble", "bolt"} {
+		t.Run(engine, func(t *testing.T) {
+			t.Run("manual", func(t *testing.T) { testDurableSubscriptionDelivery(t, engine, false) })
+			t.Run("auto", func(t *testing.T) { testDurableSubscriptionDelivery(t, engine, true) })
+		})
+	}
+}
+
+func testDurableSubscriptionDelivery(t *testing.T, engine string, autoAck bool) {
+	a, hub, producer, _ := openPublishTest(t, engine)
+	a.Config().Delivery.Subscriptions.AllowAutoAck = autoAck
 	ledger := dispatcher.NewDeliveryLedger(a.DB, hub.LocalDeliveryRecipients, nil, nil)
 	a.Subscriptions.ApplyLocal = ledger.ApplySubscription
 	deleter := dispatcher.NewDeleter(ledger, time.Millisecond, zap.NewNop())
@@ -70,19 +80,27 @@ func TestDurableSubscriptionRPCAndOfflineUniversalDelivery(t *testing.T) {
 		stream, err := client.Subscribe(ctx)
 		require.NoError(t, err)
 		require.NoError(t, stream.Send(&pb.ConsumerFrame{Body: &pb.ConsumerFrame_Init{Init: init}}))
-		_, err = stream.Header()
+		headers, err := stream.Header()
 		require.NoError(t, err)
+		if init.AutoAck {
+			require.Equal(t, []string{"true"}, headers.Get("subscription-auto-ack"))
+		}
 		return stream
 	}
-	audit := connect(&pb.SubscribeInit{Topic: "orders", SubscriberId: "audit"})
+	audit := connect(&pb.SubscribeInit{Topic: "orders", SubscriberId: "audit", AutoAck: autoAck})
 	first, err := audit.Recv()
 	require.NoError(t, err)
 	require.Equal(t, "offline", string(first.Payload))
-	require.NoError(t, audit.Send(&pb.ConsumerFrame{Body: &pb.ConsumerFrame_Ack{Ack: &pb.AckRequest{Success: true, DeliveryTag: first.DeliveryTag}}}))
+	if !autoAck {
+		require.NoError(t, audit.Send(&pb.ConsumerFrame{Body: &pb.ConsumerFrame_Ack{Ack: &pb.AckRequest{Success: true, DeliveryTag: first.DeliveryTag}}}))
+	}
 	require.Eventually(t, func() bool {
 		state, err := raft.ReadDeliveryState(a.DB, keys[0])
 		return err == nil && state != nil && !state.Needs(universal.Generation)
 	}, time.Second, time.Millisecond)
+	state, err = raft.ReadDeliveryState(a.DB, keys[0])
+	require.NoError(t, err)
+	require.True(t, state.Needs(group.Generation), "completing audit must retain the offline worker's obligation")
 	audit.CloseSend() //nolint:errcheck
 	workers := connect(&pb.SubscribeInit{Topic: "orders", GroupId: "workers"})
 	second, err := workers.Recv()
