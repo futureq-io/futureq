@@ -279,7 +279,7 @@ func (bi *boltIterator) Last() bool {
 	if bi.upper == nil {
 		k, v = bi.cursor.Last()
 	} else {
-		k, v = bi.cursor.Seek(bi.upper)
+		k, _ = bi.cursor.Seek(bi.upper)
 		if k == nil {
 			k, v = bi.cursor.Last()
 		} else {
