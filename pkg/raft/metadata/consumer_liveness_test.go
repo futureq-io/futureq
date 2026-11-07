@@ -17,7 +17,7 @@ func TestConsumerLivenessPreservesPermitsAndUsesExistingDrain(t *testing.T) {
 	finishConsumerRebalance(t, sm)
 	epoch, _ := sm.ConsumerVersion()
 	barriers := 0
-	sm.SetConsumerBarrier(func(apply func()) { barriers++; apply() })
+	sm.SetConsumerBarrier(func(apply func() bool) { barriers++; apply() })
 	svc := NewService(nil, func(_ context.Context, cmd []byte) error {
 		_, err := sm.Update(statemachine.Entry{Cmd: cmd})
 		return err

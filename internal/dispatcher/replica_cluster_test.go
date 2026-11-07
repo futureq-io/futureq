@@ -104,7 +104,7 @@ func (c *replicaTestCluster) start(id uint64, restart bool) *replicaTestNode {
 	node.hub = NewHub(NewRoundRobinStrategy(), zap.NewNop(), wake)
 	node.hub.SetGroupMembership(node.sm.ConsumerGroup)
 	node.hub.SetDeliveryFence(node.sm.ConsumerVersion, replicaTestTimeout)
-	node.sm.SetConsumerBarrier(node.hub.WithRebalanceBarrier)
+	node.sm.SetConsumerBarrier(node.hub.WithConsumerBarrier)
 	backend := NewRaftDeleteBackend(func(cmd []byte) error { _, err := propose(replicaTestShard, cmd); return err }, zap.NewNop())
 	ledger := NewDeliveryLedger(db, node.sm.DeliveryRecipients, backend, func(cmd []byte) (statemachine.Result, error) { return propose(replicaTestShard, cmd) })
 	node.deleter = NewDeleter(ledger, time.Hour, zap.NewNop())

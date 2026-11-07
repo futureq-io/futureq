@@ -17,12 +17,12 @@ import (
 
 // Discovery has its own slots: preparation/quorum latency never prevents a
 // ready heap deadline or another topic's scan from being scheduled. Ranges of
-// the same topic never overlap concurrently. No mutable scheduler state is
-// passed to workers; cursors are acknowledged only with their matching result.
+// the same topic never overlap concurrently. Workers share only the synchronized
+// key index; cursors are acknowledged only with their matching result.
 type discoveryJob struct {
 	revision              uint64
 	repairGeneration      uint64
-	known                 map[[24]byte]bool
+	assigned              map[[24]byte]bool // immutable, bounded delivery batch
 	topic                 string
 	owner                 *topicPreload
 	cursor                scanCursor
@@ -57,7 +57,7 @@ type permitRenewal struct {
 
 func (d *Dispatcher) discover(job discoveryJob) discoveryResult {
 	// Construct a scanner adapter rather than copying a Dispatcher (sync.Map).
-	scanner := &Dispatcher{scanOnly: true, skipKeys: job.known, db: d.db, hub: d.hub, deleter: d.deleter, logger: d.logger,
+	scanner := &Dispatcher{scanOnly: true, skipKeys: func(key [24]byte) bool { return job.assigned[key] || job.owner.hasKey(key) }, db: d.db, hub: d.hub, deleter: d.deleter, logger: d.logger,
 		TimeBucket: d.TimeBucket, Limits: d.Limits, PreloadLookahead: d.PreloadLookahead,
 		PreloadMaxMessages: job.futureSlots, MaintenanceRecipients: d.MaintenanceRecipients,
 		cursors: map[string]*scanCursor{job.topic: &job.cursor}}
@@ -69,7 +69,7 @@ func (d *Dispatcher) discover(job discoveryJob) discoveryResult {
 		metrics.DeliveryRepairScansTotal.Inc()
 		chunk = scanner.collectTopic(job.topic, time.Now().UnixMilli())
 	}
-	p := &topicPreload{epoch: job.owner.epoch, after: job.futureAfter, keys: job.known}
+	p := &topicPreload{epoch: job.owner.epoch, after: job.futureAfter}
 	// Future scans have independent work budgets and run even with productive
 	// due traffic, provided the scheduler reserved future admission first.
 	exhausted := false
@@ -88,13 +88,10 @@ func (d *Dispatcher) admitCandidate(p *topicPreload, c preloadCandidate) bool {
 	if !c.ready && c.payload.validity.Invalidated() {
 		return false
 	}
-	if p.keys[c.key] {
+	if p.hasKey(c.key) {
 		return false
 	}
-	if p.keys == nil {
-		p.keys = make(map[[24]byte]bool)
-	}
-	p.keys[c.key] = true
+	p.addKey(c.key)
 	heap.Push(&p.items, c)
 	if c.ready {
 		p.readyCount++
@@ -354,7 +351,9 @@ func (d *Dispatcher) runPipeline(parent context.Context) {
 			} else {
 				view := d.hub.InterestView(topic)
 				if !view.Active {
-					d.dropPreload(topic)
+					// The permit may expire after the scheduling check above.
+					// Preserve validated work until renewal; prunePreloads fences
+					// actual epoch/activation changes independently of the permit.
 					continue
 				}
 				p = d.preloads[topic]
@@ -414,18 +413,12 @@ func (d *Dispatcher) runPipeline(parent context.Context) {
 			if current := d.cursors[topic]; current != nil {
 				cursor = *current
 				cursor.after = append([]byte(nil), current.after...)
+				cursor.upper = append([]byte(nil), current.upper...)
 			}
 			scanning[topic] = p
 			reservedDue += dueSlots
 			reservedFuture += futureSlots
-			known := make(map[[24]byte]bool, len(p.keys)+len(assigned[topic]))
-			for key := range p.keys {
-				known[key] = true
-			}
-			for key := range assigned[topic] {
-				known[key] = true
-			}
-			scanJobs <- discoveryJob{revision: revision, repairGeneration: p.repairGeneration, known: known, topic: topic, owner: p, cursor: cursor, futureAfter: append([]byte(nil), p.after...), futureSlots: futureSlots, dueSlots: dueSlots}
+			scanJobs <- discoveryJob{revision: revision, repairGeneration: p.repairGeneration, assigned: assigned[topic], topic: topic, owner: p, cursor: cursor, futureAfter: append([]byte(nil), p.after...), futureSlots: futureSlots, dueSlots: dueSlots}
 			rotation = (start + offset + 1) % len(topics)
 		}
 		d.observePreload()

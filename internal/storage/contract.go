@@ -33,7 +33,7 @@ type IterOptions struct {
 	UpperBound []byte
 }
 
-// Iterator is a forward cursor over a sorted key-value range.
+// Iterator is a cursor over a sorted key-value range.
 // Callers must call Close when done to release underlying resources.
 //
 // The byte slices returned by Key and Value are only valid until the next
@@ -43,6 +43,9 @@ type Iterator interface {
 	// First positions the iterator at the first key (respecting LowerBound).
 	// Returns true if a key is found.
 	First() bool
+
+	// Last positions at the last key respecting both bounds. First may restart it.
+	Last() bool
 
 	// Next advances the iterator to the next key.
 	// Returns true if a key is found.

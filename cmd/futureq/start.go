@@ -196,7 +196,7 @@ func startRun(cmd *cobra.Command, _ []string) {
 		hub.SetDeliveryView(a.MetadataSM.TopicDeliverySnapshot)
 		hub.SetDeliveryFence(a.MetadataSM.ConsumerVersion, inFlightTimeout)
 		hub.SetReadPermit(cfg.Delivery.ReadPermit)
-		a.MetadataSM.SetConsumerBarrier(hub.WithRebalanceBarrier)
+		a.MetadataSM.SetConsumerBarrier(hub.WithConsumerBarrier)
 		disp.ReadBarrier = dispatcher.NewConsumerReadBarrier(a.Ctx, a.NodeHost, a.MetadataSM, hub, cfg.Cluster.ShardID)
 		// Clear subscriptions from an earlier process before this node serves
 		// new streams. A crash cannot run the stream's unregister defer.
