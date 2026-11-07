@@ -75,7 +75,7 @@ A `metadata.Service` registers as Dragonboat's Raft/system event listener. On le
 
 ## Leader persistence
 
-`internal/raft/leaderpersist` decorates Dragonboat's LogDB ("tan+leaderpersist"). After every successful `SaveRaftState` it hashes each persisted application command, removing Dragonboat's uncompressed encoding header, and notifies the tracker. This is the mechanism behind the **leader ack level**: a publisher is acknowledged once the leader has durably written the entry to its local Raft log — before quorum commit. Successful apply is also accepted if it wins the notification race. FutureQ uses uncompressed log entries; unknown encodings fall back to apply completion. Correlation is by command hash; batch commands embed leader-assigned event IDs.
+`internal/raft/leaderpersist` decorates Dragonboat's LogDB ("tan+leaderpersist"). After every successful `SaveRaftState` it hashes each persisted application command, removing Dragonboat's uncompressed encoding header, and notifies the tracker. This is the mechanism behind the **leader ack level**: a publisher is acknowledged once the leader has durably written the entry to its local Raft log — before quorum commit. Successful apply is also accepted if it wins the notification race. Before reporting a proposal failure, cancellation, or timeout, the handler rechecks local persistence so an already-persisted command is not reported as failed just because both signals were ready. FutureQ uses uncompressed log entries; unknown encodings fall back to apply completion. Correlation is by command hash; batch commands embed leader-assigned event IDs.
 
 ## Publish ack levels
 

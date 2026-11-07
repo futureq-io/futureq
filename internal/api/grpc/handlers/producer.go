@@ -21,6 +21,7 @@ import (
 	"github.com/futureq-io/futureq/pkg/utils"
 	pb "github.com/futureq-io/protocol/proto/go"
 	storagepb "github.com/futureq-io/protocol/proto/go/storage"
+	"github.com/lni/dragonboat/v4"
 	"github.com/lni/dragonboat/v4/statemachine"
 	"google.golang.org/protobuf/proto"
 )
@@ -299,17 +300,9 @@ func (ph *ProducerHandler) processRaftBatch(
 		propCtx, cancel := context.WithTimeout(ctx, proposalTimeout)
 		defer cancel()
 
-		select {
-		case <-persistedCh:
+		proposeErr = waitForLeaderAck(propCtx, persistedCh, rs.AppliedC())
+		if proposeErr == nil {
 			ph.logger.Debug("leader has persisted and acked")
-		case result := <-rs.AppliedC():
-			// Apply completion also proves persistence. Both channels may be
-			// ready when we wake, so selecting apply is not itself a failure.
-			if !result.Completed() {
-				proposeErr = errors.New("leader-ack proposal did not complete")
-			}
-		case <-propCtx.Done():
-			proposeErr = fmt.Errorf("leader-ack wait cancelled: %w", propCtx.Err())
 		}
 	default:
 		propCtx, cancel := context.WithTimeout(ctx, proposalTimeout)
@@ -339,6 +332,32 @@ func (ph *ProducerHandler) processRaftBatch(
 	}
 
 	return nil
+}
+
+// waitForLeaderAck waits for local persistence or successful application, which
+// also proves persistence. It does not require quorum application to finish.
+func waitForLeaderAck(ctx context.Context, persisted <-chan struct{}, applied <-chan dragonboat.RequestResult) error {
+	var waitErr error
+	select {
+	case <-persisted:
+		return nil
+	case result := <-applied:
+		if result.Completed() {
+			return nil
+		}
+		waitErr = errors.New("leader-ack proposal did not complete")
+	case <-ctx.Done():
+		waitErr = fmt.Errorf("leader-ack wait cancelled: %w", ctx.Err())
+	}
+	// select chooses randomly when persistence and a failure are both ready.
+	// Once the local log is persisted the LEADER guarantee is satisfied, even
+	// if replication/application later times out or the caller is cancelled.
+	select {
+	case <-persisted:
+		return nil
+	default:
+		return waitErr
+	}
 }
 
 // processStandaloneBatch writes the batch directly to Pebble (non-Raft mode).
