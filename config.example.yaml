@@ -59,6 +59,7 @@ publish:
 
 delivery:
   subscriptions:
+    allowAutoAck: false # reject auto-ack streams unless explicitly allowed
     # No workers connected for this duration: discard the subscription/backlog.
     # 0s retains group and universal interests forever; message TTL still applies.
     disconnectTimeout: 0s

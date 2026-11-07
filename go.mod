@@ -2,6 +2,10 @@ module github.com/futureq-io/futureq
 
 go 1.27.1
 
+// Protocol PR: https://github.com/futureq-io/protocol/pull/2
+// Replace with an upstream release after the protocol change is merged.
+replace github.com/futureq-io/protocol/proto/go => github.com/AmHonored/protocol/proto/go v0.0.0-20261107075654-d8c6174a041b
+
 // replace github.com/lni/dragonboat/v4 => github.com/hertzcodes/dragonboat v4.0.0
 
 require (

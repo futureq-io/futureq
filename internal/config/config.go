@@ -32,6 +32,8 @@ const (
 )
 
 type Subscriptions struct {
+	// AllowAutoAck permits workers to complete delivery on send instead of manual ACK/NACK.
+	AllowAutoAck bool `mapstructure:"allowAutoAck" yaml:"allowAutoAck"`
 	// DisconnectTimeout is the time without any connected worker before unsubscribe. Zero retains interest forever.
 	DisconnectTimeout time.Duration `mapstructure:"disconnectTimeout" yaml:"disconnectTimeout"`
 	RenewalWorkers    int           `mapstructure:"renewalWorkers" yaml:"renewalWorkers"`

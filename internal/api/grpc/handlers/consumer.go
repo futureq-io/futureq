@@ -52,7 +52,8 @@ func NewConsumerHandler(logger *zap.Logger, hub *dispatcher.Hub, deleter *dispat
 //   - Non-empty group_id: competing consumer — races with other consumers in
 //     the same group; only one receives each message.
 //
-// Delivery semantics: at-least-once.
+// Delivery semantics: manual ACK/NACK by default. Auto-ack streams complete
+// each recipient after a successful Send, without waiting for client processing.
 //   - On ACK (success=true): the key is queued for Raft-replicated deletion.
 //   - On NACK (success=false): the key is immediately removed from in-flight,
 //     making the message eligible for re-dispatch on the next dispatcher tick.
@@ -64,6 +65,9 @@ func (h *ConsumerHandler) Subscribe(stream grpc.BidiStreamingServer[pb.ConsumerF
 	}
 	if init == nil {
 		return nil
+	}
+	if init.AutoAck && !app.A.Config().Delivery.Subscriptions.AllowAutoAck {
+		return status.Error(codes.PermissionDenied, "auto-ack subscriptions are disabled")
 	}
 	consumerID := uuid.New().String()
 	service := app.A.Subscriptions
@@ -132,7 +136,11 @@ func (h *ConsumerHandler) Subscribe(stream grpc.BidiStreamingServer[pb.ConsumerF
 		}
 	}
 
-	if err := stream.SendHeader(grpcmetadata.Pairs("subscription-generation", subscription.Recipient)); err != nil {
+	headers := grpcmetadata.Pairs("subscription-generation", subscription.Recipient)
+	if init.AutoAck {
+		headers.Set("subscription-auto-ack", "true")
+	}
+	if err := stream.SendHeader(headers); err != nil {
 		return err
 	}
 
@@ -167,7 +175,7 @@ func (h *ConsumerHandler) Subscribe(stream grpc.BidiStreamingServer[pb.ConsumerF
 	}()
 
 	// ─── Sender goroutine: push messages to the consumer ─────────────────────
-	go h.sender(ctx, stream, consumerID, ch, errCh)
+	go h.sender(ctx, stream, consumerID, init, ch, errCh)
 
 	// ─── Receiver goroutine: process ACK/NACK frames ─────────────────────────
 	go h.receiver(stream, consumerID, init, errCh)
@@ -220,6 +228,7 @@ func (h *ConsumerHandler) sender(
 	ctx context.Context,
 	stream grpc.BidiStreamingServer[pb.ConsumerFrame, pb.QueueMessage],
 	consumerID string,
+	init *pb.SubscribeInit,
 	ch chan *pb.QueueMessage,
 	errCh chan error,
 ) {
@@ -241,6 +250,15 @@ func (h *ConsumerHandler) sender(
 				return
 			}
 			metrics.DeliveryGRPCSendsTotal.WithLabelValues(msg.Topic).Inc()
+			if init.AutoAck && h.hub.MarkAcknowledgedSent(consumerID, msg.DeliveryTag) {
+				// Use the same recipient ledger and retry queue as manual ACKs.
+				// Never complete an attempt before Send succeeds, and never
+				// release another subscription's obligation to this payload.
+				if !h.deleter.TryMarkAcknowledged(msg.DeliveryTag, metadata.DeliveryRecipient(init.GroupId, consumerID)) {
+					errCh <- status.Error(codes.ResourceExhausted, "durable ACK queue full; retry subscription")
+					return
+				}
+			}
 		}
 	}
 }
@@ -267,6 +285,11 @@ func (h *ConsumerHandler) receiver(
 		if ackReq == nil {
 			h.logger.Warn("received unexpected SubscribeInit after handshake",
 				zap.String("consumer_id", consumerID))
+			continue
+		}
+		// Ignore manual ACKs and NACKs even while Send is blocked. Only the
+		// sender may complete a delivery on an accepted auto-ack stream.
+		if init.AutoAck {
 			continue
 		}
 
