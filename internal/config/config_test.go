@@ -89,6 +89,20 @@ func (s *ConfigSuite) TestEmptyEnvironmentValueDisablesMetrics() {
 	s.Empty(cfg.Observability.Metrics.Listen)
 }
 
+func (s *ConfigSuite) TestAutoAckPolicyOverrides() {
+	cfg, err := Load("")
+	s.Require().NoError(err)
+	s.False(cfg.Delivery.Subscriptions.AllowAutoAck)
+	path := s.writeConfig("delivery:\n  subscriptions:\n    allowAutoAck: true\n")
+	cfg, err = Load(path)
+	s.Require().NoError(err)
+	s.True(cfg.Delivery.Subscriptions.AllowAutoAck)
+	s.T().Setenv("FUTUREQ_DELIVERY_SUBSCRIPTIONS_ALLOWAUTOACK", "false")
+	cfg, err = Load(path)
+	s.Require().NoError(err)
+	s.False(cfg.Delivery.Subscriptions.AllowAutoAck)
+}
+
 func (s *ConfigSuite) TestInvalidEnvironmentValueFails() {
 	s.T().Setenv("FUTUREQ_CLUSTER_NODEID", "not-a-number")
 	_, err := Load("")

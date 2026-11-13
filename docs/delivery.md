@@ -1,5 +1,14 @@
 # Delivery pipeline
 
+Consumers use manual ACK/NACK by default. An explicitly requested auto-ack stream
+requires `delivery.subscriptions.allowAutoAck: true`. After a successful gRPC
+send, the sender queues that recipient's completion through the usual batched
+ACK ledger. It does not wait for the application's handler. Failed sends remain
+pending, persistence failures retry, and independent recipients retain their
+copies. Manual ACKs and NACKs on auto-ack streams are ignored, including while a
+send is still blocked. A crash before completion commits can cause duplicates;
+handler failures cannot request redelivery after an auto-ack send.
+
 ```text
  storage ──range scan──▶ Dispatcher ──▶ Hub ──▶ consumer channels
                          ▲                │

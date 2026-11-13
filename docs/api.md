@@ -72,6 +72,20 @@ configured timeout starts. Message TTL still applies.
 - Consumers may connect to any event replica. Cluster-wide assignments and
   expiring ownership permits fence delivery during rebalances and partitions.
 
+Set `SubscribeInit.auto_ack = true` to complete this worker's deliveries after
+each successful gRPC send. The default is `false` (manual ACK/NACK). Auto-ack is
+per connection and must be requested again on reconnect; durable subscription
+creation and generation are unchanged. The server rejects auto-ack streams with
+`PermissionDenied` unless `delivery.subscriptions.allowAutoAck: true` is set.
+An accepting server includes `subscription-auto-ack: true` in initial metadata;
+clients must require that confirmation before suppressing ACK/NACK frames.
+
+On auto-ack streams both manual ACK and NACK requests are ignored. Handler errors
+cannot request redelivery, and successful send does not confirm application
+processing. Failed sends are not acknowledged. Completion uses the same batched
+recipient ledger and persistence retries as manual ACKs; other recipients keep
+their obligations. A crash before completion is committed can cause duplicates.
+
 ### After registration
 
 - The broker assigns a UUID and registers the consumer with the [hub](delivery.md#hub-consumer-groups) (buffered channel, capacity 1024).

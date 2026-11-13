@@ -110,6 +110,7 @@ output does not increase the number of freshness slots; XXH128 is not supported.
 | `delivery.deleteBatchInterval`      | `500ms` | How often the deleter flushes its batch of keys to delete (one Raft proposal per batch in clustered mode). |
 | `delivery.deleteWorkers`            | `16` | Maximum concurrent ACK/delete flushes in Raft mode (1..256). Pending and in-progress completions share the existing queue bound. Standalone flushes remain serial. |
 | `delivery.subscriptions.renewalWorkers` | `4` | Concurrent session renewal batches (1..16), at most 256 sessions per batch. |
+| `delivery.subscriptions.allowAutoAck` | `false` | Allow workers to request `SubscribeInit.auto_ack`; otherwise reject them with `PermissionDenied` before binding. Manual ACK/NACK streams remain available. |
 | `delivery.subscriptions.disconnectWorkers` | `1` | Concurrent session disconnect batches (1..16), at most 256 sessions per batch. |
 | `delivery.consumerRemovalWorkers` | `1` | Concurrent Raft consumer membership removals (1..16), targeting unique disconnected stream IDs. |
 | `delivery.deliveryWorkers`          | `2` | Delivery-worker concurrency (1..16), with at most one job per topic. Workers validate payloads, read receipts, check permissions, and queue sends. |
@@ -117,6 +118,11 @@ output does not increase the number of freshness slots; XXH128 is not supported.
 | `delivery.ttlsweepInterval`         | `60s`   | How often the TTL janitor sweeps the whole database for expired messages. |
 
 All four intervals and the in-flight timeout must be greater than zero.
+
+Auto-ack can also be enabled with
+`FUTUREQ_DELIVERY_SUBSCRIPTIONS_ALLOWAUTOACK=true`. Apply the same policy on every
+replica that accepts consumer streams. The default rejects auto-ack requests;
+enabling it permits explicit opt-in and does not change existing streams.
 
 Worker counts are applied at startup and require a restart to change. Environment
 overrides for the new pools are `FUTUREQ_DELIVERY_SUBSCRIPTIONS_RENEWALWORKERS`,
