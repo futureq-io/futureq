@@ -250,7 +250,11 @@ func (h *ConsumerHandler) sender(
 				return
 			}
 			metrics.DeliveryGRPCSendsTotal.WithLabelValues(msg.Topic).Inc()
-			if init.AutoAck && h.hub.MarkAcknowledgedSent(consumerID, msg.DeliveryTag) {
+			if init.AutoAck {
+				// Expiry or disconnect may remove local tracking while Send is
+				// blocked. A successful send still completes this generation's
+				// recipient; local tracking is only a duplicate-send guard.
+				h.hub.MarkAcknowledgedSent(consumerID, msg.DeliveryTag)
 				// Use the same recipient ledger and retry queue as manual ACKs.
 				// Never complete an attempt before Send succeeds, and never
 				// release another subscription's obligation to this payload.
