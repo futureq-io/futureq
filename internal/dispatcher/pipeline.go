@@ -145,7 +145,7 @@ func (d *Dispatcher) collectTopic(topic string, nowMs int64) deliveryChunk {
 		value := iter.Value()
 		bytesRead += len(value)
 		metrics.DeliveryDiscoveryBytesTotal.Add(float64(len(value)))
-		payload, err := cachePayload(iter, key, value)
+		payload, err := cachePayload(value)
 		if err != nil {
 			d.logger.Error("invalid stored message", zap.Error(err))
 			valid = iter.Next()
@@ -304,11 +304,8 @@ func (d *Dispatcher) prepareChunk(ctx context.Context, chunk deliveryChunk) (map
 				return nil, err
 			}
 			payload := chunk.payloads[string(item.Key)]
-			// An invalid proof can be a tracker collision or a pending write,
-			// not a changed message. Read current bytes on this attempt rather
-			// than dropping otherwise eligible work into cyclic repair/backoff.
 			msg := payload.message
-			if msg == nil || !payload.validity.Valid() {
+			if msg == nil {
 				metrics.DeliveryPreparePayloadCacheTotal.WithLabelValues("fallback").Inc()
 				refreshed, err := d.readPayload(item.Key, "preparation")
 				if errors.Is(err, storage.ErrNotFound) {
@@ -385,7 +382,9 @@ func (d *Dispatcher) deliverChunk(chunk deliveryChunk, states map[string]*raft.D
 		}
 		payload := chunk.payloads[string(item.Key)]
 		msg := payload.message
-		if msg != nil && payload.validity.Valid() {
+		// Receipt-backed delivery can reuse immutable payload bytes. Adapters
+		// without a delivery ledger still need a Get to check existence.
+		if msg != nil && (d.PrepareBatch != nil || d.PrepareDelivery != nil) {
 			metrics.DeliveryPayloadCacheTotal.WithLabelValues("cache").Inc()
 		} else {
 			metrics.DeliveryPayloadCacheTotal.WithLabelValues("fallback").Inc()
@@ -403,7 +402,7 @@ func (d *Dispatcher) deliverChunk(chunk deliveryChunk, states map[string]*raft.D
 				continue
 			}
 		}
-		// ACK bits remain authoritative after a slow preparation/barrier. A
+		// Receipt existence and ACK bits remain authoritative after preparation. A
 		// snapshot can replace receipts while retaining the same event key.
 		if d.PrepareBatch != nil || d.PrepareDelivery != nil {
 			current, err := raft.ReadDeliveryState(d.db, item.Key)

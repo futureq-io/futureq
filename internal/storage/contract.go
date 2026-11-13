@@ -33,6 +33,14 @@ type IterOptions struct {
 	UpperBound []byte
 }
 
+// CacheRevisioner optionally exposes successful event-key Set commits. The
+// scheduler uses this notification to reset speculative scan backoff when new
+// messages arrive. It is not a payload freshness proof or a per-key version.
+// Engines and wrappers without it retain the ordinary polling cadence.
+type CacheRevisioner interface {
+	CacheRevision() uint64
+}
+
 // Iterator is a cursor over a sorted key-value range.
 // Callers must call Close when done to release underlying resources.
 //

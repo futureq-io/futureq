@@ -3,7 +3,6 @@ package dispatcher
 import (
 	"bytes"
 	"context"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -19,7 +18,6 @@ import (
 
 	"github.com/futureq-io/futureq/internal/config"
 	raft "github.com/futureq-io/futureq/internal/raft/event"
-	"github.com/futureq-io/futureq/internal/repository"
 	"github.com/futureq-io/futureq/internal/storage"
 	"github.com/futureq-io/futureq/pkg/utils"
 	pb "github.com/futureq-io/protocol/proto/go"
@@ -483,70 +481,14 @@ func (s *PreloadSuite) TestFullMessageCacheAvoidsFinalPayloadReadAndOwnsBytes() 
 			chunk := d.collectScheduledTopic("orders", now)
 			require.Len(chunk.items, 1)
 			require.Equal([]byte("payload"), chunk.payloads[string(key)].message.Payload)
-			require.True(chunk.payloads[string(key)].validity.Valid())
 			states, err := d.prepareChunk(context.Background(), chunk)
 			require.NoError(err)
 			require.EqualValues(1, observed.payloadReads.Load(), "new manifest preparation still verifies existence via Get")
 			observed.payloadReads.Store(0)
 			require.Equal(1, d.deliverChunk(chunk, states))
-			require.Zero(observed.payloadReads.Load(), "valid cached data must avoid final full payload Get/decode")
+			require.Zero(observed.payloadReads.Load(), "immutable cached data must avoid final full payload Get/decode")
 			require.Equal([]byte("payload"), (<-ch).Payload)
 		})
-	}
-}
-
-func (s *PreloadSuite) TestCachedWorkerCannotBypassDeleteOverwriteOrSnapshot() {
-	for _, engine := range []string{"pebble", "bolt"} {
-		for _, mutation := range []string{"delete", "overwrite", "snapshot"} {
-			s.Run(engine+"/"+mutation, func() {
-				require := s.Require()
-
-				d, _ := newPreloadTest(s.T(), engine)
-				ch := make(chan *pb.QueueMessage, 1)
-				d.hub.Register("local", "orders", "workers", ch)
-				key := putPipelineEvent(s.T(), d, "orders", 1, time.Now().Add(-time.Second).UnixMilli())
-				chunk := d.collectScheduledTopic("orders", time.Now().UnixMilli())
-				states, err := d.prepareChunk(context.Background(), chunk)
-				require.NoError(err)
-				if mutation == "snapshot" {
-					// Real state-machine replacement, including its clearDB phase. Same key,
-					// new bytes: old payload must never be authorized by a delayed delete hint.
-					var stream bytes.Buffer
-					value, err := proto.Marshal(&storagepb.StoredMessage{Topic: "orders", Payload: []byte("replacement"), EnqueuedAtUnixMs: time.Now().Add(-time.Second).UnixMilli()})
-					require.NoError(err)
-					for _, record := range []struct{ k, v []byte }{{key, value}} {
-						require.NoError(binary.Write(&stream, binary.LittleEndian, uint32(len(record.k))))
-						stream.Write(record.k)
-						require.NoError(binary.Write(&stream, binary.LittleEndian, uint32(len(record.v))))
-						stream.Write(record.v)
-					}
-					repo, err := repository.NewEventRepository(d.db, zap.NewNop(), time.Millisecond)
-					require.NoError(err)
-					sm := raft.NewEventStateMachineFactory(d.db, repo, nil, zap.NewNop())(1, 1)
-					require.NoError(sm.RecoverFromSnapshot(&stream, make(chan struct{})))
-				} else {
-					batch := d.db.NewBatch()
-					if mutation == "delete" {
-						require.NoError(batch.Delete(key))
-					} else {
-						value, err := proto.Marshal(&storagepb.StoredMessage{Topic: "orders", Payload: []byte("replacement"), EnqueuedAtUnixMs: time.Now().Add(-time.Second).UnixMilli()})
-						require.NoError(err)
-						require.NoError(batch.Set(key, value))
-					}
-					require.NoError(batch.Commit(storage.Sync))
-					require.NoError(batch.Close())
-				}
-				require.False(chunk.payloads[string(key)].validity.Valid())
-				sent := d.deliverChunk(chunk, states)
-				if mutation == "delete" || mutation == "snapshot" {
-					require.Zero(sent)
-					require.Empty(ch)
-				} else {
-					require.Equal(1, sent)
-					require.Equal([]byte("replacement"), (<-ch).Payload)
-				}
-			})
-		}
 	}
 }
 
@@ -747,11 +689,11 @@ func (s *PreloadSuite) TestDiscoveryRejectsResultCapturedBeforeCommittedDelete()
 	require.NoError(batch.Close())
 	p := &topicPreload{}
 	d.admitChunk(p, scanned, nil)
-	require.Len(p.items, 1, "uncertain due entries reach worker validation")
+	require.Len(p.items, 1, "stale discovery can be admitted; the delivery ledger rejects deleted messages")
 	selected := d.collectPreloaded("orders", p, d.hub.InterestView("orders"), time.Now().UnixMilli())
 	states, err := d.prepareChunk(context.Background(), selected)
 	require.NoError(err)
-	require.Empty(states, "the fresh read must reject the deleted message before preparation")
+	require.Nil(states[string(key)], "receipt preparation must reject the deleted message")
 	require.Zero(d.deliverChunk(selected, states))
 	require.Empty(ch)
 	require.Empty(p.items)

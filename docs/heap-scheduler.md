@@ -2,7 +2,7 @@
 
 The dispatcher retains decoded `StoredMessage` data, including the payload.
 Storage remains authoritative; restarting discards and rebuilds the queue.
-Event keys and payload validity tracking are independent of delivery receipts.
+Event keys identify immutable message bytes; delivery receipts track mutable eligibility.
 Publish-bound receipts persist destinations with the payload; ownership fencing
 and at-least-once retries remain mandatory.
 
@@ -16,7 +16,7 @@ flowchart LR
   P -->|outcome| S
   P --> Q[Existing bounded Hub queues and gRPC senders]
   R[One bounded permit-renewal worker] --> S
-  P -->|local committed receipt and payload validation| DB
+  P -->|local committed receipt validation| DB
 ```
 
 Only the scheduler changes heaps, admission counters, cursors, fair rotation,
@@ -28,8 +28,8 @@ preparation jobs; known assigned keys are excluded from discovery and checked
 again when a result is admitted. Hub reservations remain the authority for
 individual recipient attempts after enqueue.
 
-Delivery workers check permission, read the publish-bound receipt, validate
-cached data, reread current local committed ACK state, recheck TTL/exact due time
+Delivery workers check permission, reuse the immutable cached message,
+reread current local committed receipt/ACK state, recheck TTL/exact due time
 and enqueue through Hub. Publish-bound messages have no delivery-time storage
 commit or per-batch quorum read. Their payload and frozen recipients were
 committed together by the publisher. Periodic permit renewal and actual-send
@@ -40,15 +40,15 @@ One renewal worker reads the metadata and event shards concurrently and requires
 both reads to succeed. Renewal starts with at least half the permit remaining;
 observed read latency increases this margin without extending the permit.
 If permission expires during validation, a publish-bound batch waits in the
-scheduler with its bounded reservation and validated payloads. Delivery workers
-do not start additional reads. Resuming rechecks the current receipt, payload
-validity, due time, TTL and ownership; actual Send still checks its permit.
+scheduler with its bounded reservation and cached payloads. Delivery workers
+do not start additional reads. Resuming rechecks the current receipt,
+due time, TTL and ownership; actual Send still checks its permit.
 Read barriers grant permits from **read start**, as before. The legacy no-argument
 ReadBarrier hook captures its installation context: the preparation timeout does
 not cancel that hook. The production hook independently bounds reads to two
 seconds and uses the application cancellation context. Shutdown waits for it;
 custom hooks and storage calls must return before worker shutdown can complete.
-No scheduler/tracker lock spans storage, quorum or network work.
+No scheduler lock spans storage, quorum or network work.
 
 A single global message heap was rejected because a blocked topic could obstruct
 other topics. Per-topic heaps and fair rotation retain current one-job-per-topic
@@ -58,7 +58,7 @@ cross-topic isolation on both engines without overlapping scans of a topic.
 Separate per-topic scanner goroutines or scheduler partitions would add resident
 state and require evidence of a scheduler bottleneck first.
 
-## Payload ownership and validity proof
+## Immutable payload ownership and delivery eligibility
 
 Default `proto.Unmarshal` copies bytes into an independently allocated message.
 The vendored protobuf `consumeBytes` uses `append(emptyBuf[:], v...)`; iterator
@@ -67,59 +67,29 @@ owned data. No code mutates a retained message. Hub creates distinct queue-messa
 pointers per attempt while sharing immutable payload bytes. Serialised values are
 released with the iterator, rather than cached alongside decoded messages.
 
-Both built-in engines implement optional `storage.CachedIterator`. A token records
-an engine identity, a bounded hash slot of the event key, and the sequence captured
-**before** opening the engine snapshot. `storage.payloadCacheSlots` sets the number
-of version slots and pending counts per engine (default 4096, power of two from
-64 to 1048576). The count is fixed when opening the engine and requires restart
-to change; both engines and both standalone/Raft use it. Slot indexes are
-`uint32`, and hashing uses a mask because the count is a power of two. Every batch
-that touches 24-byte event keys lazily allocates an `S/8`-byte bitmap; metadata-only
-batches allocate none. Repeated keys and collisions set the same bit, requiring
-no sorting. Both commit passes check `S/64` words and visit their set bits.
-`storage.payloadCacheHash` selects `fnv` (FNV-1a 64-bit, default) or `xxhash64`
-(XXH64) once at DB open, with the same hash used for token creation and mutations.
-Changing it requires restart and changes only local collision patterns, not
-stored event keys or the wire format. No bitmap pool is used.
-Before committing any such batch, under a short tracker lock, it advances the
-sequence, stamps affected slots and marks them pending. After storage commit
-returns (including failure), it advances/stamps again and clears its pending
-counts. Tracker locks never cover the commit itself. Multiple overlapping commits
-are supported by per-slot counts.
+A scheduled message cannot be updated or directly deleted through the API.
+An event key identifies the same immutable message bytes throughout its lifetime,
+including identical Raft replay and snapshot restoration. Keys must never be reused
+for different bytes. The cache therefore retains decoded messages without per-key
+versions, hash slots, mutation bitmaps, snapshot tokens or freshness locks. Engine
+wrappers can reuse cached payloads without exposing special iterator/read interfaces.
+A missing cached message uses an ordinary Get and decode.
 
-A token validates only when its slot is not pending and its last mutation sequence
-is no later than the token's snapshot sequence. Therefore:
+Delivery eligibility is separate from payload contents. Preparation checks exact
+due time and TTL. The delivery ledger checks payload existence when it creates a
+receipt; publish-bound receipts already exist atomically with their payloads.
+Final ACK and TTL cleanup atomically remove both the payload and its receipt.
+Before enqueue, delivery rereads the current receipt and its ACK bits. Missing or
+mismatched receipts do not send, even when discovery or preparation retained an
+older payload. A snapshot can restore the same bytes with different receipt/ACK
+state; the final receipt read remains authoritative. Adapters without a delivery
+ledger retain an ordinary final Get to check existence.
 
-1. A mutation after snapshot capture invalidates the token before it changes DB
-   contents. A mutation overlapping capture either remains pending at validation
-   or has a completion sequence newer than capture. Neither can validate.
-2. Both Set and Delete participate, covering normal publish, replay, overwrite,
-   explicit deletion, TTL, final ACK deletion and snapshot clear/repopulation.
-   Recovery uses the same batch APIs, including its intermediate clear commit.
-3. Metadata-only preparation/partial ACK updates do not invalidate payloads.
-   Hash collisions invalidate conservatively and require a fresh payload read.
-4. Future admission rejects invalidated speculative results. Due admission
-   retains uncertain proofs for worker validation: an invalid token can reflect
-   a hash collision or pending mutation rather than a changed message. Before
-   committing a new receipt, the worker rereads an invalid/unsupported payload
-   and checks its current exact due time and TTL. Eligible messages prepare on
-   that attempt; deleted, expired or future replacements cannot freeze recipients.
-   Built-in engines return refreshed bytes with a proof captured before the Get;
-   preparation retains both the decoded message and that proof. Final delivery
-   independently validates it or rereads after the read barrier. Unsupported engines
-   and wrappers retain the conservative ordinary-Get fallback.
-5. A successful token validation is the payload freshness point corresponding to
-   the old final Get. A delete starting afterwards can race enqueue just as it
-   could after that Get; the change does not claim atomic delivery versus delete.
-   A delete completed before validation cannot be bypassed by cached data.
-
-The final receipt is read again before enqueue. Locally committed recipient ACK bits
-and receipt replacement are authoritative, even if preparation returned an older
-manifest. Missing or mismatched receipts do not send. Exact due/TTL checks and
-current Hub ownership/permit checks remain mandatory. No async delete notification
-is needed for cache safety; correctness lives at the storage mutation boundary.
-Payload-cache validation adds no persistent version metadata. Delivery receipts
-separately record whether their destinations were bound at publication.
+Exact due/TTL checks, current Hub ownership, topic generations and delivery permits
+remain mandatory. A completion committed after the final receipt read can race
+enqueue, just as a deletion could race the former final payload Get. This is not
+atomic delivery versus ACK/expiry. No asynchronous delete notification is needed
+for cache safety and no persistent cache version metadata is stored.
 
 ## Admission, cursors and retries
 
@@ -149,8 +119,11 @@ reservations and fair rotation. A nonempty scan whose entries are stale,
 duplicated or unusable waits for the poll cadence.
 Due repair scans keep the poll cadence. Exhausted speculative future scans with
 no new candidates back off exponentially up to `delivery.preloadScanIdleMaxInterval`
-(default 100ms, zero disables backoff; the effective limit is at least the poll
-interval). Payload commit revisions reset this backoff on the next scheduler pass.
+(default zero disables backoff; the effective limit is at least the poll
+interval). A successful commit containing event-key Sets increments one atomic notification
+counter per DB and resets this backoff on the next scheduler pass. Metadata-only
+commits, deletes, abandoned batches and failed commits do not advance it. This
+counter does not validate cached payloads and has no per-key or bitmap metadata.
 Engines or wrappers without revision tracking keep the original poll cadence.
 A due-only scan does not change the future cursor. Each topic may retain/reserve at most
 one due batch, including while its preparation job is busy. The global due
@@ -199,7 +172,7 @@ but now retain full messages; operators should size them for actual payloads.
 The suggested opt-in trial is 512 at 100 ms, with both zero settings still
 supporting due-only delivery. Existing explicitly configured lookaheads are honoured. This is a count limit, **not** a hard byte cap.
 
-On this arm64 build `StoredMessage` is 128 bytes and a candidate is 72 bytes.
+On this arm64 build `StoredMessage` is 128 bytes and a candidate is 48 bytes.
 Allow roughly 512 bytes per retained message for decoded objects, strings,
 heap capacity slack and map bookkeeping. Payload allocation classes matter:
 100 KiB rounds up to approximately 104 KiB here. At 512 future messages:
@@ -230,7 +203,6 @@ a consumer's configured channel capacity. With defaults C=512, B=64, W=2, D=2:
 | Heap/map backing capacity | Heap <4 times live entries after drain; maps rebuilt with it | Popped slots zeroed; removed topics clear arrays/maps |
 | Sender queues and tracked attempts | Per consumer: Q buffered + at most max(1024,Q) records | Shared immutable payload; expired buffered attempts may outlive tracking |
 | Delete/ACK buffers | Existing 8192-key limits per completion kind | Keys/recipient metadata, no payload cache |
-| Validity metadata | At `S` configured slots, about `12*S` bytes per engine plus an `S/8`-byte bitmap per batch touching message keys; defaults: 48 KiB and 512 bytes. Small snapshot token. | No per-key unbounded history; commit traversal checks `S/64` words and their set bits |
 | Known-key scan filters | At most D copies of relevant bounded heap/assigned key sets | Keys only |
 
 Conservatively, the heap/discovery/worker stages retain at most `C+max(D,W)B+WB=768`

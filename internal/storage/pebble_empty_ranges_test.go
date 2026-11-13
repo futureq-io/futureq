@@ -112,7 +112,7 @@ func TestPebbleEmptyRangeConcurrentWritesMatchSnapshot(t *testing.T) {
 		defer writers.Done()
 		for i := range 400 {
 			b := db.NewBatch()
-			key := []byte(fmt.Sprintf("k%03d", i%80))
+			key := fmt.Appendf(nil, "k%03d", i%80)
 			if i%3 == 0 {
 				require.NoError(t, b.Delete(key))
 			} else {
@@ -247,7 +247,7 @@ func TestPebbleEmptyRangeRetainsPrefixDuringPublishing(t *testing.T) {
 	db := emptyRangeDB(t)
 	b := db.NewBatch()
 	for i := range 10000 {
-		key := []byte(fmt.Sprintf("event/%08d", i))
+		key := fmt.Appendf(nil, "event/%08d", i)
 		require.NoError(t, b.Set(key, key))
 		require.NoError(t, b.Delete(key))
 	}
@@ -273,27 +273,6 @@ func TestPebbleEmptyRangeRetainsPrefixDuringPublishing(t *testing.T) {
 		require.NoError(t, b.Commit(NoSync))
 		require.NoError(t, b.Close())
 	}
-}
-
-func TestPebbleEmptyRangeKeepsPayloadValidityProof(t *testing.T) {
-	db := emptyRangeDB(t)
-	lower := []byte("01234567")
-	key := []byte("012345678901234567890123")
-	opts := &IterOptions{LowerBound: lower, UpperBound: []byte("1")}
-	it, err := db.NewIter(opts)
-	require.NoError(t, err)
-	require.False(t, it.First())
-	require.NoError(t, it.Close())
-	setEmptyRangeKey(t, db, string(key))
-	it, err = db.NewIter(opts)
-	require.NoError(t, err)
-	require.True(t, it.First())
-	require.Equal(t, key, it.Key())
-	token := it.(CachedIterator).CacheToken(key)
-	require.True(t, token.Valid())
-	require.NoError(t, it.Close())
-	setEmptyRangeKey(t, db, string(key))
-	require.False(t, token.Valid(), "same-key writes must still invalidate the payload's snapshot proof")
 }
 
 func TestPebbleEmptyRangeSnapshotCapturedDuringCommit(t *testing.T) {

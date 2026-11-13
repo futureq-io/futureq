@@ -3,7 +3,6 @@ package dispatcher
 import (
 	"bytes"
 	"container/heap"
-	"io"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -26,37 +25,26 @@ type preloadCandidate struct {
 	ready   bool // charged to the independent overdue admission allowance
 }
 
+// cachedPayload owns immutable message data, never cached delivery eligibility.
 type cachedPayload struct {
-	message  *deliverypb.StoredDeliveryMessage
-	validity storage.CacheToken
+	message *deliverypb.StoredDeliveryMessage
 }
 
-func cachePayload(iter storage.Iterator, key, value []byte) (cachedPayload, error) {
+func cachePayload(value []byte) (cachedPayload, error) {
 	var msg deliverypb.StoredDeliveryMessage
 	metrics.DeliveryPayloadDecodesTotal.WithLabelValues("discovery").Inc()
 	if err := (proto.UnmarshalOptions{DiscardUnknown: true}).Unmarshal(value, &msg); err != nil {
 		return cachedPayload{}, err
 	}
-	payload := cachedPayload{message: &msg}
-	if cached, ok := iter.(storage.CachedIterator); ok {
-		payload.validity = cached.CacheToken(key)
-	}
-	return payload, nil
+	return cachedPayload{message: &msg}, nil
 }
 
-// readPayload refreshes both the decoded message and its storage freshness proof.
-// Unsupported wrappers retain the conservative final-Get fallback. Malformed
-// values return an empty payload; storage failures return an error.
+// readPayload loads a message when discovery supplied no cached payload.
+// Event keys identify immutable message bytes for their entire lifetime,
+// including replay and snapshot recovery. Receipts determine eligibility.
+// Malformed values return an empty payload; storage failures return an error.
 func (d *Dispatcher) readPayload(key []byte, stage string) (cachedPayload, error) {
-	var payload cachedPayload
-	var value []byte
-	var closer io.Closer
-	var err error
-	if reader, ok := d.db.(storage.CachedReader); ok {
-		value, closer, payload.validity, err = reader.GetWithCacheToken(key)
-	} else {
-		value, closer, err = d.db.Get(key)
-	}
+	value, closer, err := d.db.Get(key)
 	if err != nil {
 		return cachedPayload{}, err
 	}
@@ -66,8 +54,7 @@ func (d *Dispatcher) readPayload(key []byte, stage string) (cachedPayload, error
 	if (proto.UnmarshalOptions{DiscardUnknown: true}).Unmarshal(value, msg) != nil {
 		return cachedPayload{}, nil
 	}
-	payload.message = msg
-	return payload, nil
+	return cachedPayload{message: msg}, nil
 }
 
 type candidateHeap []preloadCandidate
@@ -288,7 +275,7 @@ func (d *Dispatcher) preloadTopic(topic string, p *topicPreload, view InterestVi
 				valid = iter.Next()
 				continue
 			}
-			payload, err := cachePayload(iter, key, value)
+			payload, err := cachePayload(value)
 			if err == nil {
 				msg := payload.message
 				candidate.payload = payload
