@@ -19,7 +19,7 @@ Every message is stored under a 24-byte, big-endian, lexicographically sortable 
 | ------- | ----------- | ------- |
 | 0..8    | `topicHash` | xxhash64 of the topic name |
 | 8..16   | `bucket`    | Time bucket = `fireAtMs / timeBucket`, where `fireAtMs = enqueuedAtMs + delayMs`. With `timeBucket = 0`, raw milliseconds are used (max precision). |
-| 16..24  | `eventID`   | Monotonic counter assigned by the event repository (durable across restarts) |
+| 16..24  | `eventID`   | Monotonic ID finalized in Raft log order, or reserved by the standalone event repository |
 
 The sort order is therefore *topic → time bucket → ID*, which makes "give me everything due for topic X before now" a single range scan between two computed bounds:
 
@@ -53,5 +53,5 @@ Not a separate engine: it's Pebble in `mode: memory`. Ephemeral workloads only.
 
 `internal/repository/events.go` sits between handlers/state machine and storage:
 
-- Assigns **monotonic event IDs** — leader-only in Raft mode; the last ID is persisted under `metadata/event-repo/last-id` (big-endian uint64) so restarts never reuse IDs. Replicas advance past applied IDs via `ObserveID` instead of assigning.
+- Reserves **local proposed event IDs** for the publisher. Raft ordered apply retains a proposal only when it exceeds the applied high-water mark; a stale or duplicate reservation receives the next ID. The watermark includes prior items and entries in the same storage batch, is persisted atomically with messages under `metadata/event-repo/last-id`, and survives deletion, restart, replay, and snapshots. Local reservations never decide final Raft key uniqueness. `ObserveID` advances each replica's local allocator after commit.
 - Constructs the 24-byte keys and writes optional secondary indexes (proto-marshaled index payloads pointing back to the key).

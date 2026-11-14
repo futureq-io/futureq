@@ -12,9 +12,13 @@ import (
 	"github.com/futureq-io/futureq/internal/config"
 	"github.com/futureq-io/futureq/internal/repository"
 	"github.com/futureq-io/futureq/internal/storage"
+	"github.com/futureq-io/futureq/pkg/utils"
+	storagepb "github.com/futureq-io/protocol/proto/go/storage"
 	"github.com/lni/dragonboat/v4/statemachine"
+	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 	"go.uber.org/zap"
+	"google.golang.org/protobuf/proto"
 )
 
 type EventStateMachineSuite struct {
@@ -98,7 +102,7 @@ func (s *EventStateMachineSuite) TestUpdate_StoreBatch_AppliesItems() {
 	require.Len(results, 1)
 	require.Equal(uint64(2), results[0].Result.Value, "should report 2 items applied")
 
-	// Keys must use the leader-assigned IDs from the command verbatim.
+	// Proposed IDs ahead of the applied high-water mark are retained.
 	var foundIDs []uint64
 	err = s.db.Scan(nil, func(k, v []byte) error {
 		if len(k) == 24 {
@@ -326,7 +330,7 @@ func (s *EventStateMachineSuite) TestUpdate_OutOfOrderIDsKeepDurableMaximum() {
 
 	val, closer, err := s.db.Get(repository.LastIDKey)
 	require.NoError(err)
-	require.Equal(uint64(20), binary.BigEndian.Uint64(val))
+	require.Equal(uint64(22), binary.BigEndian.Uint64(val))
 	require.NoError(closer.Close())
 
 	restartedRepo, err := repository.NewEventRepository(s.db, zap.NewNop(), time.Second)
@@ -336,8 +340,8 @@ func (s *EventStateMachineSuite) TestUpdate_OutOfOrderIDsKeepDurableMaximum() {
 	index, err := restartedSM.Open(nil)
 	require.NoError(err)
 	require.Equal(uint64(3), index)
-	require.Equal(uint64(20), restartedSM.lastPersistedID)
-	require.Equal(uint64(21), restartedRepo.NextID())
+	require.Equal(uint64(22), restartedSM.lastPersistedID)
+	require.Equal(uint64(23), restartedRepo.NextID())
 }
 
 type failingCommitDB struct{ storage.DB }
@@ -597,4 +601,117 @@ func (s *EventStateMachineSuite) TestClose_NoError() {
 
 	sm := s.newSM(nil)
 	require.NoError(sm.Close())
+}
+
+func allocationCommand(t *testing.T, kind CommandType, ids []uint64, payloads ...string) []byte {
+	t.Helper()
+	receipt, err := MarshalPublishReceipt(0, []string{"g:s:workers"})
+	require.NoError(t, err)
+	items := make([]StoreBatchItem, len(ids))
+	for i, id := range ids {
+		value, err := proto.Marshal(&storagepb.StoredMessage{Topic: "orders", Payload: []byte(payloads[i]), EnqueuedAtUnixMs: 1000})
+		require.NoError(t, err)
+		items[i] = StoreBatchItem{ID: id, Bucket: 1, TopicHash: utils.TopicHash("orders"), Msg: value, Indexes: [][]byte{[]byte("index/" + payloads[i])}}
+		if kind == StoreDeliveryBatchCmd {
+			items[i].Receipt = receipt
+		}
+	}
+	var command []byte
+	switch kind {
+	case StoreBatchCmd:
+		command, err = MarshalStoreBatchCmd(items)
+	case StoreDeliveryBatchCmd:
+		command, err = MarshalStoreDeliveryBatchCmd(items)
+	case PublishBatchCmd:
+		command, err = MarshalPublishBatchCmd(items)
+	}
+	require.NoError(t, err)
+	return command
+}
+
+func TestOrderedApplyReassignsStaleAndDuplicateReservations(t *testing.T) {
+	for _, kind := range []CommandType{StoreBatchCmd, StoreDeliveryBatchCmd, PublishBatchCmd} {
+		t.Run(map[CommandType]string{StoreBatchCmd: "raw", StoreDeliveryBatchCmd: "early-ack", PublishBatchCmd: "quorum"}[kind], func(t *testing.T) {
+			sm, db := newDeliveryTestSM(t)
+			if kind == PublishBatchCmd {
+				create, err := testSubscriptionCommand("orders", "workers", "g:s:workers")
+				require.NoError(t, err)
+				applyAdmissionSequence(t, sm, create)
+			}
+			// Duplicate IDs inside a command and a later stale command in the
+			// same Update must all use the running applied high-water mark.
+			applyAdmissionSequence(t, sm,
+				allocationCommand(t, kind, []uint64{20, 20}, "first", "second"),
+				allocationCommand(t, kind, []uint64{1}, "third"))
+			for i, want := range []string{"first", "second", "third"} {
+				key := utils.EventKey(1, utils.TopicHash("orders"), 20+uint64(i))
+				value, closer, err := db.Get(key)
+				require.NoError(t, err)
+				var message storagepb.StoredMessage
+				require.NoError(t, proto.Unmarshal(value, &message))
+				require.NoError(t, closer.Close())
+				require.Equal(t, want, string(message.Payload))
+				index, closer, err := db.Get([]byte("index/" + want))
+				require.NoError(t, err)
+				require.Equal(t, key, index, "indexes must reference the assigned ID")
+				require.NoError(t, closer.Close())
+				if kind != StoreBatchCmd {
+					state, err := ReadDeliveryState(db, key)
+					require.NoError(t, err)
+					require.NotNil(t, state)
+					require.True(t, state.Needs("g:s:workers"), "receipts must use the assigned ID too")
+				}
+			}
+			require.Equal(t, uint64(22), sm.lastPersistedID)
+			value, closer, err := db.Get(repository.LastIDKey)
+			require.NoError(t, err)
+			require.Equal(t, uint64(22), binary.BigEndian.Uint64(value))
+			require.NoError(t, closer.Close())
+		})
+	}
+}
+
+func TestOrderedApplyKeepsIDWatermarkAcrossDeletionAndSnapshot(t *testing.T) {
+	sm, _ := newDeliveryTestSM(t)
+	applyAdmissionSequence(t, sm, allocationCommand(t, StoreDeliveryBatchCmd, []uint64{9}, "original"))
+	snapshot, err := sm.PrepareSnapshot()
+	require.NoError(t, err)
+	var stream bytes.Buffer
+	require.NoError(t, sm.SaveSnapshot(snapshot, &stream, nil))
+	recovered, db := newDeliveryTestSM(t)
+	require.NoError(t, recovered.RecoverFromSnapshot(&stream, nil))
+	oldKey := utils.EventKey(1, utils.TopicHash("orders"), 9)
+	remove, err := MarshalDeleteBatchCmd([][]byte{oldKey})
+	require.NoError(t, err)
+	applyAdmissionSequence(t, recovered, remove, allocationCommand(t, StoreDeliveryBatchCmd, []uint64{9}, "delayed"))
+	_, _, err = db.Get(oldKey)
+	require.ErrorIs(t, err, storage.ErrNotFound, "completion must not allow a stale reservation to reuse a key")
+	state, err := ReadDeliveryState(db, oldKey)
+	require.NoError(t, err)
+	require.Nil(t, state)
+	key := utils.EventKey(1, utils.TopicHash("orders"), 10)
+	value, closer, err := db.Get(key)
+	require.NoError(t, err)
+	var message storagepb.StoredMessage
+	require.NoError(t, proto.Unmarshal(value, &message))
+	require.NoError(t, closer.Close())
+	require.Equal(t, "delayed", string(message.Payload))
+	require.Equal(t, uint64(10), recovered.lastPersistedID)
+}
+
+func TestOrderedApplyRejectsIDExhaustionWithoutWrappingOrPartialWrites(t *testing.T) {
+	sm, db := newDeliveryTestSM(t)
+	command := allocationCommand(t, StoreBatchCmd, []uint64{^uint64(0), 0}, "maximum", "wrapped")
+	_, err := sm.Update([]statemachine.Entry{{Index: 1, Cmd: command}})
+	require.ErrorContains(t, err, "event ID space exhausted")
+	require.Zero(t, sm.lastApplied)
+	require.Zero(t, sm.lastPersistedID)
+	_, _, err = db.Get(utils.EventKey(1, utils.TopicHash("orders"), ^uint64(0)))
+	require.ErrorIs(t, err, storage.ErrNotFound, "the whole Update must abort")
+	applyAdmissionSequence(t, sm, allocationCommand(t, StoreBatchCmd, []uint64{^uint64(0)}, "maximum"))
+	_, err = sm.Update([]statemachine.Entry{{Index: 2, Cmd: allocationCommand(t, StoreBatchCmd, []uint64{0}, "wrapped")}})
+	require.ErrorContains(t, err, "event ID space exhausted")
+	require.Equal(t, uint64(1), sm.lastApplied)
+	_, _, err = db.Get(utils.EventKey(1, utils.TopicHash("orders"), 0))
+	require.ErrorIs(t, err, storage.ErrNotFound)
 }

@@ -37,7 +37,7 @@ One binary, two operating modes, selected by `cluster.enabled`:
 
 1. A producer sends a `PublishBatch` over the `PublishStream` bidi stream.
 2. The broker validates (no negative delays/TTLs; batch ack level ≥ broker minimum) and wraps each message into a serialized `StoredMessage`.
-3. The leader assigns each message a **monotonic event ID** (persisted across restarts), computes its **time bucket** from `enqueue time + delay`, and hashes the topic.
+3. The leader reserves a proposed event ID, computes the **time bucket** from `enqueue time + delay`, and hashes the topic. Ordered Raft apply finalizes each ID above the applied high-water mark, so an in-flight reservation from a former leader cannot overwrite another message. The final watermark is committed with the payloads and restored across restart and snapshots.
 4. Snapshot all durable named destinations (including offline groups) and live
    universal subscriptions. Reject the whole batch if any topic has no destinations.
 5. Clustered mode: one `StoreDeliveryBatchCmd` commits both payloads and frozen

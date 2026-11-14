@@ -70,7 +70,12 @@ released with the iterator, rather than cached alongside decoded messages.
 A scheduled message cannot be updated or directly deleted through the API.
 An event key identifies the same immutable message bytes throughout its lifetime,
 including identical Raft replay and snapshot restoration. Keys must never be reused
-for different bytes. The cache therefore retains decoded messages without per-key
+for different bytes. Ordered Raft apply enforces this by advancing stale proposed
+IDs past its persisted high-water mark, including earlier items/entries in the same
+Update. A delayed publish from a former leader becomes a separate message, even
+after the earlier message has completed. All replicas make the same allocation
+from replicated state; local ID reservations do not authorize overwrites.
+The cache therefore retains decoded messages without per-key
 versions, hash slots, mutation bitmaps, snapshot tokens or freshness locks. Engine
 wrappers can reuse cached payloads without exposing special iterator/read interfaces.
 A missing cached message uses an ordinary Get and decode.

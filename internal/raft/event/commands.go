@@ -10,8 +10,7 @@ type CommandType uint8
 
 const (
 	// StoreBatchCmd atomically writes a batch of messages to Pebble.
-	// The state machine uses the shared EventRepository to assign keys,
-	// ensuring consistent monotonic IDs across both Raft and standalone modes.
+	// Ordered apply assigns final monotonic IDs before writing event keys.
 	StoreBatchCmd CommandType = iota
 
 	// DeleteBatchCmd atomically deletes a batch of message keys from Pebble.
@@ -36,12 +35,12 @@ const (
 
 // StoreBatchItem is the minimal per-message metadata carried in a StoreBatchCmd.
 // The serialised StoredMessage value is passed verbatim — no re-serialisation
-// occurs in the state machine. The state machine calls EventRepository to assign
-// the monotonic event ID and construct the full 24-byte key.
+// occurs in the state machine. Ordered apply chooses the final monotonic event
+// ID and EventRepository constructs the full 24-byte key.
 type StoreBatchItem struct {
-	// ID is the leader-assigned monotonic event ID. All replicas apply it
-	// verbatim — only the leader generates IDs, ensuring identical keys on
-	// every replica.
+	// ID is a proposed event ID, not a committed reservation. Ordered apply
+	// retains it only when it is above the applied high-water mark; otherwise
+	// it assigns the next ID. All replicas derive identical keys in log order.
 	ID uint64
 	// Bucket is the pre-computed time bucket (fire_at_ms / timeBucketSize).
 	Bucket uint64
