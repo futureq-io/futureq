@@ -19,7 +19,7 @@ Every message is stored under a 24-byte, big-endian, lexicographically sortable 
 | ------- | ----------- | ------- |
 | 0..8    | `topicHash` | xxhash64 of the topic name |
 | 8..16   | `bucket`    | Time bucket = `fireAtMs / timeBucket`, where `fireAtMs = enqueuedAtMs + delayMs`. With `timeBucket = 0`, raw milliseconds are used (max precision). |
-| 16..24  | `eventID`   | Monotonic counter assigned by the event repository (durable across restarts) |
+| 16..24  | `eventID`   | Monotonic ID finalized in Raft log order, or reserved by the standalone event repository |
 
 The sort order is therefore *topic → time bucket → ID*, which makes "give me everything due for topic X before now" a single range scan between two computed bounds:
 
@@ -39,7 +39,7 @@ Delivery preparation and ACK commands, preparation results, and persisted delive
 
 LSM-tree engine (`storage.pebble.*`). Scans and iterators run on internal snapshots, so reads never block writes. Options: disk or in-memory mode (`vfs.NewMem()` — same code path, nothing persists, WAL auto-disabled), WAL toggle (auto-off in clustered mode — the Raft log is the WAL), block cache (default 16MiB) and memtable size (default 64MiB).
 
-Bounded `NewIter` calls remember verified empty prefixes in a small in-memory cache. Later snapshots can seek past those prefixes instead of repeatedly walking point tombstones in `First()`. Writes invalidate overlapping proofs before and after commit; inserts behind a discovery cursor remain visible on the next cyclic scan. Pending writes and old snapshots cannot certify a raced gap. The cache retains at most 64 ranges and 64 probes with bounds up to 256 bytes, and starts empty after restart. It changes neither the on-disk format, delivery polling/retry intervals, nor payload cache-validity tokens. The first scan of an uncached range still pays the underlying traversal cost; scans over live receipts still examine them.
+Bounded `NewIter` calls remember verified empty prefixes in a small in-memory cache. Later snapshots can seek past those prefixes instead of repeatedly walking point tombstones in `First()`. Writes invalidate overlapping proofs before and after commit; inserts behind a discovery cursor remain visible on the next cyclic scan. Pending writes and old snapshots cannot certify a raced gap. The cache retains at most 64 ranges and 64 probes with bounds up to 256 bytes, and starts empty after restart. It changes neither the on-disk format, delivery polling/retry intervals, nor immutable payload-cache ownership. The first scan of an uncached range still pays the underlying traversal cost; scans over live receipts still examine them.
 
 ### bbolt
 
@@ -53,5 +53,5 @@ Not a separate engine: it's Pebble in `mode: memory`. Ephemeral workloads only.
 
 `internal/repository/events.go` sits between handlers/state machine and storage:
 
-- Assigns **monotonic event IDs** — leader-only in Raft mode; the last ID is persisted under `metadata/event-repo/last-id` (big-endian uint64) so restarts never reuse IDs. Replicas advance past applied IDs via `ObserveID` instead of assigning.
+- Reserves **local proposed event IDs** for the publisher. Raft ordered apply retains a proposal only when it exceeds the applied high-water mark; a stale or duplicate reservation receives the next ID. The watermark includes prior items and entries in the same storage batch, is persisted atomically with messages under `metadata/event-repo/last-id`, and survives deletion, restart, replay, and snapshots. Local reservations never decide final Raft key uniqueness. `ObserveID` advances each replica's local allocator after commit.
 - Constructs the 24-byte keys and writes optional secondary indexes (proto-marshaled index payloads pointing back to the key).

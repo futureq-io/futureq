@@ -83,15 +83,16 @@ func (s *EventStateMachine) readStoredUint64(key []byte) (uint64, error) {
 // applyEntry applies a single Raft log entry to the batch and returns the result
 // and any keys that were deleted (for DeleteBatchCmd).
 //
-// For StoreBatchCmd: every item carries the leader-assigned event ID. Replicas
-// apply it verbatim — the state machine never generates IDs — so all replicas
-// converge on identical keys.
+// Store commands carry proposed event IDs. Ordered apply moves stale reservations
+// past the applied high-water mark, including earlier items/entries in this
+// Update. Every replica makes the same choice without consulting local NextID
+// reservations, which may differ across an in-flight leader handoff.
 //
 // Any storage error aborts the entire Update: the batch is only committed at
 // the end of Update, so returning an error means nothing partial is written.
 // A replica that cannot write must stop (Dragonboat halts it on Update error)
 // rather than silently diverge with a watermark lagging its stored keys.
-func (s *EventStateMachine) applyEntry(batch storage.Batch, delivery *DeliveryBatch, cmd []byte) (statemachine.Result, [][]byte, uint64, error) {
+func (s *EventStateMachine) applyEntry(batch storage.Batch, delivery *DeliveryBatch, cmd []byte, lastID uint64) (statemachine.Result, [][]byte, uint64, error) {
 	if len(cmd) == 0 {
 		return statemachine.Result{Value: 0}, nil, 0, nil
 	}
@@ -121,6 +122,16 @@ func (s *EventStateMachine) applyEntry(batch storage.Batch, delivery *DeliveryBa
 		}
 		var maxID uint64
 		for _, it := range items {
+			// A former leader may submit a reserved ID after the new leader has
+			// committed it. Preserve both publications under distinct keys, even
+			// if the earlier message has already been ACKed or expired.
+			if it.ID <= lastID {
+				if lastID == ^uint64(0) {
+					return statemachine.Result{}, nil, 0, fmt.Errorf("raft: event ID space exhausted")
+				}
+				it.ID = lastID + 1
+			}
+			lastID = it.ID
 			key, err := s.repo.StoreRawWithBatch(batch, it.ID, it.Bucket, it.TopicHash, it.Indexes, it.Msg)
 			if err != nil {
 				return statemachine.Result{}, nil, 0, fmt.Errorf("raft: StoreRawWithBatch: %w", err)
@@ -175,7 +186,7 @@ func (s *EventStateMachine) Update(entries []statemachine.Entry) ([]statemachine
 	lastID := s.lastPersistedID
 
 	for i := range entries {
-		result, deletedKeys, entryMaxID, err := s.applyEntry(batch, delivery, entries[i].Cmd)
+		result, deletedKeys, entryMaxID, err := s.applyEntry(batch, delivery, entries[i].Cmd, lastID)
 		if err != nil {
 			return nil, err
 		}

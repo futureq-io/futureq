@@ -22,15 +22,6 @@ const (
 	NoAck  AckLevel = "noAck"
 )
 
-const (
-	DefaultPayloadCacheSlots = 4096
-	MinPayloadCacheSlots     = 64
-	MaxPayloadCacheSlots     = 1 << 20
-	PayloadCacheHashFNV      = "fnv"
-	PayloadCacheHashXXHash64 = "xxhash64"
-	DefaultPayloadCacheHash  = PayloadCacheHashFNV
-)
-
 type Subscriptions struct {
 	// AllowAutoAck permits workers to complete delivery on send instead of manual ACK/NACK.
 	AllowAutoAck bool `mapstructure:"allowAutoAck" yaml:"allowAutoAck"`
@@ -85,11 +76,9 @@ type Raft struct {
 }
 
 type Storage struct {
-	Engine            string `mapstructure:"engine" yaml:"engine"`
-	PayloadCacheSlots int    `mapstructure:"payloadCacheSlots" yaml:"payloadCacheSlots"`
-	PayloadCacheHash  string `mapstructure:"payloadCacheHash" yaml:"payloadCacheHash"`
-	Pebble            Pebble `mapstructure:"pebble" yaml:"pebble"`
-	Bolt              Bolt   `mapstructure:"bolt" yaml:"bolt"`
+	Engine string `mapstructure:"engine" yaml:"engine"`
+	Pebble Pebble `mapstructure:"pebble" yaml:"pebble"`
+	Bolt   Bolt   `mapstructure:"bolt" yaml:"bolt"`
 }
 
 type Pebble struct {
@@ -326,14 +315,6 @@ func (c *Config) validateCluster() error {
 }
 
 func (c *Config) validateStorage() error {
-	if err := c.validatePayloadCacheSlots(); err != nil {
-		return err
-	}
-	switch c.Storage.PayloadCacheHash {
-	case PayloadCacheHashFNV, PayloadCacheHashXXHash64:
-	default:
-		return fmt.Errorf("storage.payloadCacheHash must be fnv or xxhash64")
-	}
 	switch c.Storage.Engine {
 	case "pebble":
 		p := c.Storage.Pebble
@@ -360,14 +341,6 @@ func (c *Config) validateStorage() error {
 		}
 	default:
 		return fmt.Errorf("storage.engine must be pebble or bolt")
-	}
-	return nil
-}
-
-func (c *Config) validatePayloadCacheSlots() error {
-	slots := c.Storage.PayloadCacheSlots
-	if slots < MinPayloadCacheSlots || slots > MaxPayloadCacheSlots || slots&(slots-1) != 0 {
-		return fmt.Errorf("storage.payloadCacheSlots must be a power of two from %d to %d", MinPayloadCacheSlots, MaxPayloadCacheSlots)
 	}
 	return nil
 }

@@ -180,11 +180,17 @@ func TestDeliveryDeleteStorePrepareDoesNotFlushOldReceipt(t *testing.T) {
 	require.NoError(t, err)
 	deletion, err := MarshalDeleteBatchCmd([][]byte{key})
 	require.NoError(t, err)
-	fresh, err := MarshalPrepareDeliveryCmd(key, 2, []string{"g:fresh"})
+	// The delayed second store reuses a proposed ID, but ordered apply must
+	// assign a new key instead of resurrecting the completed message.
+	freshKey := utils.EventKey(1, 2, 2)
+	fresh, err := MarshalPrepareDeliveryCmd(freshKey, 2, []string{"g:fresh"})
 	require.NoError(t, err)
 	_, err = sm.Update([]statemachine.Entry{{Index: 1, Cmd: store}, {Index: 2, Cmd: old}, {Index: 3, Cmd: deletion}, {Index: 4, Cmd: store}, {Index: 5, Cmd: fresh}})
 	require.NoError(t, err)
 	state, err := ReadDeliveryState(db, key)
+	require.NoError(t, err)
+	require.Nil(t, state, "the old receipt cannot be flushed or recreated")
+	state, err = ReadDeliveryState(db, freshKey)
 	require.NoError(t, err)
 	require.Equal(t, newDeliveryState(2, []string{"g:fresh"}), state)
 }

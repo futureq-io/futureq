@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sync/atomic"
 
 	"github.com/cockroachdb/pebble/v2"
 	"github.com/cockroachdb/pebble/v2/vfs"
@@ -13,18 +14,14 @@ import (
 
 // Pebble holds an open pebble database and implements storage.DB.
 type Pebble struct {
-	versions *cacheVersions
+	revision atomic.Uint64
 	empty    pebbleEmptyRanges
 	db       *pebble.DB
 	logger   *zap.Logger
 }
 
 // NewPebble opens a Pebble database using the given config.
-func NewPebble(cfg config.Pebble, logger *zap.Logger, options ...Options) (*Pebble, error) {
-	versions, err := newCacheVersions(options...)
-	if err != nil {
-		return nil, err
-	}
+func NewPebble(cfg config.Pebble, logger *zap.Logger) (*Pebble, error) {
 	concurrency := cfg.CompactionConcurrency
 	if concurrency < 0 {
 		return nil, fmt.Errorf("pebble compaction concurrency must be positive")
@@ -74,7 +71,7 @@ func NewPebble(cfg config.Pebble, logger *zap.Logger, options ...Options) (*Pebb
 		return nil, err
 	}
 
-	return &Pebble{db: db, logger: pebbleLogger, versions: versions}, nil
+	return &Pebble{db: db, logger: pebbleLogger}, nil
 }
 
 // ── storage.DB implementation ─────────────────────────────────────────────────
@@ -89,7 +86,7 @@ func (p *Pebble) Get(key []byte) ([]byte, io.Closer, error) {
 }
 
 func (p *Pebble) NewBatch() Batch {
-	return &pebbleBatch{b: p.db.NewBatch(), versions: p.versions, empty: &p.empty}
+	return &pebbleBatch{b: p.db.NewBatch(), revision: &p.revision, empty: &p.empty}
 }
 
 // NewIter opens a snapshot internally and returns an iterator scoped to it.
@@ -97,7 +94,6 @@ func (p *Pebble) NewBatch() Batch {
 func (p *Pebble) NewIter(opts *IterOptions) (Iterator, error) {
 	// Serialize snapshot capture with gap invalidation, never with commit I/O.
 	p.empty.mu.Lock()
-	validity := p.versions.snapshot()
 	snap := p.db.NewSnapshot()
 	probe, lower := p.empty.capture(opts)
 	p.empty.mu.Unlock()
@@ -120,7 +116,7 @@ func (p *Pebble) NewIter(opts *IterOptions) (Iterator, error) {
 		return nil, err
 	}
 
-	return &pebbleIterator{iter: iter, snap: snap, validity: validity, empty: &p.empty, probe: probe}, nil
+	return &pebbleIterator{iter: iter, snap: snap, empty: &p.empty, probe: probe}, nil
 }
 
 func (p *Pebble) Scan(opts *IterOptions, yield func(key, value []byte) error) error {
@@ -158,20 +154,22 @@ func (p *Pebble) Close() error { return p.db.Close() }
 // ── pebbleBatch ───────────────────────────────────────────────────────────────
 
 type pebbleBatch struct {
-	empty     *pebbleEmptyRanges
-	sets      pebbleKeySpan
-	versions  *cacheVersions
-	mutations cacheMutations
-	b         *pebble.Batch
+	empty      *pebbleEmptyRanges
+	sets       pebbleKeySpan
+	revision   *atomic.Uint64
+	payloadSet bool
+	b          *pebble.Batch
 }
 
 func (pb *pebbleBatch) Set(key, value []byte) error {
-	pb.mutations.add(key, pb.versions)
 	pb.sets.include(key)
-	return pb.b.Set(key, value, nil)
+	err := pb.b.Set(key, value, nil)
+	if err == nil && len(key) == 24 {
+		pb.payloadSet = true
+	}
+	return err
 }
 func (pb *pebbleBatch) Delete(key []byte) error {
-	pb.mutations.add(key, pb.versions)
 	return pb.b.Delete(key, nil)
 }
 func (pb *pebbleBatch) Close() error { return pb.b.Close() }
@@ -181,16 +179,17 @@ func (pb *pebbleBatch) Commit(mode SyncMode) error {
 		done := pb.empty.begin(&pb.sets)
 		defer done()
 	}
-	if pb.versions != nil {
-		done := pb.versions.begin(&pb.mutations)
-		defer done()
+	opts := pebble.Sync
+	if mode == NoSync {
+		opts = pebble.NoSync
 	}
-	switch mode {
-	case NoSync:
-		return pb.b.Commit(pebble.NoSync)
-	default:
-		return pb.b.Commit(pebble.Sync)
+	if err := pb.b.Commit(opts); err != nil {
+		return err
 	}
+	if pb.payloadSet {
+		pb.revision.Add(1)
+	}
+	return nil
 }
 
 // ── pebbleIterator ────────────────────────────────────────────────────────────
@@ -198,11 +197,10 @@ func (pb *pebbleBatch) Commit(mode SyncMode) error {
 // pebbleIterator owns both the pebble.Iterator and the pebble.Snapshot it was
 // created from. Close() releases both so callers only manage one resource.
 type pebbleIterator struct {
-	empty    *pebbleEmptyRanges
-	probe    *pebbleEmptyProbe
-	validity *cacheSnapshot
-	iter     *pebble.Iterator
-	snap     *pebble.Snapshot
+	empty *pebbleEmptyRanges
+	probe *pebbleEmptyProbe
+	iter  *pebble.Iterator
+	snap  *pebble.Snapshot
 }
 
 func (pi *pebbleIterator) First() bool {
@@ -245,19 +243,6 @@ var (
 	_ Iterator = (*pebbleIterator)(nil)
 )
 
-func (pi *pebbleIterator) CacheToken(key []byte) CacheToken { return pi.validity.token(key) }
+func (p *Pebble) CacheRevision() uint64 { return p.revision.Load() }
 
-// GetWithCacheToken captures the proof before Get, without holding a tracker
-// lock across storage I/O. Overlapping writes conservatively invalidate it.
-func (p *Pebble) GetWithCacheToken(key []byte) ([]byte, io.Closer, CacheToken, error) {
-	token := p.versions.snapshot().token(key)
-	value, closer, err := p.Get(key)
-	return value, closer, token, err
-}
-
-func (p *Pebble) CacheRevision() uint64 { return p.versions.revision() }
-
-var (
-	_ CachedReader    = (*Pebble)(nil)
-	_ CacheRevisioner = (*Pebble)(nil)
-)
+var _ CacheRevisioner = (*Pebble)(nil)

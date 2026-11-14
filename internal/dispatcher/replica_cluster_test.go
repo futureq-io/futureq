@@ -31,6 +31,7 @@ type replicaTestNode struct {
 	id          uint64
 	nh          *dragonboat.NodeHost
 	db          storage.DB
+	repo        *repository.EventRepository
 	sm          *metadata.MetadataStateMachine
 	svc         *metadata.Service
 	hub         *Hub
@@ -124,6 +125,7 @@ func (c *replicaTestCluster) start(id uint64, restart bool) *replicaTestNode {
 	require.NoError(c.t, nh.StartReplica(members, false, func(uint64, uint64) statemachine.IStateMachine { return node.sm }, rc))
 	repo, err := repository.NewEventRepository(db, zap.NewNop(), time.Second)
 	require.NoError(c.t, err)
+	node.repo = repo
 	rc.ShardID = replicaTestShard
 	require.NoError(c.t, nh.StartOnDiskReplica(members, false, raft.NewEventStateMachineFactory(db, repo, func(keys [][]byte) {
 		node.dispatcher.RemoveInFlightBatch(keys)

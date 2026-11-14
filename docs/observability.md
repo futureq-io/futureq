@@ -52,12 +52,12 @@ lateness histograms use milliseconds.
 
 The full-message scheduler adds these bounded-label metrics. Storage scans and
 heap selection stay in the existing duration series; do not sum a subset with
-its aggregate. The cache counters describe validation, not successful sends.
+its aggregate. The cache counters describe payload lookups, not successful sends.
 
 | Metric (prefix `futureq_`) | Type | Labels | Meaning |
 | --- | --- | --- | --- |
-| `delivery_prepare_payload_cache_total` | counter | source (`cache`, `fallback`) | Preparation payload validations; fallback counts full payload Get attempts, including missing, expired or not-yet-due messages. These attempts are excluded from the final-delivery cache-hit ratio. |
-| `delivery_payload_cache_total` | counter | source (`cache`, `fallback`) | Final payload validations using retained data or a fresh read fallback. |
+| `delivery_prepare_payload_cache_total` | counter | source (`cache`, `fallback`) | Preparation payload lookups; a missing cache entry falls back to a full payload Get, including attempts for missing, expired or not-yet-due messages. These attempts are excluded from the final-delivery cache-hit ratio. |
+| `delivery_payload_cache_total` | counter | source (`cache`, `fallback`) | Final payload lookups using immutable retained data or a cache-miss read fallback. |
 | `delivery_payload_reads_total` | counter | — | Final-delivery payload Get calls. Preparation existence reads and maintenance payload reads are separate storage work, excluded here. |
 | `delivery_payload_decodes_total` | counter | stage (`discovery`, `preparation`, `delivery`) | Full-message decode attempts in normal discovery, preparation fallback or final delivery fallback. Excludes maintenance receipt repair. |
 | `delivery_discovery_bytes_total` | counter | — | Key/value bytes examined in due/future discovery, including known keys and filtered keys. A scan observation is counted once; not physical device bytes. |
@@ -70,8 +70,8 @@ logs the byte limit and topic; the scheduler backs off before rediscovery. An
 unfit command is not a successful preparation or send, and its payload stays in
 storage.
 
-[Scheduler design and resource bounds](heap-scheduler.md) describes payload
-validity, current-receipt reads, retry recovery and count-based sizing.
+[Scheduler design and resource bounds](heap-scheduler.md) describes immutable payload
+ownership, current-receipt reads, retry recovery and count-based sizing.
 
 ### Interpreting preloading and readiness
 

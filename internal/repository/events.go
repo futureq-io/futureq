@@ -20,9 +20,9 @@ var LastIDKey = []byte("metadata/event-repo/last-id")
 
 // EventRepository builds event keys and stores events.
 //
-// IDs are assigned only by the Raft leader (or the single node in standalone
-// mode) via NextID and travel inside the Raft command — replicas apply them
-// verbatim, so every replica writes identical keys.
+// NextID reserves IDs locally for standalone writes and Raft proposals. Raft
+// ordered apply advances stale proposed IDs past its durable high-water mark,
+// so in-flight reservations from different leaders cannot overwrite each other.
 type EventRepository struct {
 	db         storage.DB
 	logger     *zap.Logger
@@ -53,7 +53,9 @@ func NewEventRepository(db storage.DB, logger *zap.Logger, bucketSize time.Durat
 
 // NextID reserves a new monotonic event ID. Must only be called on the Raft
 // leader (or the single node in standalone mode) while building a batch.
-// IDs are monotonic, not contiguous: failed proposals simply skip IDs.
+// This reservation is local, not replicated. Raft ordered apply may assign a
+// higher ID after a leader handoff or out-of-order proposal. Failed proposals
+// can leave gaps.
 func (er *EventRepository) NextID() uint64 {
 	return er.nextID.Add(1)
 }
@@ -94,9 +96,8 @@ func (er *EventRepository) StoreWithBatch(b storage.Batch, id uint64, msg *stora
 	return key, nil
 }
 
-// StoreRawWithBatch stores the raw msg value bytes under the leader-assigned
-// ID from the Raft command. It never generates IDs itself — replicas apply the
-// command verbatim, so all replicas converge on identical keys.
+// StoreRawWithBatch stores raw message bytes under the final ID selected by
+// ordered Raft apply. It does not allocate or validate IDs itself.
 // It returns the 24-byte Pebble key for the caller to use as a delivery_tag.
 func (er *EventRepository) StoreRawWithBatch(b storage.Batch, id uint64, bucket uint64, topicHash uint64, indexes [][]byte, msg []byte) ([]byte, error) {
 	key := utils.EventKey(bucket, topicHash, id)
@@ -115,8 +116,9 @@ func (er *EventRepository) StoreRawWithBatch(b storage.Batch, id uint64, bucket 
 }
 
 // ObserveID advances the local reservation counter past id. Replicas call this
-// when applying commands (or after snapshot recovery) so that a follower
-// promoted to leader never reuses IDs.
+// when applying commands (or after snapshot recovery) to move future local
+// proposals past applied IDs. Ordered apply remains the uniqueness authority;
+// uncommitted reservations from another leader are not visible here.
 func (er *EventRepository) ObserveID(id uint64) {
 	for {
 		cur := er.nextID.Load()

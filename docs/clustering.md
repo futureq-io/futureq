@@ -22,7 +22,7 @@ and publish-bound delivery in `internal/raft/event/published_delivery.go`:
 
 | Command             | Payload |
 | ------------------- | ------- |
-| `StoreBatchCmd (0)` | Per item: `u64 id` (leader-assigned event ID; replicas apply verbatim so keys converge) · `u64 bucket` · `u64 topicHash` · index entries · `u32 len` + pre-serialized `StoredMessage`. One publish batch = one log entry. |
+| `StoreBatchCmd (0)` | Per item: `u64 id` (proposed event ID; ordered apply advances stale IDs past the applied watermark so keys converge) · `u64 bucket` · `u64 topicHash` · index entries · `u32 len` + pre-serialized `StoredMessage`. One publish batch = one log entry. |
 | `DeleteBatchCmd (1)`| Count + fixed 24-byte message keys — used for ACK-driven deletes and TTL expirations. |
 | `StoreDeliveryBatchCmd (8)` | Leader/no-ACK publish: encoded store batch followed by a length-prefixed frozen receipt per message; payload and destinations commit atomically. |
 | `SubscriptionCmd (9)` | Protobuf subscription create/remove, worker connect/disconnect, batched session renewal, conditional idle expiry, and bounded retired-recipient cleanup. |
@@ -75,7 +75,7 @@ A `metadata.Service` registers as Dragonboat's Raft/system event listener. On le
 
 ## Leader persistence
 
-`internal/raft/leaderpersist` decorates Dragonboat's LogDB ("tan+leaderpersist"). After every successful `SaveRaftState` it hashes each persisted application command, removing Dragonboat's uncompressed encoding header, and notifies the tracker. This is the mechanism behind the **leader ack level**: a publisher is acknowledged once the leader has durably written the entry to its local Raft log — before quorum commit. Successful apply is also accepted if it wins the notification race. Before reporting a proposal failure, cancellation, or timeout, the handler rechecks local persistence so an already-persisted command is not reported as failed just because both signals were ready. FutureQ uses uncompressed log entries; unknown encodings fall back to apply completion. Correlation is by command hash; batch commands embed leader-assigned event IDs.
+`internal/raft/leaderpersist` decorates Dragonboat's LogDB ("tan+leaderpersist"). After every successful `SaveRaftState` it hashes each persisted application command, removing Dragonboat's uncompressed encoding header, and notifies the tracker. This is the mechanism behind the **leader ack level**: a publisher is acknowledged once the leader has durably written the entry to its local Raft log — before quorum commit. Successful apply is also accepted if it wins the notification race. Before reporting a proposal failure, cancellation, or timeout, the handler rechecks local persistence so an already-persisted command is not reported as failed just because both signals were ready. FutureQ uses uncompressed log entries; unknown encodings fall back to apply completion. Correlation is by command hash; batch commands embed proposed event IDs; ordered apply may assign higher final IDs.
 
 ## Publish ack levels
 
