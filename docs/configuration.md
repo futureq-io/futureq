@@ -81,6 +81,7 @@ export FUTUREQ_CLUSTER_RAFT_INITIALMEMBERS='{1: "10.0.0.1:50005"}'
 | Key                                 | Default | Description |
 | ----------------------------------- | ------- | ----------- |
 | `delivery.timeBucket`               | `1ms`   | Granularity of the key scheme's time buckets. `0` = raw-millisecond buckets (maximum precision). Otherwise must be ≥1ms. |
+| `delivery.heapType`                 | `binary` | Candidate heap for due and future messages: `binary` (original Go `container/heap`), `typed-binary`, `4ary`, or `8ary`. Applied at startup; restart to change. All choices order by exact due time, then message key. |
 | `delivery.discoveryWorkers`          | `2`     | Independent storage discovery workers, `1..16`; at most one scan per topic. |
 | `delivery.preloadScanIdleMaxInterval` | `100ms` | Maximum speculative idle scan backoff. `0` disables it; must be nonnegative. The effective limit is at least the poll interval. Payload mutations reset backoff; due repair cadence is unchanged. |
 | `delivery.dispatchPollInterval`     | `5ms`   | Periodic live due-message scan interval, also used when preloading is enabled. |
@@ -89,6 +90,7 @@ export FUTUREQ_CLUSTER_RAFT_INITIALMEMBERS='{1: "10.0.0.1:50005"}'
 | `delivery.inFlightTimeout`          | `5s`    | How long an unacknowledged delivery blocks redelivery; after it expires the message is re-dispatched (at-least-once). |
 | `delivery.deleteBatchInterval`      | `500ms` | How often the deleter flushes its batch of keys to delete (one Raft proposal per batch in clustered mode). |
 | `delivery.deleteWorkers`            | `16` | Maximum concurrent ACK/delete flushes in Raft mode (1..256). Pending and in-progress completions share the existing queue bound. Standalone flushes remain serial. |
+| `delivery.ackQueueCapacity`         | `8192` | Maximum unique pending message/recipient ACKs per broker (1..1048576), including in-progress persistence. Full queues reject new ACKs and close the consumer stream for retry. Explicit/TTL delete queue capacity is unchanged. |
 | `delivery.subscriptions.renewalWorkers` | `4` | Concurrent session renewal batches (1..16), at most 256 sessions per batch. |
 | `delivery.subscriptions.allowAutoAck` | `false` | Allow workers to request `SubscribeInit.auto_ack`; otherwise reject them with `PermissionDenied` before binding. Manual ACK/NACK streams remain available. |
 | `delivery.subscriptions.disconnectWorkers` | `1` | Concurrent session disconnect batches (1..16), at most 256 sessions per batch. |
@@ -98,6 +100,13 @@ export FUTUREQ_CLUSTER_RAFT_INITIALMEMBERS='{1: "10.0.0.1:50005"}'
 | `delivery.ttlsweepInterval`         | `60s`   | How often the TTL janitor sweeps the whole database for expired messages. |
 
 All four intervals and the in-flight timeout must be greater than zero.
+
+To compare delivery heaps, change only `delivery.heapType` between runs, or set
+`FUTUREQ_DELIVERY_HEAPTYPE=8ary`. The heap is local to each broker and does not
+change stored messages or the wire protocol. Both due-only delivery and future
+preloading use the selected heap. See [heap comparisons](heap-scheduler.md#comparing-heaps)
+for a repeatable microbenchmark; broker load tests are still needed to assess
+delivery latency.
 
 Auto-ack can also be enabled with
 `FUTUREQ_DELIVERY_SUBSCRIPTIONS_ALLOWAUTOACK=true`. Apply the same policy on every

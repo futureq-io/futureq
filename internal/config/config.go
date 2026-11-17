@@ -22,6 +22,16 @@ const (
 	NoAck  AckLevel = "noAck"
 )
 
+// HeapType selects the node-local delivery candidate heap at startup.
+type HeapType string
+
+const (
+	HeapBinary      HeapType = "binary"
+	HeapTypedBinary HeapType = "typed-binary"
+	Heap4Ary        HeapType = "4ary"
+	Heap8Ary        HeapType = "8ary"
+)
+
 type Subscriptions struct {
 	// AllowAutoAck permits workers to complete delivery on send instead of manual ACK/NACK.
 	AllowAutoAck bool `mapstructure:"allowAutoAck" yaml:"allowAutoAck"`
@@ -102,6 +112,7 @@ type Publish struct {
 
 type Delivery struct {
 	Subscriptions              Subscriptions `mapstructure:"subscriptions" yaml:"subscriptions"`
+	HeapType                   HeapType      `mapstructure:"heapType" yaml:"heapType"`
 	DiscoveryWorkers           int           `mapstructure:"discoveryWorkers" yaml:"discoveryWorkers"`
 	PreloadScanIdleMaxInterval time.Duration `mapstructure:"preloadScanIdleMaxInterval" yaml:"preloadScanIdleMaxInterval"`
 	ConsumerQueueSize          int           `mapstructure:"consumerQueueSize" yaml:"consumerQueueSize"`
@@ -113,6 +124,7 @@ type Delivery struct {
 	ReadPermit                 time.Duration `mapstructure:"readPermit" yaml:"readPermit"`
 	DeleteBatchInterval        time.Duration `mapstructure:"deleteBatchInterval" yaml:"deleteBatchInterval"`
 	DeleteWorkers              int           `mapstructure:"deleteWorkers" yaml:"deleteWorkers"`
+	AckQueueCapacity           int           `mapstructure:"ackQueueCapacity" yaml:"ackQueueCapacity"`
 	ConsumerRemovalWorkers     int           `mapstructure:"consumerRemovalWorkers" yaml:"consumerRemovalWorkers"`
 	TTLSweepInterval           time.Duration `mapstructure:"ttlSweepInterval" yaml:"ttlSweepInterval"`
 	PrepareBatchSize           int           `mapstructure:"prepareBatchSize" yaml:"prepareBatchSize"`
@@ -371,6 +383,11 @@ func (c *Config) validatePublishAndDelivery() error {
 	}
 
 	d := c.Delivery
+	switch d.HeapType {
+	case HeapBinary, HeapTypedBinary, Heap4Ary, Heap8Ary:
+	default:
+		return fmt.Errorf("delivery.heapType must be binary, typed-binary, 4ary, or 8ary")
+	}
 	if d.ReadPermit < 100*time.Millisecond || d.ReadPermit > 30*time.Second || d.ReadPermit%time.Millisecond != 0 {
 		return fmt.Errorf("delivery.readPermit must be whole milliseconds from 100ms to 30s")
 	}
@@ -397,6 +414,9 @@ func (c *Config) validatePublishAndDelivery() error {
 	}
 	if d.DeleteWorkers < 1 || d.DeleteWorkers > 256 {
 		return fmt.Errorf("delivery.deleteWorkers must be 1..256")
+	}
+	if d.AckQueueCapacity < 1 || d.AckQueueCapacity > 1048576 {
+		return fmt.Errorf("delivery.ackQueueCapacity must be 1..1048576")
 	}
 	if d.PrepareBatchSize < 1 || d.PrepareBatchSize > 256 || d.ScanMaxKeys < d.PrepareBatchSize || d.ScanMaxKeys > 65536 {
 		return fmt.Errorf("delivery.prepareBatchSize must be 1..256 and scanMaxKeys must be between batch size and 65536")

@@ -56,6 +56,7 @@ publish:
   proposalTimeout: 5s
 
 delivery:
+  heapType: binary # binary (container/heap), typed-binary, 4ary, or 8ary; restart to change
   subscriptions:
     allowAutoAck: false # reject auto-ack streams unless explicitly allowed
     # No workers connected for this duration: discard the subscription/backlog.
@@ -74,6 +75,7 @@ delivery:
   readPermit: 1s # Raft delivery authorization from quorum-read start; 100ms..30s, whole milliseconds
   deleteBatchInterval: 500ms
   deleteWorkers: 16 # 1..256 concurrent ACK/delete flushes in Raft mode; standalone stays serial
+  ackQueueCapacity: 8192 # 1..1048576 unique pending recipient ACKs per broker, including proposals in progress
   consumerRemovalWorkers: 1 # 1..16 concurrent Raft consumer membership removals
   ttlSweepInterval: 1m0s
   # Each topic gets one bounded chunk at a time, with cyclic cursor wrap.

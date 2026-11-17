@@ -47,6 +47,7 @@ type Dispatcher struct {
 	ReconcileBatch             func(context.Context, []raft.DeliveryPrepare) (map[string]*raft.DeliveryState, error)
 	MaintenanceRecipients      func(string) (uint64, []string, bool)
 	Limits                     ScanLimits
+	HeapType                   config.HeapType // installed before Run; changing the heap requires a restart
 	TimeBucket                 time.Duration
 	cursors                    map[string]*scanCursor // owned by the scheduler
 	DiscoveryWorkers           int
@@ -75,6 +76,7 @@ func NewDispatcher(
 	}
 	defaults := config.DefaultDelivery()
 	return &Dispatcher{
+		HeapType:                   defaults.HeapType,
 		DiscoveryWorkers:           defaults.DiscoveryWorkers,
 		PreloadScanIdleMaxInterval: defaults.PreloadScanIdleMaxInterval,
 		db:                         db,

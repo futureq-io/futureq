@@ -26,6 +26,7 @@ var defaultConfig = Config{
 	},
 	Publish: Publish{MinAckLevel: Quorum, ProposalTimeout: 5 * time.Second},
 	Delivery: Delivery{
+		HeapType:                   HeapBinary,
 		Subscriptions:              Subscriptions{RenewalWorkers: 4, DisconnectWorkers: 1},
 		ConsumerRemovalWorkers:     1,
 		DiscoveryWorkers:           2,
@@ -39,6 +40,7 @@ var defaultConfig = Config{
 		ReadPermit:                 time.Second,
 		DeleteBatchInterval:        500 * time.Millisecond,
 		DeleteWorkers:              16,
+		AckQueueCapacity:           8192,
 		TTLSweepInterval:           time.Minute,
 		PrepareBatchSize:           64,
 		PrepareBatchBytes:          "256KiB",
