@@ -20,7 +20,7 @@ var defaultConfig = Config{
 			LogDB: LogDB{
 				Workers: 16, Shards: 16, KVKeepLogFileNum: 16,
 				KVMaxBackgroundCompactions: 2, KVMaxBackgroundFlushes: 2,
-				KVLRUCacheSize: "0B", KVWriteBufferSize: "32MiB", KVMaxWriteBufferNumber: 4,
+				KVLRUCacheSize: "0B", KVWriteBufferSize: "16MiB", KVMaxWriteBufferNumber: 4,
 				KVLevel0FileNumCompactionTrigger: 8, KVLevel0SlowdownWritesTrigger: 17, KVLevel0StopWritesTrigger: 24,
 				KVMaxBytesForLevelBase: "4GiB", KVMaxBytesForLevelMultiplier: 2,
 				KVTargetFileSizeBase: "16MiB", KVTargetFileSizeMultiplier: 2,

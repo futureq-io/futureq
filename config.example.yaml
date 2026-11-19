@@ -45,7 +45,7 @@ cluster:
       kvLRUCacheSize: 0B
       # Tan retains 16 buffers regardless of workers: 512MiB at this default.
       # Oversized updates allocate a larger temporary buffer as needed.
-      kvWriteBufferSize: 32MiB
+      kvWriteBufferSize: 16MiB
       kvMaxWriteBufferNumber: 4
       kvLevel0FileNumCompactionTrigger: 8
       kvLevel0SlowdownWritesTrigger: 17
