@@ -194,6 +194,7 @@ type Hub struct {
 	deliveryMu      sync.RWMutex
 	groupMembers    func(topic, group string) []metadata.ConsumerMember
 	localReplica    uint64
+	distribution    func() metadata.ShardDistribution
 	deliveryView    func(string) metadata.TopicDeliveryView
 	version         func() (uint64, bool)
 	permitEpoch     uint64
@@ -243,6 +244,21 @@ func (h *Hub) SetLocalReplica(nodeID uint64) {
 	h.deliveryMu.Lock()
 	defer h.deliveryMu.Unlock()
 	h.localReplica = nodeID
+}
+
+// SetShardDistribution installs the committed policy source alongside the
+// membership source. The metadata barrier excludes updates during delivery.
+func (h *Hub) SetShardDistribution(source func() metadata.ShardDistribution) {
+	h.deliveryMu.Lock()
+	defer h.deliveryMu.Unlock()
+	h.distribution = source
+}
+
+func (h *Hub) shardDistribution() metadata.ShardDistribution {
+	if h.localReplica == 0 || h.distribution == nil {
+		return metadata.ShardDistributionConsumerCount
+	}
+	return h.distribution()
 }
 
 // WithRebalanceBarrier waits for active local sends, then applies a Raft
@@ -406,6 +422,7 @@ func (h *Hub) DispatchPrepared(topic string, msg *pb.QueueMessage, deliveryTag [
 	if slot != 0 && h.localReplica != 0 {
 		shardCount = utils.SlotShardCount(slot)
 	}
+	distribution := h.shardDistribution()
 
 	// Dispatch to each group — strategy picks one consumer per group.
 	for gid, consumers := range groups {
@@ -418,7 +435,7 @@ func (h *Hub) DispatchPrepared(topic string, msg *pb.QueueMessage, deliveryTag [
 			if len(members) == 0 {
 				continue // no committed assignment, or rebalance is pending
 			}
-			selected = h.groupWorker(members, consumers, msg, deliveryTag, slot, shardCount)
+			selected = h.groupWorker(members, consumers, msg, deliveryTag, slot, shardCount, distribution)
 		} else {
 			selected = h.strategy.Select(consumers, msg)
 		}
@@ -443,11 +460,11 @@ func (h *Hub) DispatchPrepared(topic string, msg *pb.QueueMessage, deliveryTag [
 	return sentTo
 }
 
-func (h *Hub) groupWorker(members []metadata.ConsumerMember, consumers []*ConsumerEntry, msg *pb.QueueMessage, key []byte, slot, count int) *ConsumerEntry {
-	if count > 0 {
-		replica := describeReplica(members, h.localReplica)
-		if replica.replicas <= count {
-			if !replica.owns(slot, count) {
+func (h *Hub) groupWorker(members []metadata.ConsumerMember, consumers []*ConsumerEntry, msg *pb.QueueMessage, key []byte, slot, count int, distribution metadata.ShardDistribution) *ConsumerEntry {
+	if count > 0 || distribution == metadata.ShardDistributionReplicaCount {
+		replica := describeReplica(members, h.localReplica, distribution)
+		if replica.usesReplicaWorkers(count) {
+			if !replica.owns(slot, count, key) {
 				return nil
 			}
 			return h.strategy.Select(replica.localWorkers(members, consumers), msg)
@@ -735,6 +752,7 @@ func (h *Hub) InterestView(topic string) InterestView {
 	if sub == nil {
 		return view
 	}
+	distribution := h.shardDistribution()
 	for group, consumers := range sub.groupSnapshot() {
 		entry := localGroup{consumers: consumers}
 		if h.deliveryView != nil {
@@ -747,7 +765,7 @@ func (h *Hub) InterestView(topic string) InterestView {
 			continue
 		}
 		if view.sharded {
-			entry.replica = describeReplica(entry.members, h.localReplica)
+			entry.replica = describeReplica(entry.members, h.localReplica, distribution)
 			entry.local = entry.replica.localWorkers(entry.members, consumers)
 		}
 		view.groups = append(view.groups, entry)
@@ -786,8 +804,8 @@ func (v InterestView) localOwners(key []byte) []*ConsumerEntry {
 			owners = append(owners, group.consumers...)
 			continue
 		}
-		if shardCount > 0 && group.replica.replicas <= shardCount {
-			if group.replica.owns(slot, shardCount) {
+		if group.replica.usesReplicaWorkers(shardCount) {
+			if group.replica.owns(slot, shardCount, key) {
 				owners = append(owners, group.local...)
 			}
 			continue

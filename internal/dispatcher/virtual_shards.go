@@ -11,10 +11,11 @@ type replicaMembership struct {
 	replicas, ordinal int
 	workers, before   int
 	totalWorkers      int
+	distribution      metadata.ShardDistribution
 }
 
-func describeReplica(members []metadata.ConsumerMember, nodeID uint64) replicaMembership {
-	r := replicaMembership{totalWorkers: len(members)}
+func describeReplica(members []metadata.ConsumerMember, nodeID uint64, distribution metadata.ShardDistribution) replicaMembership {
+	r := replicaMembership{totalWorkers: len(members), distribution: distribution}
 	for i, member := range members {
 		if i == 0 || member.NodeID != members[i-1].NodeID {
 			if member.NodeID == nodeID {
@@ -34,9 +35,11 @@ func (r replicaMembership) shardRange(count int) (first, end int) {
 		return 0, 0
 	}
 	if r.replicas > count {
-		// Scan every shard and use per-worker ownership when the layout cannot
-		// give every serving replica a shard of its own.
+		// Use per-event ownership when some replicas would have no shard.
 		return 0, count
+	}
+	if r.distribution == metadata.ShardDistributionReplicaCount {
+		return r.ordinal * count / r.replicas, (r.ordinal + 1) * count / r.replicas
 	}
 	// Give every replica one shard and split the rest by worker count. Rounded
 	// cumulative boundaries meet exactly, with no overlaps or uncovered shards.
@@ -45,7 +48,17 @@ func (r replicaMembership) shardRange(count int) (first, end int) {
 	return r.ordinal + boundary(r.before), r.ordinal + 1 + boundary(r.before+r.workers)
 }
 
-func (r replicaMembership) owns(slot, count int) bool {
+func (r replicaMembership) usesReplicaWorkers(count int) bool {
+	return r.distribution == metadata.ShardDistributionReplicaCount || (count > 0 && r.replicas <= count)
+}
+
+func (r replicaMembership) owns(slot, count int, key []byte) bool {
+	if r.workers == 0 {
+		return false
+	}
+	if count < r.replicas {
+		return deliveryOrdinal(key)%uint64(r.replicas) == uint64(r.ordinal)
+	}
 	first, end := r.shardRange(count)
 	return count+first <= slot && slot < count+end
 }

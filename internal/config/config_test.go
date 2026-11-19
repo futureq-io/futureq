@@ -103,6 +103,18 @@ func (s *ConfigSuite) TestAutoAckPolicyOverrides() {
 	s.False(cfg.Delivery.Subscriptions.AllowAutoAck)
 }
 
+func (s *ConfigSuite) TestShardDistributionConfiguration() {
+	cfg, err := Load("")
+	s.Require().NoError(err)
+	s.Equal("consumerCount", string(cfg.Delivery.ShardDistribution))
+	cfg, err = Load(s.writeConfig("delivery:\n  shardDistribution: replicaCount\n"))
+	s.Require().NoError(err)
+	s.Equal("replicaCount", string(cfg.Delivery.ShardDistribution))
+	s.T().Setenv("FUTUREQ_DELIVERY_SHARDDISTRIBUTION", "invalid")
+	_, err = Load("")
+	s.Require().ErrorContains(err, "delivery.shardDistribution")
+}
+
 func (s *ConfigSuite) TestInvalidEnvironmentValueFails() {
 	s.T().Setenv("FUTUREQ_CLUSTER_NODEID", "not-a-number")
 	_, err := Load("")

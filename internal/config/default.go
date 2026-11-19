@@ -1,6 +1,10 @@
 package config
 
-import "time"
+import (
+	"time"
+
+	"github.com/futureq-io/futureq/pkg/raft/metadata"
+)
 
 var defaultConfig = Config{
 	ConfigVersion: 1,
@@ -36,6 +40,7 @@ var defaultConfig = Config{
 	},
 	Publish: Publish{MinAckLevel: Quorum, ProposalTimeout: 5 * time.Second},
 	Delivery: Delivery{
+		ShardDistribution:          metadata.ShardDistributionConsumerCount,
 		HeapType:                   HeapBinary,
 		Subscriptions:              Subscriptions{RenewalWorkers: 4, DisconnectWorkers: 1},
 		ConsumerRemovalWorkers:     1,

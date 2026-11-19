@@ -24,6 +24,8 @@ type ConsumerState struct {
 	Heartbeats map[uint64]uint64                      `json:"heartbeats,omitempty"`
 	// Never decrease: an isolated replica may still hold an earlier permit.
 	MaxReadPermitMs int64 `json:"max_read_permit_ms,omitempty"`
+
+	ShardDistribution ShardDistribution `json:"shard_distribution,omitempty"`
 }
 
 type consumerChange struct {
@@ -35,6 +37,9 @@ type consumerChange struct {
 	LocalIDs     []string       `json:"local_ids,omitempty"`
 	Required     []uint64       `json:"required"`
 	ReadPermitMs int64          `json:"read_permit_ms,omitempty"`
+
+	ShardDistribution ShardDistribution `json:"shard_distribution,omitempty"`
+	ExpectedEpoch     uint64            `json:"expected_epoch,omitempty"`
 }
 
 type consumerAck struct {
@@ -43,7 +48,13 @@ type consumerAck struct {
 }
 
 func marshalConsumerChange(change consumerChange) ([]byte, error) {
-	if change.Operation != "add" && change.Operation != "remove" && change.Operation != "reconcile" {
+	switch change.Operation {
+	case "add", "remove", "reconcile":
+	case setShardDistribution:
+		if !change.ShardDistribution.Valid() || len(change.Required) == 0 {
+			return nil, fmt.Errorf("metadata: invalid shard distribution change")
+		}
+	default:
 		return nil, fmt.Errorf("metadata: invalid consumer operation %q", change.Operation)
 	}
 	if change.ReadPermitMs < 0 || change.ReadPermitMs > 30000 {
@@ -107,6 +118,12 @@ func (c *ConsumerState) applyChange(change consumerChange) bool {
 	c.normalize()
 	changed := false
 	switch change.Operation {
+	case setShardDistribution:
+		if !change.ShardDistribution.Valid() || len(change.Required) == 0 || c.Pending || c.Epoch != change.ExpectedEpoch || c.shardDistribution() == change.ShardDistribution {
+			return false
+		}
+		c.ShardDistribution = change.ShardDistribution
+		changed = true
 	case "add":
 		if change.Topic == "" || change.Member.ID == "" || change.ReadPermitMs < 0 || change.ReadPermitMs > 30000 {
 			return false

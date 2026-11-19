@@ -36,12 +36,21 @@ Delivery preparation and ACK commands, preparation results, and persisted delive
 The event leader chooses a uniform random shard for each published message and
 includes the packed bucket in its Raft command. Every replica stores the same
 key and payload. Each named group divides each layout into contiguous runs of
-shards, ordered by serving replica ID and weighted by the group's worker counts.
+shards, ordered by replica ID. `delivery.shardDistribution` defaults to
+`consumerCount`, which weights replicas by the group's worker counts.
+`replicaCount` gives equal weight to each replica with consumers in the group.
 The owning replica selects one of its committed local workers using the Hub's
 dispatch strategy. Discovery and preload seek past shards outside the union of
-the local groups' ranges. Local universal subscribers need every shard. If a
-group has more serving replicas than a layout has shards, it uses per-worker
-modulo ownership for that layout so each worker can still receive messages.
+the local groups' ranges. Local universal subscribers need every shard. For
+unsharded keys and layouts with fewer shards than serving replicas, the group
+uses event ID modulo the worker count or the serving replica count, according
+to the selected policy.
+
+To change the policy, update the config on all cluster nodes and restart them.
+The metadata leader commits its configured policy, then the existing rebalance
+fences in-flight delivery before activating the new ownership for queued and
+new messages. During a rollout, the elected metadata leader's config determines
+the desired policy.
 
 Change `storage.virtualShards` on the nodes and restart them to change the
 layout used by the event leader for new publishes. During a rollout, each

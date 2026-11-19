@@ -84,6 +84,8 @@ publish:
   proposalTimeout: 5s
 
 delivery:
+  # consumerCount weights by workers. replicaCount gives each serving replica equal weight.
+  shardDistribution: consumerCount
   heapType: binary # binary, 4ary, or 8ary; restart to change
   subscriptions:
     allowAutoAck: false # reject auto-ack streams unless explicitly allowed

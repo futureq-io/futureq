@@ -198,6 +198,7 @@ func startRun(cmd *cobra.Command, _ []string) {
 		hub.SetGroupMembership(a.MetadataSM.ConsumerGroup)
 		hub.SetDeliveryView(a.MetadataSM.TopicDeliverySnapshot)
 		hub.SetLocalReplica(cfg.Cluster.NodeID)
+		hub.SetShardDistribution(a.MetadataSM.ShardDistribution)
 		hub.SetDeliveryFence(a.MetadataSM.ConsumerVersion, inFlightTimeout)
 		hub.SetReadPermit(cfg.Delivery.ReadPermit)
 		a.MetadataSM.SetConsumerBarrier(hub.WithConsumerBarrier)
@@ -257,6 +258,7 @@ func startRun(cmd *cobra.Command, _ []string) {
 func consumerMetadataLoop(ctx context.Context, a *app.App, hub *dispatcher.Hub, logger *zap.Logger) {
 	coordinator := dispatcher.NewConsumerCoordinator(hub, a.MetadataSM, a.MetadataSvc,
 		a.Config().Cluster.ShardID, a.Config().Cluster.NodeID, a.Config().Delivery.InFlightTimeout, logger)
+	coordinator.ShardDistribution = a.Config().Delivery.ShardDistribution
 	coordinator.Run(ctx)
 }
 

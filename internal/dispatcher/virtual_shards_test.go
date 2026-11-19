@@ -210,3 +210,76 @@ func TestVirtualShardDispatchUsesLocalRoundRobin(t *testing.T) {
 	require.Empty(t, hub.DispatchToTopic("orders", &pb.QueueMessage{Topic: "orders"}, remote))
 	require.Empty(t, uncommitted)
 }
+
+func TestReplicaCountDistributionSkipsEmptyReplicas(t *testing.T) {
+	members := []metadata.ConsumerMember{{ID: "a", NodeID: 1}, {ID: "b", NodeID: 1}, {ID: "c", NodeID: 3}}
+	policy := metadata.ShardDistributionReplicaCount
+	first, end := describeReplica(members, 1, policy).shardRange(64)
+	require.Equal(t, [2]int{0, 32}, [2]int{first, end})
+	first, end = describeReplica(members, 2, policy).shardRange(64)
+	require.Equal(t, [2]int{0, 0}, [2]int{first, end})
+	first, end = describeReplica(members, 3, policy).shardRange(64)
+	require.Equal(t, [2]int{32, 64}, [2]int{first, end})
+	// An unsharded key uses the same weights, with the ID selecting a replica.
+	for id := uint64(0); id < 4; id++ {
+		key := utils.EventKey(1, 1, id)
+		require.Equal(t, id%2 == 0, describeReplica(members, 1, policy).owns(0, 0, key))
+		require.False(t, describeReplica(members, 2, policy).owns(0, 0, key))
+		require.Equal(t, id%2 == 1, describeReplica(members, 3, policy).owns(0, 0, key))
+	}
+}
+
+func TestShardDistributionRebalancesQueuedDelivery(t *testing.T) {
+	c := newReplicaTestCluster(t)
+	c.nodes[1].hub.SetDeliveryTimeout(10 * time.Second)
+	for id, node := range c.nodes {
+		node.hub.SetLocalReplica(id)
+		node.hub.SetShardDistribution(node.sm.ShardDistribution)
+	}
+	first := c.subscribe(1, "first", "workers")
+	c.subscribe(1, "second", "workers")
+	other := c.subscribe(2, "other", "workers")
+	c.activate()
+	at := time.Now().Add(-time.Minute).UnixMilli()
+	data, err := proto.Marshal(&storagepb.StoredMessage{Topic: "orders", EnqueuedAtUnixMs: at})
+	require.NoError(t, err)
+	// Shard 36 belongs to replica 1 at 42/22 and replica 2 at 32/32.
+	bucket := utils.ShardStorageBucket(64+36, utils.CalculateBucket(at, time.Second))
+	cmd, err := raft.MarshalStoreBatchCmd([]raft.StoreBatchItem{{ID: 1, Bucket: bucket, TopicHash: utils.TopicHash("orders"), Msg: data}})
+	require.NoError(t, err)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	_, err = c.nodes[1].nh.SyncPropose(ctx, c.nodes[1].nh.GetNoOPSession(replicaTestShard), cmd)
+	require.NoError(t, err)
+	c.sync()
+	require.Eventually(t, func() bool { return c.nodes[1].dispatcher.dispatchAll() == 1 }, 5*time.Second, 20*time.Millisecond)
+	previous := receiveReplicaMessage(t, first)
+	require.Zero(t, c.nodes[2].dispatcher.dispatchAll())
+
+	for _, node := range c.nodes {
+		node.coordinator.ShardDistribution = metadata.ShardDistributionReplicaCount
+	}
+	require.Eventually(t, func() bool {
+		for _, node := range c.nodes {
+			if err := node.coordinator.Tick(ctx, time.Now()); err != nil {
+				return false
+			}
+		}
+		_, pending, _ := c.nodes[2].sm.ConsumerStatus(2)
+		return pending && c.nodes[2].sm.ShardDistribution() == metadata.ShardDistributionReplicaCount
+	}, 5*time.Second, 20*time.Millisecond)
+	require.Zero(t, c.nodes[2].dispatcher.dispatchAll(), "new owner must wait for the old assignment to drain")
+	c.sync()
+	require.False(t, c.nodes[1].hub.CanSend("first", previous))
+	require.True(t, c.nodes[1].hub.RemoveInFlightForConsumer("first", previous.DeliveryTag))
+	c.activate()
+	require.Eventually(t, func() bool { return c.nodes[2].dispatcher.dispatchAll() == 1 }, 5*time.Second, 20*time.Millisecond)
+	reassigned := receiveReplicaMessage(t, other)
+	require.Equal(t, previous.DeliveryTag, reassigned.DeliveryTag)
+	c.ack(2, "other", "workers", reassigned)
+	c.sync()
+	for _, node := range c.nodes {
+		_, _, err := node.db.Get(previous.DeliveryTag)
+		require.ErrorIs(t, err, storage.ErrNotFound)
+	}
+}

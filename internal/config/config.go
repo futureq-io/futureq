@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/futureq-io/futureq/pkg/raft/metadata"
 	"github.com/futureq-io/futureq/pkg/utils"
 	raftconfig "github.com/lni/dragonboat/v4/config"
 	"github.com/spf13/viper"
@@ -188,6 +189,8 @@ type Publish struct {
 }
 
 type Delivery struct {
+	ShardDistribution metadata.ShardDistribution `mapstructure:"shardDistribution" yaml:"shardDistribution"`
+
 	Subscriptions              Subscriptions `mapstructure:"subscriptions" yaml:"subscriptions"`
 	HeapType                   HeapType      `mapstructure:"heapType" yaml:"heapType"`
 	DiscoveryWorkers           int           `mapstructure:"discoveryWorkers" yaml:"discoveryWorkers"`
@@ -441,6 +444,9 @@ func (c *Config) validateStorage() error {
 }
 
 func (c *Config) validatePublishAndDelivery() error {
+	if !c.Delivery.ShardDistribution.Valid() {
+		return fmt.Errorf("delivery.shardDistribution must be consumerCount or replicaCount")
+	}
 	if c.Delivery.Subscriptions.DisconnectTimeout < 0 || c.Delivery.Subscriptions.DisconnectTimeout%time.Millisecond != 0 {
 		return fmt.Errorf("delivery.subscriptions.disconnectTimeout must be zero (forever) or a positive whole number of milliseconds")
 	}

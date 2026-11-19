@@ -11,6 +11,9 @@ import (
 // ConsumerCoordinator drains local deliveries and activates assignments even
 // when an event replica is unavailable, after its delivery permit expires.
 type ConsumerCoordinator struct {
+	// Installed before Run. Ownership uses committed metadata on every replica.
+	ShardDistribution metadata.ShardDistribution
+
 	hub           *Hub
 	sm            *metadata.MetadataStateMachine
 	svc           *metadata.Service
@@ -101,6 +104,9 @@ func (c *ConsumerCoordinator) Tick(ctx context.Context, now time.Time) error {
 	}
 	if expired {
 		return c.svc.FenceConsumers(ctx, epoch)
+	}
+	if !pending && c.ShardDistribution.Valid() && c.sm.ShardDistribution() != c.ShardDistribution {
+		return c.svc.ReconcileShardDistribution(ctx, c.shardID, c.nodeID, epoch, c.ShardDistribution)
 	}
 	return nil
 }
