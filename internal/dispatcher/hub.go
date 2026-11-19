@@ -14,6 +14,7 @@ import (
 	raft "github.com/futureq-io/futureq/internal/raft/event"
 	"github.com/futureq-io/futureq/internal/storage"
 	"github.com/futureq-io/futureq/pkg/raft/metadata"
+	"github.com/futureq-io/futureq/pkg/utils"
 	pb "github.com/futureq-io/protocol/proto/go"
 	"go.uber.org/zap"
 )
@@ -192,6 +193,7 @@ type Hub struct {
 	// deliveryMu fences every delivery against a metadata Raft rebalance.
 	deliveryMu      sync.RWMutex
 	groupMembers    func(topic, group string) []metadata.ConsumerMember
+	localReplica    uint64
 	deliveryView    func(string) metadata.TopicDeliveryView
 	version         func() (uint64, bool)
 	permitEpoch     uint64
@@ -233,6 +235,14 @@ func (h *Hub) SetGroupMembership(source func(topic, group string) []metadata.Con
 	h.deliveryMu.Lock()
 	h.groupMembers = source
 	h.deliveryMu.Unlock()
+}
+
+// SetLocalReplica enables virtual-shard discovery on a clustered hub, even
+// when the producer's current configuration writes another layout.
+func (h *Hub) SetLocalReplica(nodeID uint64) {
+	h.deliveryMu.Lock()
+	defer h.deliveryMu.Unlock()
+	h.localReplica = nodeID
 }
 
 // WithRebalanceBarrier waits for active local sends, then applies a Raft
@@ -391,6 +401,11 @@ func (h *Hub) DispatchPrepared(topic string, msg *pb.QueueMessage, deliveryTag [
 	h.mu.RUnlock()
 
 	sentTo := make([]string, 0, len(groups)+len(universal))
+	slot := utils.EventShardSlot(deliveryTag)
+	var shardCount int
+	if slot != 0 && h.localReplica != 0 {
+		shardCount = utils.SlotShardCount(slot)
+	}
 
 	// Dispatch to each group — strategy picks one consumer per group.
 	for gid, consumers := range groups {
@@ -403,13 +418,7 @@ func (h *Hub) DispatchPrepared(topic string, msg *pb.QueueMessage, deliveryTag [
 			if len(members) == 0 {
 				continue // no committed assignment, or rebalance is pending
 			}
-			owner := members[deliveryOrdinal(deliveryTag)%uint64(len(members))].ID
-			for _, consumer := range consumers {
-				if consumer.ID == owner {
-					selected = consumer
-					break
-				}
-			}
+			selected = h.groupWorker(members, consumers, msg, deliveryTag, slot, shardCount)
 		} else {
 			selected = h.strategy.Select(consumers, msg)
 		}
@@ -432,6 +441,29 @@ func (h *Hub) DispatchPrepared(topic string, msg *pb.QueueMessage, deliveryTag [
 	}
 
 	return sentTo
+}
+
+func (h *Hub) groupWorker(members []metadata.ConsumerMember, consumers []*ConsumerEntry, msg *pb.QueueMessage, key []byte, slot, count int) *ConsumerEntry {
+	if count > 0 {
+		replica := describeReplica(members, h.localReplica)
+		if replica.replicas <= count {
+			if !replica.owns(slot, count) {
+				return nil
+			}
+			return h.strategy.Select(replica.localWorkers(members, consumers), msg)
+		}
+	}
+	return moduloWorker(members, consumers, key)
+}
+
+func moduloWorker(members []metadata.ConsumerMember, consumers []*ConsumerEntry, key []byte) *ConsumerEntry {
+	id := members[deliveryOrdinal(key)%uint64(len(members))].ID
+	for _, consumer := range consumers {
+		if consumer.ID == id {
+			return consumer
+		}
+	}
+	return nil
 }
 
 // deliveryOrdinal is the event ID in the topic-first storage key. Using the
@@ -658,6 +690,8 @@ func (h *Hub) RestoreStandaloneEpoch(db storage.DB) (err error) {
 type localGroup struct {
 	members   []metadata.ConsumerMember
 	consumers []*ConsumerEntry
+	local     []*ConsumerEntry
+	replica   replicaMembership
 }
 
 // InterestView freezes both the local subscriptions and the global assignment
@@ -669,6 +703,7 @@ type InterestView struct {
 	Recipients []string
 	groups     []localGroup
 	universal  []*ConsumerEntry
+	sharded    bool
 }
 
 func (h *Hub) SetDeliveryView(source func(string) metadata.TopicDeliveryView) {
@@ -685,7 +720,7 @@ func (h *Hub) InterestView(topic string) InterestView {
 	}
 	h.mu.RLock()
 	defer h.mu.RUnlock()
-	view := InterestView{Active: true, Epoch: h.registryEpoch}
+	view := InterestView{Active: true, Epoch: h.registryEpoch, sharded: h.localReplica != 0}
 	var global metadata.TopicDeliveryView
 	if h.deliveryView != nil {
 		global = h.deliveryView(topic)
@@ -711,6 +746,10 @@ func (h *Hub) InterestView(topic string) InterestView {
 		if (h.deliveryView != nil || h.groupMembers != nil) && len(entry.members) == 0 {
 			continue
 		}
+		if view.sharded {
+			entry.replica = describeReplica(entry.members, h.localReplica)
+			entry.local = entry.replica.localWorkers(entry.members, consumers)
+		}
 		view.groups = append(view.groups, entry)
 		if h.deliveryView == nil {
 			view.Recipients = append(view.Recipients, metadata.DeliveryRecipient(group, ""))
@@ -734,22 +773,27 @@ func (h *Hub) InterestView(topic string) InterestView {
 	return view
 }
 
-// localOwners uses the committed member order and deliveryOrdinal for every
-// represented group independently. In standalone mode any group member can
-// serve; selection remains with the configured dispatch strategy.
+// localOwners returns eligible workers separately for each group's assignment.
 func (v InterestView) localOwners(key []byte) []*ConsumerEntry {
 	owners := append([]*ConsumerEntry(nil), v.universal...)
+	slot := utils.EventShardSlot(key)
+	var shardCount int
+	if slot != 0 && v.sharded {
+		shardCount = utils.SlotShardCount(slot)
+	}
 	for _, group := range v.groups {
 		if len(group.members) == 0 {
 			owners = append(owners, group.consumers...)
 			continue
 		}
-		id := group.members[deliveryOrdinal(key)%uint64(len(group.members))].ID
-		for _, consumer := range group.consumers {
-			if consumer.ID == id {
-				owners = append(owners, consumer)
-				break
+		if shardCount > 0 && group.replica.replicas <= shardCount {
+			if group.replica.owns(slot, shardCount) {
+				owners = append(owners, group.local...)
 			}
+			continue
+		}
+		if owner := moduloWorker(group.members, group.consumers, key); owner != nil {
+			owners = append(owners, owner)
 		}
 	}
 	return owners

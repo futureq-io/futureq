@@ -217,7 +217,10 @@ func (pi *pebbleIterator) First() bool {
 	}
 	return valid
 }
-func (pi *pebbleIterator) Last() bool    { return pi.iter.Last() }
+func (pi *pebbleIterator) Last() bool { return pi.iter.Last() }
+func (pi *pebbleIterator) SeekGE(key []byte) bool {
+	return pi.iter.SeekGE(key)
+}
 func (pi *pebbleIterator) Next() bool    { return pi.iter.Next() }
 func (pi *pebbleIterator) Valid() bool   { return pi.iter.Valid() }
 func (pi *pebbleIterator) Key() []byte   { return pi.iter.Key() }

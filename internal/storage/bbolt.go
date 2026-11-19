@@ -297,6 +297,14 @@ func (bi *boltIterator) Next() bool {
 	return bi.set(k, v)
 }
 
+func (bi *boltIterator) SeekGE(key []byte) bool {
+	if bytes.Compare(key, bi.lower) < 0 {
+		key = bi.lower
+	}
+	bi.done = false
+	return bi.set(bi.cursor.Seek(key))
+}
+
 func (bi *boltIterator) set(k, v []byte) bool {
 	if k == nil || (bi.upper != nil && bytes.Compare(k, bi.upper) >= 0) {
 		bi.done = true

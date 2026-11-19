@@ -197,6 +197,7 @@ func startRun(cmd *cobra.Command, _ []string) {
 		}
 		hub.SetGroupMembership(a.MetadataSM.ConsumerGroup)
 		hub.SetDeliveryView(a.MetadataSM.TopicDeliverySnapshot)
+		hub.SetLocalReplica(cfg.Cluster.NodeID)
 		hub.SetDeliveryFence(a.MetadataSM.ConsumerVersion, inFlightTimeout)
 		hub.SetReadPermit(cfg.Delivery.ReadPermit)
 		a.MetadataSM.SetConsumerBarrier(hub.WithConsumerBarrier)

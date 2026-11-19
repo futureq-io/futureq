@@ -15,6 +15,7 @@ import (
 	raft "github.com/futureq-io/futureq/internal/raft/event"
 	"github.com/futureq-io/futureq/internal/raft/leaderpersist"
 	"github.com/futureq-io/futureq/internal/storage"
+	"github.com/futureq-io/futureq/pkg/utils"
 	pb "github.com/futureq-io/protocol/proto/go"
 	"github.com/lni/dragonboat/v4"
 	raftconfig "github.com/lni/dragonboat/v4/config"
@@ -119,6 +120,39 @@ func openRaftAdmissionTest(t *testing.T) (*app.App, *ProducerHandler, *observedA
 	a.DB = observed
 	return a, NewProducerHandler(zap.NewNop()), sm, observed
 }
+
+func TestRaftPublishPersistsEachVirtualShardLayout(t *testing.T) {
+	a, producer, _, _ := openRaftAdmissionTest(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	group, err := a.Subscriptions.Create(ctx, "orders", "workers", "")
+	require.NoError(t, err)
+	counts := []int{64, 8, 0}
+	for _, count := range counts {
+		a.Config().Storage.VirtualShards = count
+		ack, err := producer.processBatch(ctx, &pb.PublishBatch{Messages: []*pb.PublishMessage{{Topic: "orders"}}})
+		require.NoError(t, err)
+		require.True(t, ack.Success)
+	}
+	keys := publishedKeys(t, a.DB)
+	require.Len(t, keys, len(counts))
+	for _, key := range keys {
+		_, bucket, id, err := utils.ParseEventKey(key)
+		require.NoError(t, err)
+		require.Positive(t, bucket)
+		wanted := counts[id-1]
+		slot := utils.EventShardSlot(key)
+		if wanted == 0 {
+			require.Zero(t, slot)
+		} else {
+			require.Equal(t, wanted, utils.SlotShardCount(slot))
+		}
+		state, err := raft.ReadDeliveryState(a.DB, key)
+		require.NoError(t, err)
+		require.Equal(t, []string{group.Recipient}, state.Recipients)
+	}
+}
+
 func TestRaftPublishAdmissionReadCountsAndAllAckModes(t *testing.T) {
 	a, producer, sm, db := openRaftAdmissionTest(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

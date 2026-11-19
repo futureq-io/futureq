@@ -35,6 +35,7 @@ type scanCursor struct {
 	after []byte
 	upper []byte // fixed exclusive end of this repair pass
 	epoch uint64
+	last  uint64 // fixed due bucket cutoff for sharded repair passes
 }
 type deliveryChunk struct {
 	unfit       bool // at least one recipient command cannot fit even an empty batch
@@ -93,10 +94,13 @@ func (d *Dispatcher) collectTopic(topic string, nowMs int64) deliveryChunk {
 		lower = cursor.after
 	}
 	upper := cursor.upper
-	if len(upper) == 0 {
-		upper = utils.DueUpperBound(hash, utils.CalculateBucket(nowMs, d.TimeBucket))
+	last := utils.CalculateBucket(nowMs, d.TimeBucket)
+	if len(upper) != 0 && view.sharded {
+		last = cursor.last
+	} else if len(upper) == 0 && !view.sharded {
+		upper = utils.DueUpperBound(hash, last)
 	}
-	iter, err := d.db.NewIter(&storage.IterOptions{LowerBound: lower, UpperBound: upper})
+	iter, err := openDiscoveryIterator(d.db, view, hash, lower, upper, 0, last, started.Add(d.Limits.WorkTime))
 	if err != nil {
 		d.logger.Error("delivery iterator failed", zap.Error(err))
 		return chunk
@@ -108,6 +112,8 @@ func (d *Dispatcher) collectTopic(topic string, nowMs int64) deliveryChunk {
 	// publishing tail (even within the same time bucket) cannot extend this pass.
 	if len(cursor.upper) == 0 && iter.Last() {
 		cursor.upper = append(append([]byte(nil), iter.Key()...), 0)
+		cursor.last = last
+		iter.upper = cursor.upper
 	}
 	valid := iter.First()
 	for valid {
@@ -186,7 +192,9 @@ func (d *Dispatcher) collectTopic(topic string, nowMs int64) deliveryChunk {
 		}
 		valid = iter.Next()
 	}
-	if !valid {
+	if iter.resumeAt != nil {
+		cursor.after = iter.resumeAt
+	} else if !valid {
 		cursor.after, cursor.upper = nil, nil
 	}
 	if err := iter.Error(); err != nil {

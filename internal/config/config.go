@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/futureq-io/futureq/pkg/utils"
 	raftconfig "github.com/lni/dragonboat/v4/config"
 	"github.com/spf13/viper"
 	"gopkg.in/yaml.v2"
@@ -161,9 +162,10 @@ func (c LogDB) DragonboatConfig() (raftconfig.LogDBConfig, error) {
 }
 
 type Storage struct {
-	Engine string `mapstructure:"engine" yaml:"engine"`
-	Pebble Pebble `mapstructure:"pebble" yaml:"pebble"`
-	Bolt   Bolt   `mapstructure:"bolt" yaml:"bolt"`
+	Engine        string `mapstructure:"engine" yaml:"engine"`
+	VirtualShards int    `mapstructure:"virtualShards" yaml:"virtualShards"`
+	Pebble        Pebble `mapstructure:"pebble" yaml:"pebble"`
+	Bolt          Bolt   `mapstructure:"bolt" yaml:"bolt"`
 }
 
 type Pebble struct {
@@ -405,6 +407,9 @@ func (c *Config) validateCluster() error {
 }
 
 func (c *Config) validateStorage() error {
+	if !utils.ValidVirtualShardCount(c.Storage.VirtualShards) {
+		return fmt.Errorf("storage.virtualShards must be zero or a power of two from 2 through %d", utils.MaxVirtualShards)
+	}
 	switch c.Storage.Engine {
 	case "pebble":
 		p := c.Storage.Pebble

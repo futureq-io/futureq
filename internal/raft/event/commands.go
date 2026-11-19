@@ -42,7 +42,7 @@ type StoreBatchItem struct {
 	// retains it only when it is above the applied high-water mark; otherwise
 	// it assigns the next ID. All replicas derive identical keys in log order.
 	ID uint64
-	// Bucket is the pre-computed time bucket (fire_at_ms / timeBucketSize).
+	// Bucket is the precomputed storage bucket, including any virtual shard slot.
 	Bucket uint64
 	// TopicHash is xxhash64(topic).
 	TopicHash uint64

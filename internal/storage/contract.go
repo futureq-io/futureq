@@ -55,6 +55,9 @@ type Iterator interface {
 	// Last positions at the last key respecting both bounds. First may restart it.
 	Last() bool
 
+	// SeekGE positions at the least key greater than or equal to key within bounds.
+	SeekGE(key []byte) bool
+
 	// Next advances the iterator to the next key.
 	// Returns true if a key is found.
 	Next() bool

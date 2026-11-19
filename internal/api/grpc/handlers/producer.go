@@ -223,11 +223,12 @@ func (ph *ProducerHandler) processRaftBatch(
 	ackLevel pb.AckLevel,
 	receipts map[string][]byte,
 ) error {
-	shardID := app.A.Config().Cluster.ShardID
+	cfg := app.A.Config()
+	shardID := cfg.Cluster.ShardID
 
 	// Only the leader may propose.
 	leaderID, _, valid, errL := app.A.NodeHost.GetLeaderID(shardID)
-	if errL != nil || !valid || leaderID != app.A.Config().Cluster.NodeID {
+	if errL != nil || !valid || leaderID != cfg.Cluster.NodeID {
 		return errors.New("node is not the cluster leader")
 	}
 
@@ -238,9 +239,10 @@ func (ph *ProducerHandler) processRaftBatch(
 			return fmt.Errorf("failed to marshal message: %w", err)
 		}
 
+		bucket := utils.CalculateBucket(data.EnqueuedAtUnixMs+data.DelayMs, cfg.Delivery.TimeBucket)
 		raftItem := raft.StoreBatchItem{
 			ID:        app.A.Repositories.Events.NextID(),
-			Bucket:    utils.CalculateBucket(data.EnqueuedAtUnixMs+data.DelayMs, app.A.Config().Delivery.TimeBucket),
+			Bucket:    utils.ChooseStorageBucket(bucket, cfg.Storage.VirtualShards),
 			TopicHash: utils.TopicHash(data.Topic),
 			Msg:       dataBytes,
 			Receipt:   receipts[data.Topic],

@@ -30,7 +30,7 @@ var defaultConfig = Config{
 		},
 	},
 	Storage: Storage{
-		Engine: "pebble",
+		Engine: "pebble", VirtualShards: 64,
 		Pebble: Pebble{Mode: "disk", DataDir: "./data", WALEnabled: true, CacheSize: "16MiB", MemtableSize: "64MiB", CompactionConcurrency: 1},
 		Bolt:   Bolt{File: "./data/futureq.db", Bucket: "futureq"},
 	},

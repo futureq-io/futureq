@@ -8,7 +8,6 @@ import (
 
 	"github.com/futureq-io/futureq/internal/metrics"
 	raft "github.com/futureq-io/futureq/internal/raft/event"
-	"github.com/futureq-io/futureq/internal/storage"
 	"github.com/futureq-io/futureq/pkg/utils"
 	deliverypb "github.com/futureq-io/protocol/proto/go/delivery"
 	"go.uber.org/zap"
@@ -211,11 +210,17 @@ func (d *Dispatcher) preloadTopic(topic string, p *topicPreload, view InterestVi
 		horizon = int64(^uint64(0) >> 1)
 	}
 	hash := utils.TopicHash(topic)
-	lower := utils.EventKey(utils.CalculateBucket(nowMs, d.TimeBucket), hash, 0)
+	earliest := utils.CalculateBucket(nowMs, d.TimeBucket)
+	last := utils.CalculateBucket(horizon, d.TimeBucket)
+	lower := utils.EventKey(earliest, hash, 0)
 	if bytes.Compare(p.after, lower) > 0 {
 		lower = p.after
 	}
-	iter, err := d.db.NewIter(&storage.IterOptions{LowerBound: lower, UpperBound: utils.DueUpperBound(hash, utils.CalculateBucket(horizon, d.TimeBucket))})
+	var upper []byte
+	if !view.sharded {
+		upper = utils.DueUpperBound(hash, last)
+	}
+	iter, err := openDiscoveryIterator(d.db, view, hash, lower, upper, earliest, last, started.Add(d.Limits.WorkTime))
 	if err != nil {
 		d.logger.Warn("preload iterator failed", zap.Error(err))
 		return false
@@ -273,10 +278,12 @@ func (d *Dispatcher) preloadTopic(topic string, p *topicPreload, view InterestVi
 		}
 		valid = iter.Next()
 	}
-	if !valid || iter.Error() != nil {
+	if iter.resumeAt != nil {
+		p.after = iter.resumeAt
+	} else if !valid || iter.Error() != nil {
 		p.after = nil
 	}
-	return !valid && iter.Error() == nil
+	return !valid && iter.resumeAt == nil && iter.Error() == nil
 }
 
 func (d *Dispatcher) dropPreload(topic string) {
