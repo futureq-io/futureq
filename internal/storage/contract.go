@@ -41,6 +41,23 @@ type CacheRevisioner interface {
 	CacheRevision() uint64
 }
 
+// IteratorSource opens independently positioned iterators.
+type IteratorSource interface {
+	NewIter(*IterOptions) (Iterator, error)
+}
+
+// IteratorSnapshot is a read view that can open iterators concurrently. Close
+// it after every iterator created from it has been closed.
+type IteratorSnapshot interface {
+	IteratorSource
+	io.Closer
+}
+
+// IteratorSnapshotter optionally gives parallel scans one point-in-time view.
+type IteratorSnapshotter interface {
+	NewIteratorSnapshot() IteratorSnapshot
+}
+
 // Iterator is a cursor over a sorted key-value range.
 // Callers must call Close when done to release underlying resources.
 //

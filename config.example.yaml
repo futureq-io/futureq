@@ -94,7 +94,8 @@ delivery:
     disconnectTimeout: 0s
     renewalWorkers: 4 # 1..16 concurrent renewal batches, up to 256 sessions each
     disconnectWorkers: 1 # 1..16 concurrent disconnect batches; shared bounded queue
-  discoveryWorkers: 2 # 1..16 independent storage scan workers
+  discoveryWorkers: 2 # 1..16 concurrent topic discovery passes
+  shardWorkers: 1 # Concurrent scans per sharded topic pass
   preloadScanIdleMaxInterval: 0s # 0 disables speculative idle backoff; due scans keep their poll cadence
   consumerQueueSize: 1024 # 1..65536 messages per consumer sender queue
   timeBucket: 1ms

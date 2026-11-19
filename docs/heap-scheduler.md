@@ -21,8 +21,8 @@ flowchart LR
 
 Only the scheduler changes heaps, admission counters, cursors, fair rotation,
 job markers and the deadline timer. Discovery workers receive copies of cursors,
-known keys and result reservations. There is at most one scan and one delivery
-job per topic. The two pools are independent, so a slow iterator or proposal on
+known keys and result reservations. There is at most one discovery pass and one
+delivery job per topic. The two pools are independent, so a slow iterator or proposal on
 one topic does not stop another cached deadline. A topic cannot submit duplicate
 preparation jobs; known assigned keys are excluded from discovery and checked
 again when a result is admitted. Hub reservations remain the authority for
@@ -51,12 +51,18 @@ custom hooks and storage calls must return before worker shutdown can complete.
 No scheduler lock spans storage, quorum or network work.
 
 A single global message heap was rejected because a blocked topic could obstruct
-other topics. Per-topic heaps and fair rotation retain current one-job-per-topic
-semantics without another ownership partition. By default two discovery workers provide
-cross-topic isolation on both engines without overlapping scans of a topic.
-`delivery.discoveryWorkers` configures this pool from 1 to 16 workers.
-Separate per-topic scanner goroutines or scheduler partitions would add resident
-state and require evidence of a scheduler bottleneck first.
+other topics. Per-topic heaps and fair rotation schedule one pass per topic.
+`delivery.discoveryWorkers` controls how many topic passes can run together
+(default 2). A sharded pass can split the replica's owned shard ranges between
+up to `delivery.shardWorkers` concurrent scans (default 1). Three discovery
+workers with two shard workers can run six scans across three topics. A topic
+holds one discovery slot, and waiting topics participate in the rotation when
+a pass finishes.
+
+Each shard scan opens its own bounded iterator and resumes with its own cursor.
+Pebble iterators in the same pass share a snapshot. Other engines use independent
+read views. The scans divide the topic's key, byte, and candidate allowances,
+and report into the same heap for delivery.
 
 ## Comparing heaps
 
@@ -231,7 +237,7 @@ can contain larger valid messages. None are truncated or permanently rejected by
 a byte cap. These memory figures are estimates, not universal maximums.
 
 Let `C=preloadMaxMessages`, `B=prepareBatchSize`, `W=deliveryWorkers`,
-`D=discoveryWorkers`, and `Q` be
+`D=discoveryWorkers`, `S=shardWorkers`, and `Q` be
 a consumer's configured channel capacity. With defaults C=512, B=64, W=2, D=2:
 
 | Stage | Bound | Payload ownership after handoff |
@@ -239,13 +245,13 @@ a consumer's configured channel capacity. With defaults C=512, B=64, W=2, D=2:
 | Retained/reserved future entries | C across heaps, scans and result channels combined | Immutable decoded message |
 | Due scan results and ready entries | max(D,W)B combined, independent of C; at most B retained/reserved per topic | Same admission representation |
 | Assigned preparation/delivery jobs | WB total; one/topic | References removed from heap and held by worker |
-| Scanner transients | At most D current decodes plus engine iterators | Released on iterator close/job return |
+| Scanner transients | At most DS current decodes plus engine iterators | Released on iterator close/job return |
 | Maintenance | At most D discovery jobs and one pending receipt chunk; uses shared pools | One transient payload read/decode per scanner, no retained payload batch |
 | Retry state | Per-active-topic deadline and cyclic cursor; no retry payload side queue | Failed jobs evict, then rediscover |
 | Heap/map backing capacity | Heap <4 times live entries after drain; maps rebuilt with it | Popped slots zeroed; removed topics clear arrays/maps |
 | Sender queues and tracked attempts | Per consumer: Q buffered + at most max(1024,Q) records | Shared immutable payload; expired buffered attempts may outlive tracking |
 | Delete/ACK buffers | Existing 8192-key limits per completion kind | Keys/recipient metadata, no payload cache |
-| Known-key scan filters | At most D copies of relevant bounded heap/assigned key sets | Keys only |
+| Known-key scan filters | D topic passes share their topic's synchronized heap keys and assigned keys across shard scans | Keys only |
 
 Conservatively, the heap/discovery/worker stages retain at most `C+max(D,W)B+WB=768`
 message allocations plus current decoder transients. At 64 KiB this is about

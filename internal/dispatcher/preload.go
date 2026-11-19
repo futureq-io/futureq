@@ -70,6 +70,8 @@ type topicPreload struct {
 	scanNext         bool
 	futureScanAfter  time.Time // scheduler-owned speculative scan deadline
 	futureScanIdle   time.Duration
+	shardScans       []shardScanState // scheduler-owned cursors for parallel discovery
+	nextShardScan    int
 }
 
 // Discovery reads this small synchronized index without copying the entire
@@ -193,7 +195,7 @@ func (d *Dispatcher) collectPreloaded(topic string, p *topicPreload, view Intere
 // true only when the range was exhausted without an iterator error.
 func (d *Dispatcher) preloadTopic(topic string, p *topicPreload, view InterestView, nowMs int64) bool {
 	defer d.observePreload()
-	if d.preloadCount >= d.PreloadMaxMessages {
+	if !view.Active || (d.shardScan != nil && d.shardScan.epoch != view.Epoch) || d.preloadCount >= d.PreloadMaxMessages {
 		return false
 	}
 	started := time.Now()
@@ -220,7 +222,7 @@ func (d *Dispatcher) preloadTopic(topic string, p *topicPreload, view InterestVi
 	if !view.sharded {
 		upper = utils.DueUpperBound(hash, last)
 	}
-	iter, err := openDiscoveryIterator(d.db, view, hash, lower, upper, earliest, last, started.Add(d.Limits.WorkTime))
+	iter, err := openDiscoveryIterator(d.discoverySource(), view, hash, lower, upper, earliest, last, started.Add(d.Limits.WorkTime), d.shardScan)
 	if err != nil {
 		d.logger.Warn("preload iterator failed", zap.Error(err))
 		return false

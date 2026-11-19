@@ -32,6 +32,8 @@ type inFlightEntry struct {
 type Dispatcher struct {
 	skipKeys        func([24]byte) bool // synchronized preload lookup, isolated discovery adapter only
 	scanOnly        bool                // isolated worker adapter never publishes scheduler gauges
+	shardScan       *shardScanRange     // immutable range assigned to an isolated discovery worker
+	scanSource      storage.IteratorSource
 	db              storage.DB
 	hub             *Hub
 	deleter         *Deleter
@@ -51,6 +53,7 @@ type Dispatcher struct {
 	TimeBucket                 time.Duration
 	cursors                    map[string]*scanCursor // owned by the scheduler
 	DiscoveryWorkers           int
+	ShardWorkers               int
 	PreloadScanIdleMaxInterval time.Duration
 	PreloadLookahead           time.Duration
 	PreloadMaxMessages         int
@@ -78,6 +81,7 @@ func NewDispatcher(
 	return &Dispatcher{
 		HeapType:                   defaults.HeapType,
 		DiscoveryWorkers:           defaults.DiscoveryWorkers,
+		ShardWorkers:               defaults.ShardWorkers,
 		PreloadScanIdleMaxInterval: defaults.PreloadScanIdleMaxInterval,
 		db:                         db,
 		hub:                        hub,

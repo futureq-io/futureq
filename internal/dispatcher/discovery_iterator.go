@@ -20,18 +20,22 @@ type discoveryIterator struct {
 	loadedOwnership      bool
 	seeks                int
 	resumeAt             []byte
+	shards               *shardScanRange
 }
 
-func openDiscoveryIterator(db storage.DB, view InterestView, hash uint64, lower, upper []byte, earliest, last uint64, deadline time.Time) (*discoveryIterator, error) {
+func openDiscoveryIterator(db storage.IteratorSource, view InterestView, hash uint64, lower, upper []byte, earliest, last uint64, deadline time.Time, shards *shardScanRange) (*discoveryIterator, error) {
 	if view.sharded && len(upper) == 0 {
 		// Include every possible layout, including when the topic hash is MaxUint64.
 		upper = append(utils.EventKey(^uint64(0), hash, ^uint64(0)), 0)
+	}
+	if shards != nil {
+		lower, upper = shards.bounds(hash, lower, upper)
 	}
 	iter, err := db.NewIter(&storage.IterOptions{LowerBound: lower, UpperBound: upper})
 	if err != nil {
 		return nil, err
 	}
-	return &discoveryIterator{Iterator: iter, view: view, hash: hash, earliest: earliest, last: last, deadline: deadline, upper: upper}, nil
+	return &discoveryIterator{Iterator: iter, view: view, hash: hash, earliest: earliest, last: last, deadline: deadline, upper: upper, shards: shards}, nil
 }
 
 func (i *discoveryIterator) First() bool { return i.advance(i.Iterator.First()) }
@@ -53,6 +57,11 @@ func (i *discoveryIterator) advance(valid bool) bool {
 		}
 		if !i.loadedOwnership {
 			i.owned = i.view.ownedShardSlots()
+			if i.shards != nil {
+				for slot := range i.owned {
+					i.owned[slot] = i.owned[slot] && i.shards.slots[slot]
+				}
+			}
 			i.loadedOwnership = true
 		}
 		if slot >= 2 && i.owned[slot] {

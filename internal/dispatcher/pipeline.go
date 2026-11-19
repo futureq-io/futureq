@@ -80,7 +80,7 @@ func (d *Dispatcher) collectTopic(topic string, nowMs int64) deliveryChunk {
 		observeCollection("due_scan", started)
 	}()
 	view := d.hub.InterestView(topic)
-	if !view.Active {
+	if !view.Active || (d.shardScan != nil && d.shardScan.epoch != view.Epoch) {
 		return chunk
 	}
 	cursor := d.cursors[topic]
@@ -100,7 +100,7 @@ func (d *Dispatcher) collectTopic(topic string, nowMs int64) deliveryChunk {
 	} else if len(upper) == 0 && !view.sharded {
 		upper = utils.DueUpperBound(hash, last)
 	}
-	iter, err := openDiscoveryIterator(d.db, view, hash, lower, upper, 0, last, started.Add(d.Limits.WorkTime))
+	iter, err := openDiscoveryIterator(d.discoverySource(), view, hash, lower, upper, 0, last, started.Add(d.Limits.WorkTime), d.shardScan)
 	if err != nil {
 		d.logger.Error("delivery iterator failed", zap.Error(err))
 		return chunk

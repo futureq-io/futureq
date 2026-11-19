@@ -194,6 +194,7 @@ type Delivery struct {
 	Subscriptions              Subscriptions `mapstructure:"subscriptions" yaml:"subscriptions"`
 	HeapType                   HeapType      `mapstructure:"heapType" yaml:"heapType"`
 	DiscoveryWorkers           int           `mapstructure:"discoveryWorkers" yaml:"discoveryWorkers"`
+	ShardWorkers               int           `mapstructure:"shardWorkers" yaml:"shardWorkers"`
 	PreloadScanIdleMaxInterval time.Duration `mapstructure:"preloadScanIdleMaxInterval" yaml:"preloadScanIdleMaxInterval"`
 	ConsumerQueueSize          int           `mapstructure:"consumerQueueSize" yaml:"consumerQueueSize"`
 	TimeBucket                 time.Duration `mapstructure:"timeBucket" yaml:"timeBucket"`
@@ -482,6 +483,9 @@ func (c *Config) validatePublishAndDelivery() error {
 	}
 	if d.DiscoveryWorkers < 1 || d.DiscoveryWorkers > 16 {
 		return fmt.Errorf("delivery.discoveryWorkers must be 1..16")
+	}
+	if d.ShardWorkers < 1 {
+		return fmt.Errorf("delivery.shardWorkers must be positive")
 	}
 	if d.PreloadScanIdleMaxInterval < 0 {
 		return fmt.Errorf("delivery.preloadScanIdleMaxInterval must be nonnegative")

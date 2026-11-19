@@ -45,6 +45,7 @@ var defaultConfig = Config{
 		Subscriptions:              Subscriptions{RenewalWorkers: 4, DisconnectWorkers: 1},
 		ConsumerRemovalWorkers:     1,
 		DiscoveryWorkers:           2,
+		ShardWorkers:               1,
 		PreloadScanIdleMaxInterval: 0 * time.Millisecond,
 		ConsumerQueueSize:          1024,
 		TimeBucket:                 time.Millisecond,

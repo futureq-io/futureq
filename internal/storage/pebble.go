@@ -119,6 +119,24 @@ func (p *Pebble) NewIter(opts *IterOptions) (Iterator, error) {
 	return &pebbleIterator{iter: iter, snap: snap, empty: &p.empty, probe: probe}, nil
 }
 
+// NewIteratorSnapshot shares a snapshot across bounded scans. Iterators opened
+// later on this snapshot cannot use the empty-range cache, whose proofs track
+// the current DB state at the time a snapshot is captured.
+func (p *Pebble) NewIteratorSnapshot() IteratorSnapshot {
+	return pebbleIteratorSnapshot{Snapshot: p.db.NewSnapshot()}
+}
+
+type pebbleIteratorSnapshot struct {
+	*pebble.Snapshot
+}
+
+func (s pebbleIteratorSnapshot) NewIter(opts *IterOptions) (Iterator, error) {
+	if opts == nil {
+		return s.Snapshot.NewIter(nil)
+	}
+	return s.Snapshot.NewIter(&pebble.IterOptions{LowerBound: opts.LowerBound, UpperBound: opts.UpperBound})
+}
+
 func (p *Pebble) Scan(opts *IterOptions, yield func(key, value []byte) error) error {
 	snap := p.db.NewSnapshot()
 
