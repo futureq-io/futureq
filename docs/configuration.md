@@ -55,7 +55,50 @@ export FUTUREQ_CLUSTER_RAFT_INITIALMEMBERS='{1: "10.0.0.1:50005"}'
 | `cluster.raft.rtt`               | `200ms`         | Estimated inter-node round-trip time driving Dragonboat's timers. Whole milliseconds, ≥1ms. |
 | `cluster.raft.snapshotEntries`   | `10000`         | Take a state-machine snapshot after this many applied log entries. |
 | `cluster.raft.compactionOverhead`| `5000`          | Log entries retained above the snapshot index. |
-| `cluster.raft.logDBWriteBufferSize` | `4MiB` | Retained Tan serialization buffer per worker. Dragonboat has 16 workers, so the default retains 64MiB per broker. Larger individual updates use a temporary buffer. Override with `FUTUREQ_CLUSTER_RAFT_LOGDBWRITEBUFFERSIZE`. |
+| `cluster.raft.logDB` | See below | Dragonboat LogDB settings and persistence worker count. |
+
+### cluster.raft.logDB
+
+All fields of Dragonboat's `LogDBConfig` are configurable in this block. Byte
+quantities use `B`, `KiB`, `MiB`, or `GiB`; optional byte settings accept `0B`.
+Environment overrides follow the nesting, for example
+`FUTUREQ_CLUSTER_RAFT_LOGDB_KVWRITEBUFFERSIZE=4MiB` and
+`FUTUREQ_CLUSTER_RAFT_LOGDB_WORKERS=4`.
+
+`workers` controls `Engine.ExecShards`, whose workers persist Raft updates.
+`shards` controls `LogDBConfig.Shards`. Changing either count requires fresh
+Raft storage; Dragonboat rejects incompatible saved partition settings.
+
+FutureQ uses the Tan backend, which directly consumes `kvWriteBufferSize` and
+retains **16 buffers regardless of the worker setting**. The `32MiB` default
+therefore retains **512MiB per broker**. Oversized updates use temporary
+allocations. Other KV/cache/level options are passed through to Dragonboat but
+belong to its other LogDB backends and have no effect on Tan. These settings
+are separate from application storage under `storage.pebble`.
+
+| Key below `cluster.raft.logDB` | Default |
+|---|---:|
+| `workers` | `16` |
+| `shards` | `16` |
+| `kvKeepLogFileNum` | `16` |
+| `kvMaxBackgroundCompactions` | `2` |
+| `kvMaxBackgroundFlushes` | `2` |
+| `kvLRUCacheSize` | `0B` |
+| `kvWriteBufferSize` | `32MiB` |
+| `kvMaxWriteBufferNumber` | `4` |
+| `kvLevel0FileNumCompactionTrigger` | `8` |
+| `kvLevel0SlowdownWritesTrigger` | `17` |
+| `kvLevel0StopWritesTrigger` | `24` |
+| `kvMaxBytesForLevelBase` | `4GiB` |
+| `kvMaxBytesForLevelMultiplier` | `2` |
+| `kvTargetFileSizeBase` | `16MiB` |
+| `kvTargetFileSizeMultiplier` | `2` |
+| `kvLevelCompactionDynamicLevelBytes` | `0` |
+| `kvRecycleLogFileNum` | `0` |
+| `kvNumOfLevels` | `7` |
+| `kvBlockSize` | `32KiB` |
+| `saveBufferSize` | `32KiB` |
+| `maxSaveBufferSize` | `64MiB` |
 
 ## storage
 
