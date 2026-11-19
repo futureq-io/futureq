@@ -151,6 +151,13 @@ func (a *App) StartRaft(join bool, onDeleteKeys func(keys [][]byte)) error {
 		ListenAddress:  cfg.Cluster.Raft.Listen,
 	}
 	nhc.Expert.LogDBFactory = leaderpersist.NewFactory(tracker)
+	logDBConfig, err := cfg.Cluster.Raft.LogDB.DragonboatConfig()
+	if err != nil {
+		return err
+	}
+	nhc.Expert.LogDB = logDBConfig
+	nhc.Expert.Engine = raftconfig.GetDefaultEngineConfig()
+	nhc.Expert.Engine.ExecShards = cfg.Cluster.Raft.LogDB.Workers
 
 	// We need the NodeHost reference to create the propose function, but
 	// Dragonboat needs the listeners at creation time. Use a forward reference:
@@ -170,7 +177,6 @@ func (a *App) StartRaft(join bool, onDeleteKeys func(keys [][]byte)) error {
 	nhc.RaftEventListener = metadataSvc
 	nhc.SystemEventListener = metadataSvc
 
-	var err error
 	nh, err = dragonboat.NewNodeHost(nhc)
 	if err != nil {
 		return fmt.Errorf("failed to create dragonboat nodehost: %w", err)

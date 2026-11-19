@@ -2,7 +2,6 @@ package dispatcher
 
 import (
 	"bytes"
-	"container/heap"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -59,24 +58,8 @@ func (d *Dispatcher) readPayload(key []byte, stage string) (cachedPayload, error
 
 type candidateHeap []preloadCandidate
 
-func (h candidateHeap) Len() int { return len(h) }
-func (h candidateHeap) Less(i, j int) bool {
-	if h[i].due == h[j].due {
-		return bytes.Compare(h[i].key[:], h[j].key[:]) < 0
-	}
-	return h[i].due < h[j].due
-}
-func (h candidateHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
-func (h *candidateHeap) Push(v any)   { *h = append(*h, v.(preloadCandidate)) }
-func (h *candidateHeap) Pop() any {
-	last := len(*h) - 1
-	v := (*h)[last]
-	(*h)[last] = preloadCandidate{} // do not retain popped payloads in the backing array
-	*h = (*h)[:last]
-	return v
-}
-
 type topicPreload struct {
+	heapShift        uint         // 0/1: typed binary; 2/3: typed 4-ary/8-ary
 	readyCount       int          // scheduler-owned due credits; future entries are charged separately
 	repairGeneration uint64       // fences cursor resets against older scan results
 	valid            *atomic.Bool // optional generation fence, set by the production owner
@@ -132,7 +115,7 @@ func (d *Dispatcher) collectScheduledTopic(topic string, nowMs int64) deliveryCh
 	p := d.preloads[topic]
 	if p == nil || p.epoch != view.Epoch {
 		d.dropPreload(topic)
-		p = &topicPreload{epoch: view.Epoch}
+		p = &topicPreload{epoch: view.Epoch, heapShift: candidateHeapShift(d.HeapType)}
 		d.preloads[topic] = p
 	}
 	if !p.scanNext {
@@ -169,7 +152,7 @@ func (d *Dispatcher) collectPreloaded(topic string, p *topicPreload, view Intere
 		if commandSize.SizeWith(item) > d.Limits.Bytes && len(chunk.items) > 0 {
 			break // retain this candidate for a subsequent bounded chunk
 		}
-		heap.Pop(&p.items)
+		p.items.popCandidate(p.heapShift)
 		p.removeKey(candidate.key)
 		if candidate.ready {
 			p.readyCount--
@@ -281,7 +264,7 @@ func (d *Dispatcher) preloadTopic(topic string, p *topicPreload, view InterestVi
 				candidate.payload = payload
 				candidate.due = msg.EnqueuedAtUnixMs + msg.DelayMs
 				if candidate.due > nowMs && candidate.due <= horizon && !d.isExpired(msg, nowMs) {
-					heap.Push(&p.items, candidate)
+					p.items.pushCandidate(candidate, p.heapShift)
 					p.addKey(candidate.key)
 					d.preloadCount++
 					loaded++
@@ -386,7 +369,7 @@ func (d *Dispatcher) releaseReady(topic string, p *topicPreload) {
 	}
 	clear(p.items[len(kept):])
 	p.items = kept
-	heap.Init(&p.items)
+	p.items.initCandidates(p.heapShift)
 	p.compact()
 	p.repairGeneration++
 	delete(d.cursors, topic)

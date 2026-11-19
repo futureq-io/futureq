@@ -1,7 +1,6 @@
 package dispatcher
 
 import (
-	"container/heap"
 	"context"
 	"errors"
 	"sort"
@@ -69,7 +68,7 @@ func (d *Dispatcher) discover(job discoveryJob) discoveryResult {
 		metrics.DeliveryRepairScansTotal.Inc()
 		chunk = scanner.collectTopic(job.topic, time.Now().UnixMilli())
 	}
-	p := &topicPreload{epoch: job.owner.epoch, after: job.futureAfter}
+	p := &topicPreload{epoch: job.owner.epoch, after: job.futureAfter, heapShift: job.owner.heapShift}
 	// Future scans have independent work budgets and run even with productive
 	// due traffic, provided the scheduler reserved future admission first.
 	exhausted := false
@@ -87,7 +86,7 @@ func (d *Dispatcher) admitCandidate(p *topicPreload, c preloadCandidate) bool {
 		return false
 	}
 	p.addKey(c.key)
-	heap.Push(&p.items, c)
+	p.items.pushCandidate(c, p.heapShift)
 	if c.ready {
 		p.readyCount++
 		d.readyCount++
@@ -354,7 +353,7 @@ func (d *Dispatcher) runPipeline(parent context.Context) {
 				p = d.preloads[topic]
 				if p == nil || p.epoch != view.Epoch {
 					d.dropPreload(topic)
-					p = &topicPreload{epoch: view.Epoch, valid: &atomic.Bool{}}
+					p = &topicPreload{epoch: view.Epoch, valid: &atomic.Bool{}, heapShift: candidateHeapShift(d.HeapType)}
 					p.valid.Store(true)
 					d.preloads[topic] = p
 				}

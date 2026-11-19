@@ -17,6 +17,16 @@ var defaultConfig = Config{
 			Listen: "0.0.0.0:50005", Advertise: "", DataDir: "./raft-data",
 			InitialMembers: map[uint64]string{}, RTT: 200 * time.Millisecond,
 			SnapshotEntries: 10000, CompactionOverhead: 5000,
+			LogDB: LogDB{
+				Workers: 16, Shards: 16, KVKeepLogFileNum: 16,
+				KVMaxBackgroundCompactions: 2, KVMaxBackgroundFlushes: 2,
+				KVLRUCacheSize: "0B", KVWriteBufferSize: "16MiB", KVMaxWriteBufferNumber: 4,
+				KVLevel0FileNumCompactionTrigger: 8, KVLevel0SlowdownWritesTrigger: 17, KVLevel0StopWritesTrigger: 24,
+				KVMaxBytesForLevelBase: "4GiB", KVMaxBytesForLevelMultiplier: 2,
+				KVTargetFileSizeBase: "16MiB", KVTargetFileSizeMultiplier: 2,
+				KVLevelCompactionDynamicLevelBytes: 0, KVRecycleLogFileNum: 0, KVNumOfLevels: 7,
+				KVBlockSize: "32KiB", SaveBufferSize: "32KiB", MaxSaveBufferSize: "64MiB",
+			},
 		},
 	},
 	Storage: Storage{
@@ -26,6 +36,7 @@ var defaultConfig = Config{
 	},
 	Publish: Publish{MinAckLevel: Quorum, ProposalTimeout: 5 * time.Second},
 	Delivery: Delivery{
+		HeapType:                   HeapBinary,
 		Subscriptions:              Subscriptions{RenewalWorkers: 4, DisconnectWorkers: 1},
 		ConsumerRemovalWorkers:     1,
 		DiscoveryWorkers:           2,
@@ -39,6 +50,7 @@ var defaultConfig = Config{
 		ReadPermit:                 time.Second,
 		DeleteBatchInterval:        500 * time.Millisecond,
 		DeleteWorkers:              16,
+		AckQueueCapacity:           8192,
 		TTLSweepInterval:           time.Minute,
 		PrepareBatchSize:           64,
 		PrepareBatchBytes:          "256KiB",

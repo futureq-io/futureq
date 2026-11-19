@@ -58,6 +58,43 @@ cross-topic isolation on both engines without overlapping scans of a topic.
 Separate per-topic scanner goroutines or scheduler partitions would add resident
 state and require evidence of a scheduler bottleneck first.
 
+## Comparing heaps
+
+`delivery.heapType` selects the candidate heap when the broker starts:
+
+| Value | Implementation |
+| --- | --- |
+| `binary` (default) | Typed binary heap without interface boxing |
+| `4ary` | Typed heap with four children per node |
+| `8ary` | Typed heap with eight children per node |
+
+All variants retain the same full-message candidate layout, exact due-time/key
+ordering, count limits, topic ownership and generation fencing. The selection
+also applies to discovery workers' temporary heaps and rebuilds after retry
+eviction. Typed variants use hole-based sifting and clear popped payload slots.
+Heap choice does not enable speculative preloading; configure lookahead and
+capacity separately. Changing the selector requires a restart and rebuilds the
+local cache from authoritative storage.
+
+The former `typed-binary` selector is now named `binary`; update configurations
+using that old value. The interface-based `container/heap` implementation has
+been removed.
+
+Run the heap-only comparison with:
+
+```sh
+go test ./internal/dispatcher -run '^$' -bench '^BenchmarkCandidateHeap$' -benchmem -count=3
+```
+
+The benchmark covers 10,000 and 16,384 entries, mixed and identical deadlines,
+steady pop/push operations, and complete build/drain cycles. Candidates and
+ordering are identical across choices. Setup is excluded from steady-operation
+timing; build/drain includes all insertions and removals while reusing capacity.
+These figures exclude discovery, receipt reads, Hub work, and gRPC sends. Compare
+end-to-end lateness using the same load, payload sizes, cache settings and batch
+limits, restarting between selectors and allowing the cache to warm up. No heap
+variant is assumed to be faster for every workload.
+
 ## Immutable payload ownership and delivery eligibility
 
 Default `proto.Unmarshal` copies bytes into an independently allocated message.

@@ -133,6 +133,7 @@ func startRun(cmd *cobra.Command, _ []string) {
 		}
 	}
 	deleter := dispatcher.NewDeleter(ledger, deleteInterval, logger)
+	deleter.AckQueueCapacity = cfg.Delivery.AckQueueCapacity
 	if cfg.Cluster.Enabled {
 		// Overlap consensus waits without releasing tracking before commit
 		// or accumulating unbounded proposal goroutines during quorum loss.
@@ -146,6 +147,8 @@ func startRun(cmd *cobra.Command, _ []string) {
 		wakeCh, logger,
 	)
 	disp.PrepareBatch = ledger.PublishedBatch
+	disp.HeapType = cfg.Delivery.HeapType
+	logger.Info("delivery heap selected", zap.String("heapType", string(disp.HeapType)))
 	disp.TimeBucket = cfg.Delivery.TimeBucket
 	disp.DiscoveryWorkers = cfg.Delivery.DiscoveryWorkers
 	disp.PreloadScanIdleMaxInterval = cfg.Delivery.PreloadScanIdleMaxInterval

@@ -88,6 +88,9 @@ type Deleter struct {
 	// MaxConcurrentFlushes allows persistence waits to overlap. Values <= 1
 	// keep serial flushing. Set before Run; standalone storage stays serial.
 	MaxConcurrentFlushes int
+	// AckQueueCapacity bounds unique recipient ACKs, including proposals in
+	// progress. Set before Run; nonpositive values retain the default bound.
+	AckQueueCapacity int
 
 	mu         sync.Mutex
 	pending    [][]byte
@@ -180,7 +183,11 @@ func (d *Deleter) TryMarkAcknowledged(key []byte, recipient string) bool {
 	if d.ackKeys[id] {
 		return true
 	}
-	if len(d.ackKeys) >= MaxPendingCompletions {
+	capacity := d.AckQueueCapacity
+	if capacity <= 0 {
+		capacity = MaxPendingCompletions
+	}
+	if len(d.ackKeys) >= capacity {
 		return false
 	}
 	d.ackKeys[id] = true

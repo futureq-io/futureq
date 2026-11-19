@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	raftconfig "github.com/lni/dragonboat/v4/config"
 	"github.com/spf13/viper"
 	"gopkg.in/yaml.v2"
 )
@@ -20,6 +21,15 @@ const (
 	Quorum AckLevel = "quorum"
 	Leader AckLevel = "leader"
 	NoAck  AckLevel = "noAck"
+)
+
+// HeapType selects the node-local delivery candidate heap at startup.
+type HeapType string
+
+const (
+	HeapBinary HeapType = "binary"
+	Heap4Ary   HeapType = "4ary"
+	Heap8Ary   HeapType = "8ary"
 )
 
 type Subscriptions struct {
@@ -73,6 +83,81 @@ type Raft struct {
 	RTT                time.Duration     `mapstructure:"rtt" yaml:"rtt"`
 	SnapshotEntries    uint64            `mapstructure:"snapshotEntries" yaml:"snapshotEntries"`
 	CompactionOverhead uint64            `mapstructure:"compactionOverhead" yaml:"compactionOverhead"`
+	LogDB              LogDB             `mapstructure:"logDB" yaml:"logDB"`
+}
+
+// LogDB exposes every field of Dragonboat's LogDBConfig. Workers separately
+// controls Engine.ExecShards, whose workers call SaveRaftState. The active Tan
+// backend only consumes KVWriteBufferSize directly and retains 16 buffers.
+type LogDB struct {
+	Workers                            uint64 `mapstructure:"workers" yaml:"workers"`
+	Shards                             uint64 `mapstructure:"shards" yaml:"shards"`
+	KVKeepLogFileNum                   uint64 `mapstructure:"kvKeepLogFileNum" yaml:"kvKeepLogFileNum"`
+	KVMaxBackgroundCompactions         uint64 `mapstructure:"kvMaxBackgroundCompactions" yaml:"kvMaxBackgroundCompactions"`
+	KVMaxBackgroundFlushes             uint64 `mapstructure:"kvMaxBackgroundFlushes" yaml:"kvMaxBackgroundFlushes"`
+	KVLRUCacheSize                     Size   `mapstructure:"kvLRUCacheSize" yaml:"kvLRUCacheSize"`
+	KVWriteBufferSize                  Size   `mapstructure:"kvWriteBufferSize" yaml:"kvWriteBufferSize"`
+	KVMaxWriteBufferNumber             uint64 `mapstructure:"kvMaxWriteBufferNumber" yaml:"kvMaxWriteBufferNumber"`
+	KVLevel0FileNumCompactionTrigger   uint64 `mapstructure:"kvLevel0FileNumCompactionTrigger" yaml:"kvLevel0FileNumCompactionTrigger"`
+	KVLevel0SlowdownWritesTrigger      uint64 `mapstructure:"kvLevel0SlowdownWritesTrigger" yaml:"kvLevel0SlowdownWritesTrigger"`
+	KVLevel0StopWritesTrigger          uint64 `mapstructure:"kvLevel0StopWritesTrigger" yaml:"kvLevel0StopWritesTrigger"`
+	KVMaxBytesForLevelBase             Size   `mapstructure:"kvMaxBytesForLevelBase" yaml:"kvMaxBytesForLevelBase"`
+	KVMaxBytesForLevelMultiplier       uint64 `mapstructure:"kvMaxBytesForLevelMultiplier" yaml:"kvMaxBytesForLevelMultiplier"`
+	KVTargetFileSizeBase               Size   `mapstructure:"kvTargetFileSizeBase" yaml:"kvTargetFileSizeBase"`
+	KVTargetFileSizeMultiplier         uint64 `mapstructure:"kvTargetFileSizeMultiplier" yaml:"kvTargetFileSizeMultiplier"`
+	KVLevelCompactionDynamicLevelBytes uint64 `mapstructure:"kvLevelCompactionDynamicLevelBytes" yaml:"kvLevelCompactionDynamicLevelBytes"`
+	KVRecycleLogFileNum                uint64 `mapstructure:"kvRecycleLogFileNum" yaml:"kvRecycleLogFileNum"`
+	KVNumOfLevels                      uint64 `mapstructure:"kvNumOfLevels" yaml:"kvNumOfLevels"`
+	KVBlockSize                        Size   `mapstructure:"kvBlockSize" yaml:"kvBlockSize"`
+	SaveBufferSize                     Size   `mapstructure:"saveBufferSize" yaml:"saveBufferSize"`
+	MaxSaveBufferSize                  Size   `mapstructure:"maxSaveBufferSize" yaml:"maxSaveBufferSize"`
+}
+
+// DragonboatConfig converts byte quantities while preserving zero for options
+// where it disables a cache/limit. Worker/shard counts are stored in Raft's
+// compatibility flags and cannot be changed against existing Raft storage.
+func (c LogDB) DragonboatConfig() (raftconfig.LogDBConfig, error) {
+	maxInt := uint64(int(^uint(0) >> 1))
+	if c.Workers == 0 || c.Shards == 0 || c.Workers > maxInt || c.Shards > maxInt {
+		return raftconfig.LogDBConfig{}, fmt.Errorf("cluster.raft.logDB.workers and shards must be positive supported counts")
+	}
+	result := raftconfig.LogDBConfig{
+		Shards: c.Shards, KVKeepLogFileNum: c.KVKeepLogFileNum,
+		KVMaxBackgroundCompactions: c.KVMaxBackgroundCompactions, KVMaxBackgroundFlushes: c.KVMaxBackgroundFlushes,
+		KVMaxWriteBufferNumber:           c.KVMaxWriteBufferNumber,
+		KVLevel0FileNumCompactionTrigger: c.KVLevel0FileNumCompactionTrigger,
+		KVLevel0SlowdownWritesTrigger:    c.KVLevel0SlowdownWritesTrigger, KVLevel0StopWritesTrigger: c.KVLevel0StopWritesTrigger,
+		KVMaxBytesForLevelMultiplier: c.KVMaxBytesForLevelMultiplier, KVTargetFileSizeMultiplier: c.KVTargetFileSizeMultiplier,
+		KVLevelCompactionDynamicLevelBytes: c.KVLevelCompactionDynamicLevelBytes,
+		KVRecycleLogFileNum:                c.KVRecycleLogFileNum, KVNumOfLevels: c.KVNumOfLevels,
+	}
+	for _, field := range []struct {
+		name     string
+		size     Size
+		target   *uint64
+		positive bool
+	}{
+		{"kvLRUCacheSize", c.KVLRUCacheSize, &result.KVLRUCacheSize, false},
+		{"kvWriteBufferSize", c.KVWriteBufferSize, &result.KVWriteBufferSize, true},
+		{"kvMaxBytesForLevelBase", c.KVMaxBytesForLevelBase, &result.KVMaxBytesForLevelBase, false},
+		{"kvTargetFileSizeBase", c.KVTargetFileSizeBase, &result.KVTargetFileSizeBase, false},
+		{"kvBlockSize", c.KVBlockSize, &result.KVBlockSize, false},
+		{"saveBufferSize", c.SaveBufferSize, &result.SaveBufferSize, false},
+		{"maxSaveBufferSize", c.MaxSaveBufferSize, &result.MaxSaveBufferSize, false},
+	} {
+		var n int64
+		var err error
+		switch field.size {
+		case "0B", "0KiB", "0MiB", "0GiB":
+		default:
+			n, err = field.size.Bytes()
+		}
+		if err != nil || uint64(n) > maxInt || (field.positive && n == 0) {
+			return raftconfig.LogDBConfig{}, fmt.Errorf("cluster.raft.logDB.%s must be a supported size (kvWriteBufferSize must be positive)", field.name)
+		}
+		*field.target = uint64(n)
+	}
+	return result, nil
 }
 
 type Storage struct {
@@ -102,6 +187,7 @@ type Publish struct {
 
 type Delivery struct {
 	Subscriptions              Subscriptions `mapstructure:"subscriptions" yaml:"subscriptions"`
+	HeapType                   HeapType      `mapstructure:"heapType" yaml:"heapType"`
 	DiscoveryWorkers           int           `mapstructure:"discoveryWorkers" yaml:"discoveryWorkers"`
 	PreloadScanIdleMaxInterval time.Duration `mapstructure:"preloadScanIdleMaxInterval" yaml:"preloadScanIdleMaxInterval"`
 	ConsumerQueueSize          int           `mapstructure:"consumerQueueSize" yaml:"consumerQueueSize"`
@@ -113,6 +199,7 @@ type Delivery struct {
 	ReadPermit                 time.Duration `mapstructure:"readPermit" yaml:"readPermit"`
 	DeleteBatchInterval        time.Duration `mapstructure:"deleteBatchInterval" yaml:"deleteBatchInterval"`
 	DeleteWorkers              int           `mapstructure:"deleteWorkers" yaml:"deleteWorkers"`
+	AckQueueCapacity           int           `mapstructure:"ackQueueCapacity" yaml:"ackQueueCapacity"`
 	ConsumerRemovalWorkers     int           `mapstructure:"consumerRemovalWorkers" yaml:"consumerRemovalWorkers"`
 	TTLSweepInterval           time.Duration `mapstructure:"ttlSweepInterval" yaml:"ttlSweepInterval"`
 	PrepareBatchSize           int           `mapstructure:"prepareBatchSize" yaml:"prepareBatchSize"`
@@ -295,6 +382,9 @@ func (c *Config) validateCluster() error {
 	if cl.Raft.DataDir == "" || cl.Raft.RTT < time.Millisecond || cl.Raft.RTT%time.Millisecond != 0 || cl.Raft.SnapshotEntries == 0 || cl.Raft.CompactionOverhead == 0 {
 		return fmt.Errorf("cluster.raft requires dataDir, millisecond rtt, snapshotEntries, and compactionOverhead")
 	}
+	if _, err := cl.Raft.LogDB.DragonboatConfig(); err != nil {
+		return err
+	}
 	if len(cl.JoinSeeds) > 0 && len(cl.Raft.InitialMembers) > 0 {
 		return fmt.Errorf("cluster.joinSeeds and cluster.raft.initialMembers cannot both be set")
 	}
@@ -371,6 +461,11 @@ func (c *Config) validatePublishAndDelivery() error {
 	}
 
 	d := c.Delivery
+	switch d.HeapType {
+	case HeapBinary, Heap4Ary, Heap8Ary:
+	default:
+		return fmt.Errorf("delivery.heapType must be binary, 4ary, or 8ary")
+	}
 	if d.ReadPermit < 100*time.Millisecond || d.ReadPermit > 30*time.Second || d.ReadPermit%time.Millisecond != 0 {
 		return fmt.Errorf("delivery.readPermit must be whole milliseconds from 100ms to 30s")
 	}
@@ -397,6 +492,9 @@ func (c *Config) validatePublishAndDelivery() error {
 	}
 	if d.DeleteWorkers < 1 || d.DeleteWorkers > 256 {
 		return fmt.Errorf("delivery.deleteWorkers must be 1..256")
+	}
+	if d.AckQueueCapacity < 1 || d.AckQueueCapacity > 1048576 {
+		return fmt.Errorf("delivery.ackQueueCapacity must be 1..1048576")
 	}
 	if d.PrepareBatchSize < 1 || d.PrepareBatchSize > 256 || d.ScanMaxKeys < d.PrepareBatchSize || d.ScanMaxKeys > 65536 {
 		return fmt.Errorf("delivery.prepareBatchSize must be 1..256 and scanMaxKeys must be between batch size and 65536")
