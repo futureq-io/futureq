@@ -58,25 +58,8 @@ func (d *Dispatcher) readPayload(key []byte, stage string) (cachedPayload, error
 
 type candidateHeap []preloadCandidate
 
-func (h candidateHeap) Len() int { return len(h) }
-func (h candidateHeap) Less(i, j int) bool {
-	if h[i].due == h[j].due {
-		return bytes.Compare(h[i].key[:], h[j].key[:]) < 0
-	}
-	return h[i].due < h[j].due
-}
-func (h candidateHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
-func (h *candidateHeap) Push(v any)   { *h = append(*h, v.(preloadCandidate)) }
-func (h *candidateHeap) Pop() any {
-	last := len(*h) - 1
-	v := (*h)[last]
-	(*h)[last] = preloadCandidate{} // do not retain popped payloads in the backing array
-	*h = (*h)[:last]
-	return v
-}
-
 type topicPreload struct {
-	heapShift        uint         // 0: container/heap; 1/2/3: typed binary/4-ary/8-ary
+	heapShift        uint         // 0/1: typed binary; 2/3: typed 4-ary/8-ary
 	readyCount       int          // scheduler-owned due credits; future entries are charged separately
 	repairGeneration uint64       // fences cursor resets against older scan results
 	valid            *atomic.Bool // optional generation fence, set by the production owner

@@ -2,18 +2,15 @@ package dispatcher
 
 import (
 	"bytes"
-	"container/heap"
 
 	"github.com/futureq-io/futureq/internal/config"
 )
 
 // candidateHeapShift is captured when a topic is created, including worker-local
-// discovery heaps. The zero value retains the original container/heap behavior.
+// discovery heaps. Binary heaps use the same typed operations as wider heaps.
 func candidateHeapShift(kind config.HeapType) uint {
 	switch kind {
 	case "", config.HeapBinary:
-		return 0
-	case config.HeapTypedBinary:
 		return 1
 	case config.Heap4Ary:
 		return 2
@@ -31,14 +28,11 @@ func candidateBefore(a, b preloadCandidate) bool {
 	return a.due < b.due
 }
 
-// Typed heaps use the same entries and ordering as the original heap. A shift
+// All heaps use the same entries and ordering. A shift
 // selects 2, 4, or 8 children without division in the sift loops. Hole-based
 // sifting moves one entry per level rather than swapping two full candidates.
 func (h *candidateHeap) pushCandidate(candidate preloadCandidate, shift uint) {
-	if shift == 0 {
-		heap.Push(h, candidate)
-		return
-	}
+	shift = max(1, shift) // zero-value topic heaps also use typed binary operations
 	items := append(*h, candidate)
 	child := len(items) - 1
 	for child > 0 {
@@ -56,9 +50,6 @@ func (h *candidateHeap) pushCandidate(candidate preloadCandidate, shift uint) {
 // Callers check for an eligible head before popping. Clear the removed slot in
 // every implementation so drained backing arrays cannot retain payloads.
 func (h *candidateHeap) popCandidate(shift uint) preloadCandidate {
-	if shift == 0 {
-		return heap.Pop(h).(preloadCandidate)
-	}
 	items := *h
 	first := items[0]
 	last := len(items) - 1
@@ -66,7 +57,7 @@ func (h *candidateHeap) popCandidate(shift uint) preloadCandidate {
 	items[last] = preloadCandidate{}
 	items = items[:last]
 	if last > 0 {
-		items.siftCandidateDown(0, replacement, shift)
+		items.siftCandidateDown(0, replacement, max(1, shift))
 	}
 	*h = items
 	return first
@@ -97,10 +88,7 @@ func (h candidateHeap) siftCandidateDown(parent int, candidate preloadCandidate,
 // arity before the scheduler reads its head again; copying during compaction
 // alone preserves the heap shape and needs no rebuild.
 func (h *candidateHeap) initCandidates(shift uint) {
-	if shift == 0 {
-		heap.Init(h)
-		return
-	}
+	shift = max(1, shift)
 	if len(*h) < 2 {
 		return
 	}

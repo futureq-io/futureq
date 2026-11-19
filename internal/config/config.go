@@ -27,10 +27,9 @@ const (
 type HeapType string
 
 const (
-	HeapBinary      HeapType = "binary"
-	HeapTypedBinary HeapType = "typed-binary"
-	Heap4Ary        HeapType = "4ary"
-	Heap8Ary        HeapType = "8ary"
+	HeapBinary HeapType = "binary"
+	Heap4Ary   HeapType = "4ary"
+	Heap8Ary   HeapType = "8ary"
 )
 
 type Subscriptions struct {
@@ -463,9 +462,9 @@ func (c *Config) validatePublishAndDelivery() error {
 
 	d := c.Delivery
 	switch d.HeapType {
-	case HeapBinary, HeapTypedBinary, Heap4Ary, Heap8Ary:
+	case HeapBinary, Heap4Ary, Heap8Ary:
 	default:
-		return fmt.Errorf("delivery.heapType must be binary, typed-binary, 4ary, or 8ary")
+		return fmt.Errorf("delivery.heapType must be binary, 4ary, or 8ary")
 	}
 	if d.ReadPermit < 100*time.Millisecond || d.ReadPermit > 30*time.Second || d.ReadPermit%time.Millisecond != 0 {
 		return fmt.Errorf("delivery.readPermit must be whole milliseconds from 100ms to 30s")

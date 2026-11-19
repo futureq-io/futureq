@@ -82,7 +82,7 @@ publish:
   proposalTimeout: 5s
 
 delivery:
-  heapType: binary # binary (container/heap), typed-binary, 4ary, or 8ary; restart to change
+  heapType: binary # binary, 4ary, or 8ary; restart to change
   subscriptions:
     allowAutoAck: false # reject auto-ack streams unless explicitly allowed
     # No workers connected for this duration: discard the subscription/backlog.

@@ -13,7 +13,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-var candidateHeapTypes = []config.HeapType{config.HeapBinary, config.HeapTypedBinary, config.Heap4Ary, config.Heap8Ary}
+var candidateHeapTypes = []config.HeapType{config.HeapBinary, config.Heap4Ary, config.Heap8Ary}
 
 func heapTestCandidates(count int, equalDeadlines bool) candidateHeap {
 	items := make(candidateHeap, count)
@@ -131,7 +131,7 @@ func TestCandidateHeapRebuildAndCompaction(t *testing.T) {
 }
 
 func TestTypedCandidateHeapOperationsDoNotAllocate(t *testing.T) {
-	for _, kind := range candidateHeapTypes[1:] {
+	for _, kind := range candidateHeapTypes {
 		t.Run(string(kind), func(t *testing.T) {
 			shift := candidateHeapShift(kind)
 			h := heapTestCandidates(16384, false)
@@ -143,6 +143,26 @@ func TestTypedCandidateHeapOperationsDoNotAllocate(t *testing.T) {
 			})
 			require.Zero(t, allocs)
 		})
+	}
+}
+
+func TestZeroValueCandidateHeapUsesBinaryOrdering(t *testing.T) {
+	items := heapTestCandidates(128, false)
+	want := sortedHeapCandidates(items)
+	for _, rebuild := range []bool{false, true} {
+		var h candidateHeap
+		if rebuild {
+			h = slices.Clone(items)
+			h.initCandidates(0)
+		} else {
+			for _, item := range items {
+				h.pushCandidate(item, 0)
+			}
+		}
+		for _, expected := range want {
+			require.Equal(t, expected, h.popCandidate(0))
+		}
+		require.Empty(t, h)
 	}
 }
 

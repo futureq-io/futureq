@@ -64,8 +64,7 @@ state and require evidence of a scheduler bottleneck first.
 
 | Value | Implementation |
 | --- | --- |
-| `binary` (default) | Original binary heap using Go `container/heap` |
-| `typed-binary` | Typed binary heap without interface boxing |
+| `binary` (default) | Typed binary heap without interface boxing |
 | `4ary` | Typed heap with four children per node |
 | `8ary` | Typed heap with eight children per node |
 
@@ -76,6 +75,10 @@ eviction. Typed variants use hole-based sifting and clear popped payload slots.
 Heap choice does not enable speculative preloading; configure lookahead and
 capacity separately. Changing the selector requires a restart and rebuilds the
 local cache from authoritative storage.
+
+The former `typed-binary` selector is now named `binary`; update configurations
+using that old value. The interface-based `container/heap` implementation has
+been removed.
 
 Run the heap-only comparison with:
 

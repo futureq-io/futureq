@@ -125,7 +125,7 @@ are separate from application storage under `storage.pebble`.
 | Key                                 | Default | Description |
 | ----------------------------------- | ------- | ----------- |
 | `delivery.timeBucket`               | `1ms`   | Granularity of the key scheme's time buckets. `0` = raw-millisecond buckets (maximum precision). Otherwise must be ≥1ms. |
-| `delivery.heapType`                 | `binary` | Candidate heap for due and future messages: `binary` (original Go `container/heap`), `typed-binary`, `4ary`, or `8ary`. Applied at startup; restart to change. All choices order by exact due time, then message key. |
+| `delivery.heapType`                 | `binary` | Candidate heap for due and future messages: `binary` (typed binary), `4ary`, or `8ary`. Applied at startup; restart to change. All choices order by exact due time, then message key. |
 | `delivery.discoveryWorkers`          | `2`     | Independent storage discovery workers, `1..16`; at most one scan per topic. |
 | `delivery.preloadScanIdleMaxInterval` | `100ms` | Maximum speculative idle scan backoff. `0` disables it; must be nonnegative. The effective limit is at least the poll interval. Payload mutations reset backoff; due repair cadence is unchanged. |
 | `delivery.dispatchPollInterval`     | `5ms`   | Periodic live due-message scan interval, also used when preloading is enabled. |
