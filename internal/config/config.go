@@ -83,6 +83,8 @@ type Raft struct {
 	RTT                time.Duration     `mapstructure:"rtt" yaml:"rtt"`
 	SnapshotEntries    uint64            `mapstructure:"snapshotEntries" yaml:"snapshotEntries"`
 	CompactionOverhead uint64            `mapstructure:"compactionOverhead" yaml:"compactionOverhead"`
+	// LogDBWriteBufferSize is retained per Tan worker; 16 workers share the NodeHost.
+	LogDBWriteBufferSize Size `mapstructure:"logDBWriteBufferSize" yaml:"logDBWriteBufferSize"`
 }
 
 type Storage struct {
@@ -306,6 +308,10 @@ func (c *Config) validateCluster() error {
 	}
 	if cl.Raft.DataDir == "" || cl.Raft.RTT < time.Millisecond || cl.Raft.RTT%time.Millisecond != 0 || cl.Raft.SnapshotEntries == 0 || cl.Raft.CompactionOverhead == 0 {
 		return fmt.Errorf("cluster.raft requires dataDir, millisecond rtt, snapshotEntries, and compactionOverhead")
+	}
+	bufferBytes, err := cl.Raft.LogDBWriteBufferSize.Bytes()
+	if err != nil || bufferBytes > int64(int(^uint(0)>>1)) {
+		return fmt.Errorf("cluster.raft.logDBWriteBufferSize must be a positive supported size")
 	}
 	if len(cl.JoinSeeds) > 0 && len(cl.Raft.InitialMembers) > 0 {
 		return fmt.Errorf("cluster.joinSeeds and cluster.raft.initialMembers cannot both be set")

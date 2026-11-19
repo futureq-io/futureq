@@ -55,6 +55,7 @@ export FUTUREQ_CLUSTER_RAFT_INITIALMEMBERS='{1: "10.0.0.1:50005"}'
 | `cluster.raft.rtt`               | `200ms`         | Estimated inter-node round-trip time driving Dragonboat's timers. Whole milliseconds, ≥1ms. |
 | `cluster.raft.snapshotEntries`   | `10000`         | Take a state-machine snapshot after this many applied log entries. |
 | `cluster.raft.compactionOverhead`| `5000`          | Log entries retained above the snapshot index. |
+| `cluster.raft.logDBWriteBufferSize` | `4MiB` | Retained Tan serialization buffer per worker. Dragonboat has 16 workers, so the default retains 64MiB per broker. Larger individual updates use a temporary buffer. Override with `FUTUREQ_CLUSTER_RAFT_LOGDBWRITEBUFFERSIZE`. |
 
 ## storage
 

@@ -34,6 +34,9 @@ cluster:
     rtt: 200ms
     snapshotEntries: 10000
     compactionOverhead: 5000
+    # Retained serialization buffer per Tan worker (16 workers: 64MiB total).
+    # Oversized Raft updates allocate a larger temporary buffer as needed.
+    logDBWriteBufferSize: 4MiB
 
 storage:
   engine: pebble

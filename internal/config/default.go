@@ -17,6 +17,7 @@ var defaultConfig = Config{
 			Listen: "0.0.0.0:50005", Advertise: "", DataDir: "./raft-data",
 			InitialMembers: map[uint64]string{}, RTT: 200 * time.Millisecond,
 			SnapshotEntries: 10000, CompactionOverhead: 5000,
+			LogDBWriteBufferSize: "4MiB",
 		},
 	},
 	Storage: Storage{
