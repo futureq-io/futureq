@@ -70,8 +70,8 @@ Environment overrides follow the nesting, for example
 Raft storage; Dragonboat rejects incompatible saved partition settings.
 
 FutureQ uses the Tan backend, which directly consumes `kvWriteBufferSize` and
-retains **16 buffers regardless of the worker setting**. The `32MiB` default
-therefore retains **512MiB per broker**. Oversized updates use temporary
+retains **16 buffers regardless of the worker setting**. The `16MiB` default
+therefore retains **256MiB per broker**. Oversized updates use temporary
 allocations. Other KV/cache/level options are passed through to Dragonboat but
 belong to its other LogDB backends and have no effect on Tan. These settings
 are separate from application storage under `storage.pebble`.
@@ -84,7 +84,7 @@ are separate from application storage under `storage.pebble`.
 | `kvMaxBackgroundCompactions` | `2` |
 | `kvMaxBackgroundFlushes` | `2` |
 | `kvLRUCacheSize` | `0B` |
-| `kvWriteBufferSize` | `32MiB` |
+| `kvWriteBufferSize` | `16MiB` |
 | `kvMaxWriteBufferNumber` | `4` |
 | `kvLevel0FileNumCompactionTrigger` | `8` |
 | `kvLevel0SlowdownWritesTrigger` | `17` |

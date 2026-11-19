@@ -43,7 +43,7 @@ cluster:
       kvMaxBackgroundCompactions: 2
       kvMaxBackgroundFlushes: 2
       kvLRUCacheSize: 0B
-      # Tan retains 16 buffers regardless of workers: 512MiB at this default.
+      # Tan retains 16 buffers regardless of workers: 256MiB at this default.
       # Oversized updates allocate a larger temporary buffer as needed.
       kvWriteBufferSize: 16MiB
       kvMaxWriteBufferNumber: 4
