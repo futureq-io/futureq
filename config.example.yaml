@@ -34,9 +34,32 @@ cluster:
     rtt: 200ms
     snapshotEntries: 10000
     compactionOverhead: 5000
-    # Retained serialization buffer per Tan worker (16 workers: 64MiB total).
-    # Oversized Raft updates allocate a larger temporary buffer as needed.
-    logDBWriteBufferSize: 4MiB
+    logDB:
+      # Engine.ExecShards controls workers that persist Raft updates.
+      # Changing workers/shards requires fresh Raft storage.
+      workers: 16
+      shards: 16
+      kvKeepLogFileNum: 16
+      kvMaxBackgroundCompactions: 2
+      kvMaxBackgroundFlushes: 2
+      kvLRUCacheSize: 0B
+      # Tan retains 16 buffers regardless of workers: 512MiB at this default.
+      # Oversized updates allocate a larger temporary buffer as needed.
+      kvWriteBufferSize: 32MiB
+      kvMaxWriteBufferNumber: 4
+      kvLevel0FileNumCompactionTrigger: 8
+      kvLevel0SlowdownWritesTrigger: 17
+      kvLevel0StopWritesTrigger: 24
+      kvMaxBytesForLevelBase: 4GiB
+      kvMaxBytesForLevelMultiplier: 2
+      kvTargetFileSizeBase: 16MiB
+      kvTargetFileSizeMultiplier: 2
+      kvLevelCompactionDynamicLevelBytes: 0
+      kvRecycleLogFileNum: 0
+      kvNumOfLevels: 7
+      kvBlockSize: 32KiB
+      saveBufferSize: 32KiB
+      maxSaveBufferSize: 64MiB
 
 storage:
   engine: pebble

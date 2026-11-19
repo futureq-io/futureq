@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	raftconfig "github.com/lni/dragonboat/v4/config"
 	"github.com/spf13/viper"
 	"gopkg.in/yaml.v2"
 )
@@ -83,8 +84,81 @@ type Raft struct {
 	RTT                time.Duration     `mapstructure:"rtt" yaml:"rtt"`
 	SnapshotEntries    uint64            `mapstructure:"snapshotEntries" yaml:"snapshotEntries"`
 	CompactionOverhead uint64            `mapstructure:"compactionOverhead" yaml:"compactionOverhead"`
-	// LogDBWriteBufferSize is retained per Tan worker; 16 workers share the NodeHost.
-	LogDBWriteBufferSize Size `mapstructure:"logDBWriteBufferSize" yaml:"logDBWriteBufferSize"`
+	LogDB              LogDB             `mapstructure:"logDB" yaml:"logDB"`
+}
+
+// LogDB exposes every field of Dragonboat's LogDBConfig. Workers separately
+// controls Engine.ExecShards, whose workers call SaveRaftState. The active Tan
+// backend only consumes KVWriteBufferSize directly and retains 16 buffers.
+type LogDB struct {
+	Workers                            uint64 `mapstructure:"workers" yaml:"workers"`
+	Shards                             uint64 `mapstructure:"shards" yaml:"shards"`
+	KVKeepLogFileNum                   uint64 `mapstructure:"kvKeepLogFileNum" yaml:"kvKeepLogFileNum"`
+	KVMaxBackgroundCompactions         uint64 `mapstructure:"kvMaxBackgroundCompactions" yaml:"kvMaxBackgroundCompactions"`
+	KVMaxBackgroundFlushes             uint64 `mapstructure:"kvMaxBackgroundFlushes" yaml:"kvMaxBackgroundFlushes"`
+	KVLRUCacheSize                     Size   `mapstructure:"kvLRUCacheSize" yaml:"kvLRUCacheSize"`
+	KVWriteBufferSize                  Size   `mapstructure:"kvWriteBufferSize" yaml:"kvWriteBufferSize"`
+	KVMaxWriteBufferNumber             uint64 `mapstructure:"kvMaxWriteBufferNumber" yaml:"kvMaxWriteBufferNumber"`
+	KVLevel0FileNumCompactionTrigger   uint64 `mapstructure:"kvLevel0FileNumCompactionTrigger" yaml:"kvLevel0FileNumCompactionTrigger"`
+	KVLevel0SlowdownWritesTrigger      uint64 `mapstructure:"kvLevel0SlowdownWritesTrigger" yaml:"kvLevel0SlowdownWritesTrigger"`
+	KVLevel0StopWritesTrigger          uint64 `mapstructure:"kvLevel0StopWritesTrigger" yaml:"kvLevel0StopWritesTrigger"`
+	KVMaxBytesForLevelBase             Size   `mapstructure:"kvMaxBytesForLevelBase" yaml:"kvMaxBytesForLevelBase"`
+	KVMaxBytesForLevelMultiplier       uint64 `mapstructure:"kvMaxBytesForLevelMultiplier" yaml:"kvMaxBytesForLevelMultiplier"`
+	KVTargetFileSizeBase               Size   `mapstructure:"kvTargetFileSizeBase" yaml:"kvTargetFileSizeBase"`
+	KVTargetFileSizeMultiplier         uint64 `mapstructure:"kvTargetFileSizeMultiplier" yaml:"kvTargetFileSizeMultiplier"`
+	KVLevelCompactionDynamicLevelBytes uint64 `mapstructure:"kvLevelCompactionDynamicLevelBytes" yaml:"kvLevelCompactionDynamicLevelBytes"`
+	KVRecycleLogFileNum                uint64 `mapstructure:"kvRecycleLogFileNum" yaml:"kvRecycleLogFileNum"`
+	KVNumOfLevels                      uint64 `mapstructure:"kvNumOfLevels" yaml:"kvNumOfLevels"`
+	KVBlockSize                        Size   `mapstructure:"kvBlockSize" yaml:"kvBlockSize"`
+	SaveBufferSize                     Size   `mapstructure:"saveBufferSize" yaml:"saveBufferSize"`
+	MaxSaveBufferSize                  Size   `mapstructure:"maxSaveBufferSize" yaml:"maxSaveBufferSize"`
+}
+
+// DragonboatConfig converts byte quantities while preserving zero for options
+// where it disables a cache/limit. Worker/shard counts are stored in Raft's
+// compatibility flags and cannot be changed against existing Raft storage.
+func (c LogDB) DragonboatConfig() (raftconfig.LogDBConfig, error) {
+	maxInt := uint64(int(^uint(0) >> 1))
+	if c.Workers == 0 || c.Shards == 0 || c.Workers > maxInt || c.Shards > maxInt {
+		return raftconfig.LogDBConfig{}, fmt.Errorf("cluster.raft.logDB.workers and shards must be positive supported counts")
+	}
+	result := raftconfig.LogDBConfig{
+		Shards: c.Shards, KVKeepLogFileNum: c.KVKeepLogFileNum,
+		KVMaxBackgroundCompactions: c.KVMaxBackgroundCompactions, KVMaxBackgroundFlushes: c.KVMaxBackgroundFlushes,
+		KVMaxWriteBufferNumber:           c.KVMaxWriteBufferNumber,
+		KVLevel0FileNumCompactionTrigger: c.KVLevel0FileNumCompactionTrigger,
+		KVLevel0SlowdownWritesTrigger:    c.KVLevel0SlowdownWritesTrigger, KVLevel0StopWritesTrigger: c.KVLevel0StopWritesTrigger,
+		KVMaxBytesForLevelMultiplier: c.KVMaxBytesForLevelMultiplier, KVTargetFileSizeMultiplier: c.KVTargetFileSizeMultiplier,
+		KVLevelCompactionDynamicLevelBytes: c.KVLevelCompactionDynamicLevelBytes,
+		KVRecycleLogFileNum:                c.KVRecycleLogFileNum, KVNumOfLevels: c.KVNumOfLevels,
+	}
+	for _, field := range []struct {
+		name     string
+		size     Size
+		target   *uint64
+		positive bool
+	}{
+		{"kvLRUCacheSize", c.KVLRUCacheSize, &result.KVLRUCacheSize, false},
+		{"kvWriteBufferSize", c.KVWriteBufferSize, &result.KVWriteBufferSize, true},
+		{"kvMaxBytesForLevelBase", c.KVMaxBytesForLevelBase, &result.KVMaxBytesForLevelBase, false},
+		{"kvTargetFileSizeBase", c.KVTargetFileSizeBase, &result.KVTargetFileSizeBase, false},
+		{"kvBlockSize", c.KVBlockSize, &result.KVBlockSize, false},
+		{"saveBufferSize", c.SaveBufferSize, &result.SaveBufferSize, false},
+		{"maxSaveBufferSize", c.MaxSaveBufferSize, &result.MaxSaveBufferSize, false},
+	} {
+		var n int64
+		var err error
+		switch field.size {
+		case "0B", "0KiB", "0MiB", "0GiB":
+		default:
+			n, err = field.size.Bytes()
+		}
+		if err != nil || uint64(n) > maxInt || (field.positive && n == 0) {
+			return raftconfig.LogDBConfig{}, fmt.Errorf("cluster.raft.logDB.%s must be a supported size (kvWriteBufferSize must be positive)", field.name)
+		}
+		*field.target = uint64(n)
+	}
+	return result, nil
 }
 
 type Storage struct {
@@ -309,9 +383,8 @@ func (c *Config) validateCluster() error {
 	if cl.Raft.DataDir == "" || cl.Raft.RTT < time.Millisecond || cl.Raft.RTT%time.Millisecond != 0 || cl.Raft.SnapshotEntries == 0 || cl.Raft.CompactionOverhead == 0 {
 		return fmt.Errorf("cluster.raft requires dataDir, millisecond rtt, snapshotEntries, and compactionOverhead")
 	}
-	bufferBytes, err := cl.Raft.LogDBWriteBufferSize.Bytes()
-	if err != nil || bufferBytes > int64(int(^uint(0)>>1)) {
-		return fmt.Errorf("cluster.raft.logDBWriteBufferSize must be a positive supported size")
+	if _, err := cl.Raft.LogDB.DragonboatConfig(); err != nil {
+		return err
 	}
 	if len(cl.JoinSeeds) > 0 && len(cl.Raft.InitialMembers) > 0 {
 		return fmt.Errorf("cluster.joinSeeds and cluster.raft.initialMembers cannot both be set")

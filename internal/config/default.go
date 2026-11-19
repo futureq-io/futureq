@@ -17,7 +17,16 @@ var defaultConfig = Config{
 			Listen: "0.0.0.0:50005", Advertise: "", DataDir: "./raft-data",
 			InitialMembers: map[uint64]string{}, RTT: 200 * time.Millisecond,
 			SnapshotEntries: 10000, CompactionOverhead: 5000,
-			LogDBWriteBufferSize: "4MiB",
+			LogDB: LogDB{
+				Workers: 16, Shards: 16, KVKeepLogFileNum: 16,
+				KVMaxBackgroundCompactions: 2, KVMaxBackgroundFlushes: 2,
+				KVLRUCacheSize: "0B", KVWriteBufferSize: "32MiB", KVMaxWriteBufferNumber: 4,
+				KVLevel0FileNumCompactionTrigger: 8, KVLevel0SlowdownWritesTrigger: 17, KVLevel0StopWritesTrigger: 24,
+				KVMaxBytesForLevelBase: "4GiB", KVMaxBytesForLevelMultiplier: 2,
+				KVTargetFileSizeBase: "16MiB", KVTargetFileSizeMultiplier: 2,
+				KVLevelCompactionDynamicLevelBytes: 0, KVRecycleLogFileNum: 0, KVNumOfLevels: 7,
+				KVBlockSize: "32KiB", SaveBufferSize: "32KiB", MaxSaveBufferSize: "64MiB",
+			},
 		},
 	},
 	Storage: Storage{

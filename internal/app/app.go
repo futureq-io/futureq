@@ -151,11 +151,13 @@ func (a *App) StartRaft(join bool, onDeleteKeys func(keys [][]byte)) error {
 		ListenAddress:  cfg.Cluster.Raft.Listen,
 	}
 	nhc.Expert.LogDBFactory = leaderpersist.NewFactory(tracker)
-	logDBConfig, err := raftLogDBConfig(cfg.Cluster.Raft.LogDBWriteBufferSize)
+	logDBConfig, err := cfg.Cluster.Raft.LogDB.DragonboatConfig()
 	if err != nil {
 		return err
 	}
 	nhc.Expert.LogDB = logDBConfig
+	nhc.Expert.Engine = raftconfig.GetDefaultEngineConfig()
+	nhc.Expert.Engine.ExecShards = cfg.Cluster.Raft.LogDB.Workers
 
 	// We need the NodeHost reference to create the propose function, but
 	// Dragonboat needs the listeners at creation time. Use a forward reference:
@@ -294,20 +296,6 @@ func (a *App) StartRaft(join bool, onDeleteKeys func(keys [][]byte)) error {
 	}()
 
 	return nil
-}
-
-// Tan preallocates one serialization buffer per LogDB worker (16 workers).
-// Dragonboat's 128MiB default therefore retains 2GiB even for a small cluster,
-// exceeding the Go memory limit in typical broker pods. Tan allocates a larger
-// temporary buffer when an individual update exceeds this initial size.
-func raftLogDBConfig(size config.Size) (raftconfig.LogDBConfig, error) {
-	bufferBytes, err := size.Bytes()
-	if err != nil || bufferBytes > int64(int(^uint(0)>>1)) {
-		return raftconfig.LogDBConfig{}, fmt.Errorf("cluster.raft.logDBWriteBufferSize must be a positive supported size")
-	}
-	cfg := raftconfig.GetDefaultLogDBConfig()
-	cfg.KVWriteBufferSize = uint64(bufferBytes)
-	return cfg, nil
 }
 
 // HasRaftData reports whether local Raft data exists for this node.
