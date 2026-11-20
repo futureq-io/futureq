@@ -15,6 +15,7 @@ import (
 // Pebble holds an open pebble database and implements storage.DB.
 type Pebble struct {
 	revision atomic.Uint64
+	topics   topicRevisions
 	empty    pebbleEmptyRanges
 	db       *pebble.DB
 	logger   *zap.Logger
@@ -86,7 +87,7 @@ func (p *Pebble) Get(key []byte) ([]byte, io.Closer, error) {
 }
 
 func (p *Pebble) NewBatch() Batch {
-	return &pebbleBatch{b: p.db.NewBatch(), revision: &p.revision, empty: &p.empty}
+	return &pebbleBatch{b: p.db.NewBatch(), revision: &p.revision, topics: &p.topics, empty: &p.empty}
 }
 
 // NewIter opens a snapshot internally and returns an iterator scoped to it.
@@ -117,6 +118,24 @@ func (p *Pebble) NewIter(opts *IterOptions) (Iterator, error) {
 	}
 
 	return &pebbleIterator{iter: iter, snap: snap, empty: &p.empty, probe: probe}, nil
+}
+
+// NewIteratorSnapshot shares a snapshot across bounded scans. Iterators opened
+// later on this snapshot cannot use the empty-range cache, whose proofs track
+// the current DB state at the time a snapshot is captured.
+func (p *Pebble) NewIteratorSnapshot() IteratorSnapshot {
+	return pebbleIteratorSnapshot{Snapshot: p.db.NewSnapshot()}
+}
+
+type pebbleIteratorSnapshot struct {
+	*pebble.Snapshot
+}
+
+func (s pebbleIteratorSnapshot) NewIter(opts *IterOptions) (Iterator, error) {
+	if opts == nil {
+		return s.Snapshot.NewIter(nil)
+	}
+	return s.Snapshot.NewIter(&pebble.IterOptions{LowerBound: opts.LowerBound, UpperBound: opts.UpperBound})
 }
 
 func (p *Pebble) Scan(opts *IterOptions, yield func(key, value []byte) error) error {
@@ -154,18 +173,19 @@ func (p *Pebble) Close() error { return p.db.Close() }
 // ── pebbleBatch ───────────────────────────────────────────────────────────────
 
 type pebbleBatch struct {
-	empty      *pebbleEmptyRanges
-	sets       pebbleKeySpan
-	revision   *atomic.Uint64
-	payloadSet bool
-	b          *pebble.Batch
+	empty    *pebbleEmptyRanges
+	sets     pebbleKeySpan
+	revision *atomic.Uint64
+	topics   *topicRevisions
+	writes   eventTopicWrites
+	b        *pebble.Batch
 }
 
 func (pb *pebbleBatch) Set(key, value []byte) error {
 	pb.sets.include(key)
 	err := pb.b.Set(key, value, nil)
-	if err == nil && len(key) == 24 {
-		pb.payloadSet = true
+	if err == nil {
+		pb.writes.add(key)
 	}
 	return err
 }
@@ -186,7 +206,8 @@ func (pb *pebbleBatch) Commit(mode SyncMode) error {
 	if err := pb.b.Commit(opts); err != nil {
 		return err
 	}
-	if pb.payloadSet {
+	if pb.writes.set {
+		pb.topics.commit(pb.writes)
 		pb.revision.Add(1)
 	}
 	return nil
@@ -217,7 +238,10 @@ func (pi *pebbleIterator) First() bool {
 	}
 	return valid
 }
-func (pi *pebbleIterator) Last() bool    { return pi.iter.Last() }
+func (pi *pebbleIterator) Last() bool { return pi.iter.Last() }
+func (pi *pebbleIterator) SeekGE(key []byte) bool {
+	return pi.iter.SeekGE(key)
+}
 func (pi *pebbleIterator) Next() bool    { return pi.iter.Next() }
 func (pi *pebbleIterator) Valid() bool   { return pi.iter.Valid() }
 func (pi *pebbleIterator) Key() []byte   { return pi.iter.Key() }
@@ -244,5 +268,7 @@ var (
 )
 
 func (p *Pebble) CacheRevision() uint64 { return p.revision.Load() }
+
+func (p *Pebble) WatchTopic(hash uint64) *TopicRevision { return p.topics.watch(hash) }
 
 var _ CacheRevisioner = (*Pebble)(nil)

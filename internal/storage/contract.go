@@ -41,6 +41,29 @@ type CacheRevisioner interface {
 	CacheRevision() uint64
 }
 
+// TopicRevisioner tracks successful event writes by topic and shard while
+// discovery holds a watch. The caller closes the watch when dropping its state.
+type TopicRevisioner interface {
+	WatchTopic(topicHash uint64) *TopicRevision
+}
+
+// IteratorSource opens independently positioned iterators.
+type IteratorSource interface {
+	NewIter(*IterOptions) (Iterator, error)
+}
+
+// IteratorSnapshot is a read view that can open iterators concurrently. Close
+// it after every iterator created from it has been closed.
+type IteratorSnapshot interface {
+	IteratorSource
+	io.Closer
+}
+
+// IteratorSnapshotter optionally gives parallel scans one point-in-time view.
+type IteratorSnapshotter interface {
+	NewIteratorSnapshot() IteratorSnapshot
+}
+
 // Iterator is a cursor over a sorted key-value range.
 // Callers must call Close when done to release underlying resources.
 //
@@ -54,6 +77,9 @@ type Iterator interface {
 
 	// Last positions at the last key respecting both bounds. First may restart it.
 	Last() bool
+
+	// SeekGE positions at the least key greater than or equal to key within bounds.
+	SeekGE(key []byte) bool
 
 	// Next advances the iterator to the next key.
 	// Returns true if a key is found.

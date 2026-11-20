@@ -18,20 +18,47 @@ Every message is stored under a 24-byte, big-endian, lexicographically sortable 
 | Bytes   | Field       | Meaning |
 | ------- | ----------- | ------- |
 | 0..8    | `topicHash` | xxhash64 of the topic name |
-| 8..16   | `bucket`    | Time bucket = `fireAtMs / timeBucket`, where `fireAtMs = enqueuedAtMs + delayMs`. With `timeBucket = 0`, raw milliseconds are used (max precision). |
+| 8..16   | `bucket`    | The time bucket, with a virtual shard slot ahead of it for sharded publishes. The time bucket is `(enqueuedAtMs + delayMs) / timeBucket`. With `timeBucket = 0`, raw milliseconds are used. |
 | 16..24  | `eventID`   | Monotonic ID finalized in Raft log order, or reserved by the standalone event repository |
 
-The sort order is therefore *topic → time bucket → ID*, which makes "give me everything due for topic X before now" a single range scan between two computed bounds:
-
-| Helper             | Bound |
-| ------------------ | ----- |
-| `TopicLowerBound`  | `[topicHash]` — inclusive |
-| `TopicUpperBound`  | `[topicHash + 1]` — exclusive |
-| `DueUpperBound`    | `[topicHash][maxBucket + 1]` — exclusive; future buckets are never scanned |
+Unsharded keys sort by topic, time bucket, and ID. Sharded keys sort by topic,
+shard slot, time bucket, and ID. The high bit of the bucket field marks a
+sharded key. The next eight bits contain the count plus the zero-based shard
+ordinal. The remaining 55 bits contain the time bucket. Larger time buckets
+use the unsharded layout.
 
 The stored value is the protobuf `StoredMessage` (topic, payload, enqueue time, delay, TTL, indexes). The 24-byte key doubles as the opaque `delivery_tag` consumers receive and echo back on ACK.
 
 Delivery preparation and ACK commands, preparation results, and persisted delivery receipts use Protobuf exclusively. Receipts have an `FQR` version-1 prefix, and batch preparation results have an `FQP` version-1 prefix. JSON delivery formats are no longer supported; development data containing them must be reset, including databases, Raft logs, and snapshots. The removed delivery command numbers (2, 3, and 4) remain reserved. Consumer membership and consumer snapshot metadata still use JSON.
+
+## Virtual delivery shards
+
+The event leader chooses a uniform random shard for each published message and
+includes the packed bucket in its Raft command. Every replica stores the same
+key and payload. Each named group divides each layout into contiguous runs of
+shards, ordered by replica ID. `delivery.shardDistribution` defaults to
+`consumerCount`, which weights replicas by the group's worker counts.
+`replicaCount` gives equal weight to each replica with consumers in the group.
+The owning replica selects one of its committed local workers using the Hub's
+dispatch strategy. Discovery and preload seek past shards outside the union of
+the local groups' ranges. Local universal subscribers need every shard. For
+unsharded keys and layouts with fewer shards than serving replicas, the group
+uses event ID modulo the worker count or the serving replica count, according
+to the selected policy.
+
+To change the policy, update the config on all cluster nodes and restart them.
+The metadata leader commits its configured policy, then the existing rebalance
+fences in-flight delivery before activating the new ownership for queued and
+new messages. During a rollout, the elected metadata leader's config determines
+the desired policy.
+
+Change `storage.virtualShards` on the nodes and restart them to change the
+layout used by the event leader for new publishes. During a rollout, each
+message's key identifies its own layout. Existing messages drain at their
+original keys, including when the count is reduced or set to zero. Worker or
+replica membership changes recalculate ownership for every layout under the
+existing rebalance fence. A size change requires no data copy or delivery-tag
+rewrite. The option applies to clustered publishes.
 
 ## Engines
 

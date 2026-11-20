@@ -1,6 +1,10 @@
 package config
 
-import "time"
+import (
+	"time"
+
+	"github.com/futureq-io/futureq/pkg/raft/metadata"
+)
 
 var defaultConfig = Config{
 	ConfigVersion: 1,
@@ -30,16 +34,18 @@ var defaultConfig = Config{
 		},
 	},
 	Storage: Storage{
-		Engine: "pebble",
+		Engine: "pebble", VirtualShards: 64,
 		Pebble: Pebble{Mode: "disk", DataDir: "./data", WALEnabled: true, CacheSize: "16MiB", MemtableSize: "64MiB", CompactionConcurrency: 1},
 		Bolt:   Bolt{File: "./data/futureq.db", Bucket: "futureq"},
 	},
 	Publish: Publish{MinAckLevel: Quorum, ProposalTimeout: 5 * time.Second},
 	Delivery: Delivery{
+		ShardDistribution:          metadata.ShardDistributionConsumerCount,
 		HeapType:                   HeapBinary,
 		Subscriptions:              Subscriptions{RenewalWorkers: 4, DisconnectWorkers: 1},
 		ConsumerRemovalWorkers:     1,
 		DiscoveryWorkers:           2,
+		ShardWorkers:               1,
 		PreloadScanIdleMaxInterval: 0 * time.Millisecond,
 		ConsumerQueueSize:          1024,
 		TimeBucket:                 time.Millisecond,

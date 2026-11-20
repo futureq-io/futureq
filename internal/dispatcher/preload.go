@@ -64,6 +64,7 @@ type topicPreload struct {
 	repairGeneration uint64       // fences cursor resets against older scan results
 	valid            *atomic.Bool // optional generation fence, set by the production owner
 	epoch            uint64
+	assignmentEpoch  uint64
 	after            []byte // independent of the live due cursor; never a watermark
 	items            candidateHeap
 	keyMu            sync.RWMutex // protects keys only; never held across storage or Hub calls
@@ -71,6 +72,17 @@ type topicPreload struct {
 	scanNext         bool
 	futureScanAfter  time.Time // scheduler-owned speculative scan deadline
 	futureScanIdle   time.Duration
+	shardScans       []shardScanState // scheduler-owned cursors for parallel discovery
+	nextShardScan    int
+	nextDueShardScan int
+	sharded          bool
+	layouts          int
+	layoutRevision   uint64
+	layoutProbeAt    time.Time
+	revision         uint64
+	revisionWatch    *storage.TopicRevision
+	shardRevisions   *storage.TopicRevisionSnapshot
+	dueBeforeRefresh bool
 }
 
 // Discovery reads this small synchronized index without copying the entire
@@ -167,8 +179,7 @@ func (d *Dispatcher) collectPreloaded(topic string, p *topicPreload, view Intere
 			metrics.DeliveryRejectedTotal.WithLabelValues("prepare_bytes").Inc()
 			break // retry on bounded backoff with a fresh recipient view
 		}
-		owners := view.localOwners(item.Key)
-		if len(owners) == 0 || !d.hub.hasReadyOwner(owners, item.Key) {
+		if _, ready := d.hub.hasReadyOwner(view, item.Key); !ready {
 			continue
 		}
 		commandSize.Add(item)
@@ -194,7 +205,7 @@ func (d *Dispatcher) collectPreloaded(topic string, p *topicPreload, view Intere
 // true only when the range was exhausted without an iterator error.
 func (d *Dispatcher) preloadTopic(topic string, p *topicPreload, view InterestView, nowMs int64) bool {
 	defer d.observePreload()
-	if d.preloadCount >= d.PreloadMaxMessages {
+	if !view.Active || !d.shardScan.matches(view) || d.preloadCount >= d.PreloadMaxMessages {
 		return false
 	}
 	started := time.Now()
@@ -211,11 +222,17 @@ func (d *Dispatcher) preloadTopic(topic string, p *topicPreload, view InterestVi
 		horizon = int64(^uint64(0) >> 1)
 	}
 	hash := utils.TopicHash(topic)
-	lower := utils.EventKey(utils.CalculateBucket(nowMs, d.TimeBucket), hash, 0)
+	earliest := utils.CalculateBucket(nowMs, d.TimeBucket)
+	last := utils.CalculateBucket(horizon, d.TimeBucket)
+	lower := utils.EventKey(earliest, hash, 0)
 	if bytes.Compare(p.after, lower) > 0 {
 		lower = p.after
 	}
-	iter, err := d.db.NewIter(&storage.IterOptions{LowerBound: lower, UpperBound: utils.DueUpperBound(hash, utils.CalculateBucket(horizon, d.TimeBucket))})
+	var upper []byte
+	if !view.sharded {
+		upper = utils.DueUpperBound(hash, last)
+	}
+	iter, err := openDiscoveryIterator(d.discoverySource(), view, hash, lower, upper, earliest, last, started.Add(d.Limits.WorkTime), d.shardScan)
 	if err != nil {
 		d.logger.Warn("preload iterator failed", zap.Error(err))
 		return false
@@ -224,7 +241,8 @@ func (d *Dispatcher) preloadTopic(topic string, p *topicPreload, view InterestVi
 	examined, bytesRead := 0, 0
 	valid := iter.First()
 	for valid {
-		if d.preloadCount >= d.PreloadMaxMessages || examined >= d.Limits.Examined || bytesRead >= d.Limits.Bytes || (examined > 0 && time.Since(started) >= d.Limits.WorkTime) || !d.hub.DeliveryPermitted() {
+		if d.scanPayload.full() || d.preloadCount >= d.PreloadMaxMessages || examined >= d.Limits.Examined || bytesRead >= d.Limits.Bytes ||
+			(examined > 0 && time.Since(started) >= d.Limits.WorkTime) || !d.hub.DeliveryPermitted() {
 			break
 		}
 		key := iter.Key()
@@ -238,7 +256,7 @@ func (d *Dispatcher) preloadTopic(topic string, p *topicPreload, view InterestVi
 				valid = iter.Next()
 				continue
 			}
-			if len(view.localOwners(key)) == 0 {
+			if !view.hasLocalOwner(key) {
 				filtered++
 				valid = iter.Next()
 				continue
@@ -258,6 +276,10 @@ func (d *Dispatcher) preloadTopic(topic string, p *topicPreload, view InterestVi
 				valid = iter.Next()
 				continue
 			}
+			if !d.scanPayload.reserve(len(value)) {
+				p.after = append(p.after[:0], key...)
+				break
+			}
 			payload, err := cachePayload(value)
 			if err == nil {
 				msg := payload.message
@@ -273,14 +295,19 @@ func (d *Dispatcher) preloadTopic(topic string, p *topicPreload, view InterestVi
 		}
 		valid = iter.Next()
 	}
-	if !valid || iter.Error() != nil {
+	if iter.resumeAt != nil {
+		p.after = iter.resumeAt
+	} else if !valid || iter.Error() != nil {
 		p.after = nil
 	}
-	return !valid && iter.Error() == nil
+	return !valid && iter.resumeAt == nil && iter.Error() == nil
 }
 
 func (d *Dispatcher) dropPreload(topic string) {
 	if p := d.preloads[topic]; p != nil {
+		if p.revisionWatch != nil {
+			p.revisionWatch.Close()
+		}
 		if p.valid != nil {
 			p.valid.Store(false)
 		}
@@ -372,5 +399,5 @@ func (d *Dispatcher) releaseReady(topic string, p *topicPreload) {
 	p.items.initCandidates(p.heapShift)
 	p.compact()
 	p.repairGeneration++
-	delete(d.cursors, topic)
+	d.forgetCursor(topic)
 }

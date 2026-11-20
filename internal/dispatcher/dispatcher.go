@@ -30,16 +30,22 @@ type inFlightEntry struct {
 //   - Performs TTL checks at dispatch time; expired messages are batched for deletion
 //   - Snapshot-based iteration (never blocks concurrent writes)
 type Dispatcher struct {
-	skipKeys        func([24]byte) bool // synchronized preload lookup, isolated discovery adapter only
-	scanOnly        bool                // isolated worker adapter never publishes scheduler gauges
-	db              storage.DB
-	hub             *Hub
-	deleter         *Deleter
-	logger          *zap.Logger
-	interval        time.Duration
-	inFlightTimeout time.Duration
-	wakeCh          chan struct{}
-	inFlight        sync.Map // key: string(pebbleKey) → *inFlightEntry
+	skipKeys           func([24]byte) bool // synchronized preload lookup, isolated discovery adapter only
+	scanOnly           bool                // isolated worker adapter never publishes scheduler gauges
+	shardScan          *shardScanRange     // immutable range assigned to an isolated discovery worker
+	scanSource         storage.IteratorSource
+	scanRevision       uint64
+	scanShardRevisions *storage.TopicRevisionSnapshot
+	scanPayload        scanPayloadAdmission
+	tracksScanRevision bool
+	db                 storage.DB
+	hub                *Hub
+	deleter            *Deleter
+	logger             *zap.Logger
+	interval           time.Duration
+	inFlightTimeout    time.Duration
+	wakeCh             chan struct{}
+	inFlight           sync.Map // key: string(pebbleKey) → *inFlightEntry
 	// Installed before Run. Cluster reads also refresh the bounded metadata permit.
 	ReadBarrier                func() error
 	PrepareDelivery            func(string, []byte) (*raft.DeliveryState, error) // legacy single-key hook
@@ -51,6 +57,7 @@ type Dispatcher struct {
 	TimeBucket                 time.Duration
 	cursors                    map[string]*scanCursor // owned by the scheduler
 	DiscoveryWorkers           int
+	ShardWorkers               int
 	PreloadScanIdleMaxInterval time.Duration
 	PreloadLookahead           time.Duration
 	PreloadMaxMessages         int
@@ -78,6 +85,7 @@ func NewDispatcher(
 	return &Dispatcher{
 		HeapType:                   defaults.HeapType,
 		DiscoveryWorkers:           defaults.DiscoveryWorkers,
+		ShardWorkers:               defaults.ShardWorkers,
 		PreloadScanIdleMaxInterval: defaults.PreloadScanIdleMaxInterval,
 		db:                         db,
 		hub:                        hub,

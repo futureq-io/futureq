@@ -10,6 +10,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/futureq-io/futureq/pkg/raft/metadata"
+	"github.com/futureq-io/futureq/pkg/utils"
 	raftconfig "github.com/lni/dragonboat/v4/config"
 	"github.com/spf13/viper"
 	"gopkg.in/yaml.v2"
@@ -161,9 +163,10 @@ func (c LogDB) DragonboatConfig() (raftconfig.LogDBConfig, error) {
 }
 
 type Storage struct {
-	Engine string `mapstructure:"engine" yaml:"engine"`
-	Pebble Pebble `mapstructure:"pebble" yaml:"pebble"`
-	Bolt   Bolt   `mapstructure:"bolt" yaml:"bolt"`
+	Engine        string `mapstructure:"engine" yaml:"engine"`
+	VirtualShards int    `mapstructure:"virtualShards" yaml:"virtualShards"`
+	Pebble        Pebble `mapstructure:"pebble" yaml:"pebble"`
+	Bolt          Bolt   `mapstructure:"bolt" yaml:"bolt"`
 }
 
 type Pebble struct {
@@ -186,9 +189,12 @@ type Publish struct {
 }
 
 type Delivery struct {
+	ShardDistribution metadata.ShardDistribution `mapstructure:"shardDistribution" yaml:"shardDistribution"`
+
 	Subscriptions              Subscriptions `mapstructure:"subscriptions" yaml:"subscriptions"`
 	HeapType                   HeapType      `mapstructure:"heapType" yaml:"heapType"`
 	DiscoveryWorkers           int           `mapstructure:"discoveryWorkers" yaml:"discoveryWorkers"`
+	ShardWorkers               int           `mapstructure:"shardWorkers" yaml:"shardWorkers"`
 	PreloadScanIdleMaxInterval time.Duration `mapstructure:"preloadScanIdleMaxInterval" yaml:"preloadScanIdleMaxInterval"`
 	ConsumerQueueSize          int           `mapstructure:"consumerQueueSize" yaml:"consumerQueueSize"`
 	TimeBucket                 time.Duration `mapstructure:"timeBucket" yaml:"timeBucket"`
@@ -405,6 +411,9 @@ func (c *Config) validateCluster() error {
 }
 
 func (c *Config) validateStorage() error {
+	if !utils.ValidVirtualShardCount(c.Storage.VirtualShards) {
+		return fmt.Errorf("storage.virtualShards must be zero or a power of two from 2 through %d", utils.MaxVirtualShards)
+	}
 	switch c.Storage.Engine {
 	case "pebble":
 		p := c.Storage.Pebble
@@ -436,6 +445,9 @@ func (c *Config) validateStorage() error {
 }
 
 func (c *Config) validatePublishAndDelivery() error {
+	if !c.Delivery.ShardDistribution.Valid() {
+		return fmt.Errorf("delivery.shardDistribution must be consumerCount or replicaCount")
+	}
 	if c.Delivery.Subscriptions.DisconnectTimeout < 0 || c.Delivery.Subscriptions.DisconnectTimeout%time.Millisecond != 0 {
 		return fmt.Errorf("delivery.subscriptions.disconnectTimeout must be zero (forever) or a positive whole number of milliseconds")
 	}
@@ -471,6 +483,9 @@ func (c *Config) validatePublishAndDelivery() error {
 	}
 	if d.DiscoveryWorkers < 1 || d.DiscoveryWorkers > 16 {
 		return fmt.Errorf("delivery.discoveryWorkers must be 1..16")
+	}
+	if d.ShardWorkers < 1 {
+		return fmt.Errorf("delivery.shardWorkers must be positive")
 	}
 	if d.PreloadScanIdleMaxInterval < 0 {
 		return fmt.Errorf("delivery.preloadScanIdleMaxInterval must be nonnegative")

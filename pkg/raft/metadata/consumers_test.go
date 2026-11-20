@@ -73,6 +73,37 @@ func TestConsumerMembershipSnapshotAndReconcile(t *testing.T) {
 	require.False(t, recovered.ConsumerActive("orders", "workers", "orphan"))
 }
 
+func TestShardDistributionSurvivesSnapshotAndRejectsStaleChanges(t *testing.T) {
+	sm := newSM()
+	require.Equal(t, ShardDistributionConsumerCount, sm.ShardDistribution())
+	applyConsumerChange(t, sm, "add", "worker", 1)
+	finishConsumerRebalance(t, sm)
+	epoch, _ := sm.ConsumerVersion()
+	apply := func(policy ShardDistribution, expected uint64) uint64 {
+		t.Helper()
+		cmd, err := marshalConsumerChange(consumerChange{Operation: setShardDistribution, ShardDistribution: policy, ExpectedEpoch: expected, Required: []uint64{1, 2}})
+		require.NoError(t, err)
+		result, err := sm.Update(statemachine.Entry{Cmd: cmd})
+		require.NoError(t, err)
+		return result.Value
+	}
+	require.Zero(t, apply(ShardDistributionReplicaCount, epoch-1))
+	require.EqualValues(t, 1, apply(ShardDistributionReplicaCount, epoch))
+	frozen, active := sm.ConsumerVersion()
+	require.False(t, active)
+	require.Zero(t, apply(ShardDistributionConsumerCount, frozen))
+	finishConsumerRebalance(t, sm)
+	require.Zero(t, apply(ShardDistributionReplicaCount, frozen))
+	var snapshot bytes.Buffer
+	require.NoError(t, sm.SaveSnapshot(&snapshot, nil, nil))
+	restored := newSM()
+	require.NoError(t, restored.RecoverFromSnapshot(&snapshot, nil, nil))
+	require.Equal(t, ShardDistributionReplicaCount, restored.ShardDistribution())
+	require.EqualValues(t, 1, apply(ShardDistributionConsumerCount, frozen))
+	finishConsumerRebalance(t, sm)
+	require.Equal(t, ShardDistributionConsumerCount, sm.ShardDistribution())
+}
+
 func TestConsumerMembershipPrunesDepartedNode(t *testing.T) {
 	sm := newSM()
 	applyConsumerChange(t, sm, "add", "a", 1)

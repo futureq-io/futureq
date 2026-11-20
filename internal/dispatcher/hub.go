@@ -5,15 +5,18 @@ import (
 	"encoding/binary"
 	"fmt"
 	"hash/fnv"
+	"iter"
 	"math"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/futureq-io/futureq/internal/metrics"
 	raft "github.com/futureq-io/futureq/internal/raft/event"
 	"github.com/futureq-io/futureq/internal/storage"
 	"github.com/futureq-io/futureq/pkg/raft/metadata"
+	"github.com/futureq-io/futureq/pkg/utils"
 	pb "github.com/futureq-io/protocol/proto/go"
 	"go.uber.org/zap"
 )
@@ -102,6 +105,8 @@ type TopicSubscription struct {
 	// own their maps/slices and remain immutable across later mutations.
 	groupsView    map[string][]*ConsumerEntry
 	universalView []*ConsumerEntry
+	assignment    atomic.Pointer[topicAssignment]
+	assignmentMu  sync.Mutex
 }
 
 // newTopicSubscription returns an empty TopicSubscription.
@@ -158,6 +163,7 @@ func (ts *TopicSubscription) universalSnapshot() []*ConsumerEntry {
 }
 
 func (ts *TopicSubscription) rebuildSnapshots() {
+	ts.assignment.Store(nil)
 	groups := make(map[string][]*ConsumerEntry, len(ts.groups))
 	for id, consumers := range ts.groups {
 		groups[id] = append([]*ConsumerEntry(nil), consumers...)
@@ -192,12 +198,15 @@ type Hub struct {
 	// deliveryMu fences every delivery against a metadata Raft rebalance.
 	deliveryMu      sync.RWMutex
 	groupMembers    func(topic, group string) []metadata.ConsumerMember
+	localReplica    uint64
+	distribution    func() metadata.ShardDistribution
 	deliveryView    func(string) metadata.TopicDeliveryView
 	version         func() (uint64, bool)
 	permitEpoch     uint64
 	permitUntil     time.Time
 	readPermit      time.Duration
 	registryEpoch   uint64
+	assignmentEpoch uint64
 	inFlightTimeout time.Duration
 
 	// topics: topic → *TopicSubscription
@@ -232,7 +241,33 @@ func (h *Hub) WithConsumerRegistry(apply func() error) error {
 func (h *Hub) SetGroupMembership(source func(topic, group string) []metadata.ConsumerMember) {
 	h.deliveryMu.Lock()
 	h.groupMembers = source
+	h.assignmentEpoch++
 	h.deliveryMu.Unlock()
+}
+
+// SetLocalReplica enables virtual-shard discovery on a clustered hub, even
+// when the producer's current configuration writes another layout.
+func (h *Hub) SetLocalReplica(nodeID uint64) {
+	h.deliveryMu.Lock()
+	defer h.deliveryMu.Unlock()
+	h.localReplica = nodeID
+	h.assignmentEpoch++
+}
+
+// SetShardDistribution installs the committed policy source alongside the
+// membership source. The metadata barrier excludes updates during delivery.
+func (h *Hub) SetShardDistribution(source func() metadata.ShardDistribution) {
+	h.deliveryMu.Lock()
+	defer h.deliveryMu.Unlock()
+	h.distribution = source
+	h.assignmentEpoch++
+}
+
+func (h *Hub) shardDistribution() metadata.ShardDistribution {
+	if h.localReplica == 0 || h.distribution == nil {
+		return metadata.ShardDistributionConsumerCount
+	}
+	return h.distribution()
 }
 
 // WithRebalanceBarrier waits for active local sends, then applies a Raft
@@ -251,6 +286,7 @@ func (h *Hub) WithConsumerBarrier(apply func() bool) {
 	defer h.deliveryMu.Unlock()
 	if apply() {
 		h.permitUntil = time.Time{}
+		h.assignmentEpoch++
 	}
 }
 
@@ -388,9 +424,26 @@ func (h *Hub) DispatchPrepared(topic string, msg *pb.QueueMessage, deliveryTag [
 	// Snapshot groups and universal consumers while holding the lock.
 	groups := sub.groupSnapshot()
 	universal := sub.universalSnapshot()
+	var assignment *topicAssignment
+	if h.groupMembers != nil && h.deliveryView != nil && h.version != nil {
+		assignment = h.topicAssignmentLocked(topic, sub)
+		if assignment == nil {
+			h.mu.RUnlock()
+			return nil
+		}
+	}
 	h.mu.RUnlock()
 
 	sentTo := make([]string, 0, len(groups)+len(universal))
+	slot := utils.EventShardSlot(deliveryTag)
+	var shardCount int
+	if slot != 0 && h.localReplica != 0 {
+		shardCount = utils.SlotShardCount(slot)
+	}
+	distribution := metadata.ShardDistributionConsumerCount
+	if assignment == nil {
+		distribution = h.shardDistribution()
+	}
 
 	// Dispatch to each group — strategy picks one consumer per group.
 	for gid, consumers := range groups {
@@ -398,25 +451,22 @@ func (h *Hub) DispatchPrepared(topic string, msg *pb.QueueMessage, deliveryTag [
 			continue
 		}
 		var selected *ConsumerEntry
-		if h.groupMembers != nil {
+		var eligible []*ConsumerEntry
+		if assignment != nil {
+			if group, ok := assignment.groups[gid]; ok {
+				selected, eligible = h.assignedWorker(group, msg, deliveryTag, slot, shardCount)
+			}
+		} else if h.groupMembers != nil {
 			members := h.groupMembers(topic, gid)
 			if len(members) == 0 {
 				continue // no committed assignment, or rebalance is pending
 			}
-			owner := members[deliveryOrdinal(deliveryTag)%uint64(len(members))].ID
-			for _, consumer := range consumers {
-				if consumer.ID == owner {
-					selected = consumer
-					break
-				}
-			}
+			selected, eligible = h.groupWorker(members, consumers, msg, deliveryTag, slot, shardCount, distribution)
 		} else {
 			selected = h.strategy.Select(consumers, msg)
+			eligible = consumers
 		}
-		if selected == nil {
-			continue
-		}
-		if h.trySend(selected, msg, deliveryTag) {
+		if selected != nil && h.trySendGroup(selected, eligible, msg, deliveryTag) {
 			sentTo = append(sentTo, gid)
 		}
 	}
@@ -426,12 +476,36 @@ func (h *Hub) DispatchPrepared(topic string, msg *pb.QueueMessage, deliveryTag [
 		if manifest != nil && !manifest.Needs(metadata.DeliveryRecipient("", c.ID)) {
 			continue
 		}
-		if h.trySend(c, msg, deliveryTag) {
+		if h.trySend(c, msg, deliveryTag) == sendAccepted {
 			sentTo = append(sentTo, "")
 		}
 	}
 
 	return sentTo
+}
+
+func (h *Hub) groupWorker(members []metadata.ConsumerMember, consumers []*ConsumerEntry, msg *pb.QueueMessage, key []byte, slot, count int, distribution metadata.ShardDistribution) (*ConsumerEntry, []*ConsumerEntry) {
+	if count > 0 || distribution == metadata.ShardDistributionReplicaCount {
+		replica := describeReplica(members, h.localReplica, distribution)
+		if replica.usesReplicaWorkers(count) {
+			if !replica.owns(slot, count, key) {
+				return nil, nil
+			}
+			eligible := replica.localWorkers(members, consumers)
+			return h.strategy.Select(eligible, msg), eligible
+		}
+	}
+	return moduloWorker(members, consumers, key), nil
+}
+
+func moduloWorker(members []metadata.ConsumerMember, consumers []*ConsumerEntry, key []byte) *ConsumerEntry {
+	id := members[deliveryOrdinal(key)%uint64(len(members))].ID
+	for _, consumer := range consumers {
+		if consumer.ID == id {
+			return consumer
+		}
+	}
+	return nil
 }
 
 // deliveryOrdinal is the event ID in the topic-first storage key. Using the
@@ -445,28 +519,80 @@ func deliveryOrdinal(tag []byte) uint64 {
 	return h.Sum64()
 }
 
-// trySend attempts to deliver a message to a single consumer. Returns true on
-// success. Tracks the delivery tag as in-flight for the consumer.
-func (h *Hub) trySend(c *ConsumerEntry, msg *pb.QueueMessage, deliveryTag []byte) bool {
+type sendOutcome uint8
+
+const (
+	sendAccepted sendOutcome = iota
+	sendAlreadyInFlight
+	sendQueueFull
+	sendWorkerAtLimit
+)
+
+func (h *Hub) trySendGroup(selected *ConsumerEntry, eligible []*ConsumerEntry, msg *pb.QueueMessage, deliveryTag []byte) bool {
+	reservation := groupDeliveryKey{topic: selected.Topic, group: selected.Group, key: string(deliveryTag)}
 	h.inFlightMu.Lock()
-	defer h.inFlightMu.Unlock()
-	reservation := groupDeliveryKey{topic: c.Topic, group: c.Group, key: string(deliveryTag)}
-	if c.Group != "" {
-		if _, exists := h.groupInFlight[reservation]; exists {
-			return false
+	outcome := h.trySendGroupLocked(selected, eligible, msg, deliveryTag, reservation)
+	h.inFlightMu.Unlock()
+	h.reportSendRejection(selected, outcome)
+	return outcome == sendAccepted
+}
+
+func (h *Hub) trySendGroupLocked(selected *ConsumerEntry, eligible []*ConsumerEntry, msg *pb.QueueMessage, deliveryTag []byte, reservation groupDeliveryKey) sendOutcome {
+	if _, exists := h.groupInFlight[reservation]; exists {
+		return sendAlreadyInFlight
+	}
+	outcome := h.enqueueLocked(selected, msg, deliveryTag, reservation)
+	if outcome == sendAccepted || outcome == sendAlreadyInFlight || len(eligible) <= 1 {
+		return outcome
+	}
+	// The strategy gets the first attempt. Walk the remaining eligible
+	// workers once while holding the reservation lock.
+	start := 0
+	for i, worker := range eligible {
+		if worker == selected {
+			start = i + 1
+			break
 		}
 	}
-	if h.deliveryRecords[c.ID] == nil {
-		h.deliveryRecords[c.ID] = make(map[string]deliveryRecord)
+	for offset := range len(eligible) {
+		worker := eligible[(start+offset)%len(eligible)]
+		if worker == selected {
+			continue
+		}
+		switch result := h.enqueueLocked(worker, msg, deliveryTag, reservation); result {
+		case sendAccepted, sendAlreadyInFlight:
+			return result
+		case sendQueueFull:
+			outcome = sendQueueFull
+		}
 	}
+	return outcome
+}
+
+// trySend delivers to an independent universal recipient.
+func (h *Hub) trySend(c *ConsumerEntry, msg *pb.QueueMessage, deliveryTag []byte) sendOutcome {
+	reservation := groupDeliveryKey{key: string(deliveryTag)}
+	h.inFlightMu.Lock()
+	outcome := h.enqueueLocked(c, msg, deliveryTag, reservation)
+	h.inFlightMu.Unlock()
+	h.reportSendRejection(c, outcome)
+	return outcome
+}
+
+// enqueueLocked publishes the delivery and installs its reservation while
+// the caller holds inFlightMu. A group checks that reservation before trying workers.
+func (h *Hub) enqueueLocked(c *ConsumerEntry, msg *pb.QueueMessage, deliveryTag []byte, reservation groupDeliveryKey) sendOutcome {
+	records := h.deliveryRecords[c.ID]
 	// A fast sender with stalled ACKs must not turn a bounded channel into an
 	// unbounded retry map. Expiry or ACK releases one of these fixed slots.
-	if len(h.deliveryRecords[c.ID]) >= max(1024, cap(c.Ch)) {
-		metrics.DeliveryRejectedTotal.WithLabelValues("in_flight_limit").Inc()
-		return false
+	if len(records) >= max(1024, cap(c.Ch)) {
+		return sendWorkerAtLimit
 	}
-	if _, exists := h.deliveryRecords[c.ID][string(deliveryTag)]; exists {
-		return false
+	if _, exists := records[reservation.key]; exists {
+		return sendAlreadyInFlight
+	}
+	if capacity := cap(c.Ch); c.Ch == nil || (capacity > 0 && len(c.Ch) == capacity) {
+		return sendQueueFull
 	}
 	// Separate pointers let the sender reject an old queued attempt after a
 	// timeout, even if the same key has since been delivered to this stream again.
@@ -481,20 +607,35 @@ func (h *Hub) trySend(c *ConsumerEntry, msg *pb.QueueMessage, deliveryTag []byte
 	case c.Ch <- queued:
 		metrics.DeliverySenderEnqueueLatenessMs.WithLabelValues(msg.Topic).Observe(float64(queuedAt.UnixNano())/1e6 - float64(msg.EnqueuedAtUnixMs+msg.DelayMs))
 		h.inFlightByConsumer[c.ID] = append(h.inFlightByConsumer[c.ID], deliveryTag)
-		h.deliveryRecords[c.ID][string(deliveryTag)] = deliveryRecord{message: queued, topic: c.Topic, group: c.Group, expires: time.Now().Add(h.inFlightTimeout), epoch: h.permitEpoch}
-		if c.Group != "" {
+		if records == nil {
+			records = make(map[string]deliveryRecord)
+			h.deliveryRecords[c.ID] = records
+		}
+		records[reservation.key] = deliveryRecord{message: queued, topic: c.Topic, group: c.Group, expires: time.Now().Add(h.inFlightTimeout), epoch: h.permitEpoch}
+		if reservation.group != "" {
 			h.groupInFlight[reservation] = c.ID
 		}
 		metrics.MessagesInFlight.WithLabelValues(c.Topic, c.Group).Inc()
-		return true
+		return sendAccepted
 	default:
+		return sendQueueFull
+	}
+}
+
+func (h *Hub) reportSendRejection(c *ConsumerEntry, outcome sendOutcome) {
+	switch outcome {
+	case sendWorkerAtLimit:
+		metrics.DeliveryRejectedTotal.WithLabelValues("in_flight_limit").Inc()
+	case sendQueueFull:
 		metrics.DeliveryRejectedTotal.WithLabelValues("full_queue").Inc()
+		if c.Group != "" {
+			h.logger.Warn("consumer group saturated, skipping", zap.String("topic", c.Topic), zap.String("group", c.Group))
+			return
+		}
 		h.logger.Warn("consumer channel full, skipping",
 			zap.String("consumer_id", c.ID),
 			zap.String("topic", c.Topic),
-			zap.String("group", c.Group),
 		)
-		return false
 	}
 }
 
@@ -658,23 +799,28 @@ func (h *Hub) RestoreStandaloneEpoch(db storage.DB) (err error) {
 type localGroup struct {
 	members   []metadata.ConsumerMember
 	consumers []*ConsumerEntry
+	local     []*ConsumerEntry
+	replica   replicaMembership
 }
 
 // InterestView freezes both the local subscriptions and the global assignment
 // used to filter a chunk. Queueing still validates the live epoch under the
 // rebalance lock; this view is never itself a delivery permit.
 type InterestView struct {
-	Epoch      uint64
-	Active     bool
-	Recipients []string
-	groups     []localGroup
-	universal  []*ConsumerEntry
+	Epoch           uint64
+	Active          bool
+	Recipients      []string
+	groups          []localGroup
+	universal       []*ConsumerEntry
+	sharded         bool
+	assignmentEpoch uint64
 }
 
 func (h *Hub) SetDeliveryView(source func(string) metadata.TopicDeliveryView) {
 	h.deliveryMu.Lock()
 	defer h.deliveryMu.Unlock()
 	h.deliveryView = source
+	h.assignmentEpoch++
 }
 
 func (h *Hub) InterestView(topic string) InterestView {
@@ -685,7 +831,14 @@ func (h *Hub) InterestView(topic string) InterestView {
 	}
 	h.mu.RLock()
 	defer h.mu.RUnlock()
-	view := InterestView{Active: true, Epoch: h.registryEpoch}
+	sub := h.topics[topic]
+	if sub != nil && h.deliveryView != nil && h.version != nil {
+		if assignment := h.topicAssignmentLocked(topic, sub); assignment != nil {
+			return assignment.view
+		}
+		return InterestView{}
+	}
+	view := InterestView{Active: true, Epoch: h.registryEpoch, sharded: h.localReplica != 0, assignmentEpoch: h.assignmentEpoch}
 	var global metadata.TopicDeliveryView
 	if h.deliveryView != nil {
 		global = h.deliveryView(topic)
@@ -696,10 +849,10 @@ func (h *Hub) InterestView(topic string) InterestView {
 	} else if h.version != nil {
 		view.Epoch = h.permitEpoch
 	}
-	sub := h.topics[topic]
 	if sub == nil {
 		return view
 	}
+	distribution := h.shardDistribution()
 	for group, consumers := range sub.groupSnapshot() {
 		entry := localGroup{consumers: consumers}
 		if h.deliveryView != nil {
@@ -710,6 +863,10 @@ func (h *Hub) InterestView(topic string) InterestView {
 		// A non-nil membership source must not fall back to local ownership.
 		if (h.deliveryView != nil || h.groupMembers != nil) && len(entry.members) == 0 {
 			continue
+		}
+		if view.sharded {
+			entry.replica = describeReplica(entry.members, h.localReplica, distribution)
+			entry.local = entry.replica.localWorkers(entry.members, consumers)
 		}
 		view.groups = append(view.groups, entry)
 		if h.deliveryView == nil {
@@ -734,42 +891,69 @@ func (h *Hub) InterestView(topic string) InterestView {
 	return view
 }
 
-// localOwners uses the committed member order and deliveryOrdinal for every
-// represented group independently. In standalone mode any group member can
-// serve; selection remains with the configured dispatch strategy.
-func (v InterestView) localOwners(key []byte) []*ConsumerEntry {
-	owners := append([]*ConsumerEntry(nil), v.universal...)
-	for _, group := range v.groups {
-		if len(group.members) == 0 {
-			owners = append(owners, group.consumers...)
-			continue
+// localOwners yields one representative of each owned named group, and every
+// local universal recipient. A named group shares one in-flight reservation.
+func (v InterestView) localOwners(key []byte) iter.Seq[*ConsumerEntry] {
+	return func(yield func(*ConsumerEntry) bool) {
+		for _, owner := range v.universal {
+			if !yield(owner) {
+				return
+			}
 		}
-		id := group.members[deliveryOrdinal(key)%uint64(len(group.members))].ID
-		for _, consumer := range group.consumers {
-			if consumer.ID == id {
-				owners = append(owners, consumer)
-				break
+		slot := utils.EventShardSlot(key)
+		var shardCount int
+		if slot != 0 && v.sharded {
+			shardCount = utils.SlotShardCount(slot)
+		}
+		for _, group := range v.groups {
+			if owner := group.owner(slot, shardCount, key); owner != nil && !yield(owner) {
+				return
 			}
 		}
 	}
-	return owners
 }
 
-func (h *Hub) hasReadyOwner(owners []*ConsumerEntry, key []byte) bool {
-	h.inFlightMu.Lock()
-	defer h.inFlightMu.Unlock()
-	for _, owner := range owners {
-		if owner.Group != "" {
-			reservation := groupDeliveryKey{topic: owner.Topic, group: owner.Group, key: string(key)}
-			if _, exists := h.groupInFlight[reservation]; exists {
-				continue
-			}
+func (group localGroup) owner(slot, count int, key []byte) *ConsumerEntry {
+	if len(group.members) == 0 {
+		if len(group.consumers) > 0 {
+			return group.consumers[0]
 		}
-		if _, exists := h.deliveryRecords[owner.ID][string(key)]; !exists {
-			return true
+		return nil
+	}
+	if group.replica.usesReplicaWorkers(count) {
+		if len(group.local) > 0 && group.replica.owns(slot, count, key) {
+			return group.local[0]
 		}
+		return nil
+	}
+	return moduloWorker(group.members, group.consumers, key)
+}
+
+func (v InterestView) hasLocalOwner(key []byte) bool {
+	for range v.localOwners(key) {
+		return true
 	}
 	return false
+}
+
+func (h *Hub) hasReadyOwner(view InterestView, key []byte) (owned, ready bool) {
+	h.inFlightMu.Lock()
+	defer h.inFlightMu.Unlock()
+	tag := string(key)
+	for owner := range view.localOwners(key) {
+		owned = true
+		if owner.Group != "" {
+			reservation := groupDeliveryKey{topic: owner.Topic, group: owner.Group, key: tag}
+			if _, exists := h.groupInFlight[reservation]; !exists {
+				return true, true
+			}
+			continue
+		}
+		if _, exists := h.deliveryRecords[owner.ID][tag]; !exists {
+			return true, true
+		}
+	}
+	return owned, false
 }
 
 func (h *Hub) DeliveryPermitted() bool {

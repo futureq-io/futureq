@@ -248,7 +248,7 @@ func TestImmutableOwnershipViewIncludesEveryGroupAndUniversalInterest(t *testing
 	require.Equal(t, []string{"g:a", "g:b", "u:remote", "u:u-local"}, view.Recipients, "local filtering retains global interests")
 	ownerIDs := func(id uint64) []string {
 		var ids []string
-		for _, owner := range view.localOwners(utils.EventKey(1, 2, id)) {
+		for owner := range view.localOwners(utils.EventKey(1, 2, id)) {
 			ids = append(ids, owner.ID)
 		}
 		return ids

@@ -6,6 +6,7 @@ package main
 import (
 	"context"
 	stdLogger "log"
+	"runtime"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -151,6 +152,11 @@ func startRun(cmd *cobra.Command, _ []string) {
 	logger.Info("delivery heap selected", zap.String("heapType", string(disp.HeapType)))
 	disp.TimeBucket = cfg.Delivery.TimeBucket
 	disp.DiscoveryWorkers = cfg.Delivery.DiscoveryWorkers
+	disp.ShardWorkers = cfg.Delivery.ShardWorkers
+	if cpus := runtime.GOMAXPROCS(0); cfg.Cluster.Enabled && disp.ShardWorkers > cpus/disp.DiscoveryWorkers {
+		logger.Warn("configured discovery and shard worker product exceeds GOMAXPROCS",
+			zap.Int("discoveryWorkers", disp.DiscoveryWorkers), zap.Int("shardWorkers", disp.ShardWorkers), zap.Int("gomaxprocs", cpus))
+	}
 	disp.PreloadScanIdleMaxInterval = cfg.Delivery.PreloadScanIdleMaxInterval
 	disp.PreloadLookahead = cfg.Delivery.PreloadLookahead
 	disp.PreloadMaxMessages = cfg.Delivery.PreloadMaxMessages
@@ -197,6 +203,8 @@ func startRun(cmd *cobra.Command, _ []string) {
 		}
 		hub.SetGroupMembership(a.MetadataSM.ConsumerGroup)
 		hub.SetDeliveryView(a.MetadataSM.TopicDeliverySnapshot)
+		hub.SetLocalReplica(cfg.Cluster.NodeID)
+		hub.SetShardDistribution(a.MetadataSM.ShardDistribution)
 		hub.SetDeliveryFence(a.MetadataSM.ConsumerVersion, inFlightTimeout)
 		hub.SetReadPermit(cfg.Delivery.ReadPermit)
 		a.MetadataSM.SetConsumerBarrier(hub.WithConsumerBarrier)
@@ -256,6 +264,7 @@ func startRun(cmd *cobra.Command, _ []string) {
 func consumerMetadataLoop(ctx context.Context, a *app.App, hub *dispatcher.Hub, logger *zap.Logger) {
 	coordinator := dispatcher.NewConsumerCoordinator(hub, a.MetadataSM, a.MetadataSvc,
 		a.Config().Cluster.ShardID, a.Config().Cluster.NodeID, a.Config().Delivery.InFlightTimeout, logger)
+	coordinator.ShardDistribution = a.Config().Delivery.ShardDistribution
 	coordinator.Run(ctx)
 }
 
