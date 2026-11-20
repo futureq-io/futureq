@@ -53,7 +53,7 @@ func splitShardScans(view InterestView, workers int, layouts int) []shardScanSta
 			r := &lanes[lane].rangeKeys
 			r.epoch = view.Epoch
 			r.assignmentEpoch = view.assignmentEpoch
-			for end := (lane + 1) * n / parallel; assigned < end; {
+			for end := int(int64(lane+1) * int64(n) / int64(parallel)); assigned < end; {
 				first := slots[rangeIdx].first
 				size := min(end-assigned, slots[rangeIdx].end-first)
 				r.slots = append(r.slots, shardSlotRange{first, first + size})

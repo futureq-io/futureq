@@ -127,7 +127,7 @@ func TestRaftPublishPersistsEachVirtualShardLayout(t *testing.T) {
 	defer cancel()
 	group, err := a.Subscriptions.Create(ctx, "orders", "workers", "")
 	require.NoError(t, err)
-	counts := []int{64, 8, 0}
+	counts := []int{utils.MaxVirtualShards, 64, 8, 0}
 	for _, count := range counts {
 		a.Config().Storage.VirtualShards = count
 		ack, err := producer.processBatch(ctx, &pb.PublishBatch{Messages: []*pb.PublishMessage{{Topic: "orders"}}})

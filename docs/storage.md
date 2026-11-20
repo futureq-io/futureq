@@ -17,9 +17,9 @@ Every message is stored under a 25-byte, big-endian, lexicographically sortable 
 
 | Bytes   | Field       | Meaning |
 | ------- | ----------- | ------- |
-| 0..8    | `topicHash` | xxhash64 of the topic name |
-| 8..17   | `bucket`    | A 17-bit virtual shard slot followed by the 55-bit time bucket. The time bucket is `(enqueuedAtMs + delayMs) / timeBucket`. With `timeBucket = 0`, raw milliseconds are used. |
-| 17..25  | `eventID`   | Monotonic ID finalized in Raft log order, or reserved by the standalone event repository |
+| 0–7     | `topicHash` | xxhash64 of the topic name |
+| 8–16    | `bucket`    | A 17-bit virtual shard slot followed by the 55-bit time bucket. The time bucket is `(enqueuedAtMs + delayMs) / timeBucket`. With `timeBucket = 0`, raw milliseconds are used. |
+| 17–24   | `eventID`   | Monotonic ID finalized in Raft log order, or reserved by the standalone event repository |
 
 Unsharded keys sort by topic, time bucket, and ID. Sharded keys sort by topic,
 shard slot, time bucket, and ID. Slot zero selects the unsharded layout. A

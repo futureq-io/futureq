@@ -42,12 +42,13 @@ func (r replicaMembership) shardRange(count int) (first, end int) {
 		return 0, count
 	}
 	if r.distribution == metadata.ShardDistributionReplicaCount {
-		return r.ordinal * count / r.replicas, (r.ordinal + 1) * count / r.replicas
+		ordinal, total, replicas := int64(r.ordinal), int64(count), int64(r.replicas)
+		return int(ordinal * total / replicas), int((ordinal + 1) * total / replicas)
 	}
 	// Give every replica one shard and split the rest by worker count. Rounded
 	// cumulative boundaries meet exactly, with no overlaps or uncovered shards.
-	extra := count - r.replicas
-	boundary := func(workers int) int { return (extra*workers + r.totalWorkers/2) / r.totalWorkers }
+	extra, totalWorkers := int64(count-r.replicas), int64(r.totalWorkers)
+	boundary := func(workers int) int { return int((extra*int64(workers) + totalWorkers/2) / totalWorkers) }
 	return r.ordinal + boundary(r.before), r.ordinal + 1 + boundary(r.before+r.workers)
 }
 
