@@ -1,0 +1,12 @@
+# Only application source and module manifests belong in the build context.
+**
+!go.mod
+!go.sum
+!cmd/
+!cmd/futureq/
+!cmd/futureq/**
+!internal/
+!internal/**
+!pkg/
+!pkg/**
+**/*_test.go

@@ -1,37 +1,39 @@
-# Build stage
-FROM golang:1.27.1-alpine AS builder
+# syntax=docker/dockerfile:1
+
+FROM --platform=$BUILDPLATFORM golang:1.27.1-alpine AS builder
 
 WORKDIR /app
 
-# Install build dependencies
-RUN apk add --no-cache git ca-certificates
-
-# Copy go mod files and vendor directory first for better layer caching
+# Download dependencies separately so source changes reuse this layer.
 COPY go.mod go.sum ./
-COPY vendor/ ./vendor/
+RUN go mod download
 
 # Copy source code
 COPY . .
 
-# Build the binary using vendor dependencies
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -mod=vendor -ldflags="-w -s" -o /futureq ./cmd/futureq
+ARG TARGETOS
+ARG TARGETARCH
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
+    go build -mod=readonly -trimpath -ldflags="-w -s" -o /futureq ./cmd/futureq
 
 # Runtime stage
 FROM alpine:3.24
 
 WORKDIR /app
 
-# Install ca-certificates for HTTPS and runas non-root user
+# Default storage paths must be writable by the runtime user.
 RUN apk add --no-cache ca-certificates tzdata && \
-    adduser -D -u 1000 appuser
+    adduser -D -u 1000 appuser && \
+    mkdir -p /app/data /app/raft-data && \
+    chown -R appuser:appuser /app
 
 USER appuser
 
 # Copy binary from builder
 COPY --from=builder /futureq /app/futureq
 
-# Expose default gRPC port (can be overridden via config)
-EXPOSE 50051
+# gRPC, Prometheus metrics, and Raft transport.
+EXPOSE 8443 9090 50005
 
 ENTRYPOINT ["/app/futureq"]
 CMD ["start"]
