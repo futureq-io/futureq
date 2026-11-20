@@ -11,23 +11,27 @@ All engines implement the `storage.DB` interface (`internal/storage/contract.go`
 
 Because of this contract, the dispatcher and janitor are completely engine-agnostic.
 
-## The 24-byte event key
+## The 25-byte event key
 
-Every message is stored under a 24-byte, big-endian, lexicographically sortable key (`pkg/utils/keys.go`):
+Every message is stored under a 25-byte, big-endian, lexicographically sortable key (`pkg/utils/keys.go`):
 
 | Bytes   | Field       | Meaning |
 | ------- | ----------- | ------- |
 | 0..8    | `topicHash` | xxhash64 of the topic name |
-| 8..16   | `bucket`    | The time bucket, with a virtual shard slot ahead of it for sharded publishes. The time bucket is `(enqueuedAtMs + delayMs) / timeBucket`. With `timeBucket = 0`, raw milliseconds are used. |
-| 16..24  | `eventID`   | Monotonic ID finalized in Raft log order, or reserved by the standalone event repository |
+| 8..17   | `bucket`    | A 17-bit virtual shard slot followed by the 55-bit time bucket. The time bucket is `(enqueuedAtMs + delayMs) / timeBucket`. With `timeBucket = 0`, raw milliseconds are used. |
+| 17..25  | `eventID`   | Monotonic ID finalized in Raft log order, or reserved by the standalone event repository |
 
 Unsharded keys sort by topic, time bucket, and ID. Sharded keys sort by topic,
-shard slot, time bucket, and ID. The high bit of the bucket field marks a
-sharded key. The next eight bits contain the count plus the zero-based shard
-ordinal. The remaining 55 bits contain the time bucket. Larger time buckets
-use the unsharded layout.
+shard slot, time bucket, and ID. Slot zero selects the unsharded layout. A
+sharded slot stores the shard count plus the zero-based shard ordinal. The
+largest layout uses 65,536 shards. Time buckets above the 55-bit maximum use
+the final unsharded bucket, and delivery still checks the exact scheduled time
+stored in the message.
 
-The stored value is the protobuf `StoredMessage` (topic, payload, enqueue time, delay, TTL, indexes). The 24-byte key doubles as the opaque `delivery_tag` consumers receive and echo back on ACK.
+The stored value is the protobuf `StoredMessage` (topic, payload, enqueue time, delay, TTL, indexes). The 25-byte key doubles as the opaque `delivery_tag` consumers receive and echo back on ACK.
+
+Reset development databases, Raft logs, and snapshots created with the previous
+24-byte key format before starting this version.
 
 Delivery preparation and ACK commands, preparation results, and persisted delivery receipts use Protobuf exclusively. Receipts have an `FQR` version-1 prefix, and batch preparation results have an `FQP` version-1 prefix. JSON delivery formats are no longer supported; development data containing them must be reset, including databases, Raft logs, and snapshots. The removed delivery command numbers (2, 3, and 4) remain reserved. Consumer membership and consumer snapshot metadata still use JSON.
 
@@ -81,4 +85,4 @@ Not a separate engine: it's Pebble in `mode: memory`. Ephemeral workloads only.
 `internal/repository/events.go` sits between handlers/state machine and storage:
 
 - Reserves **local proposed event IDs** for the publisher. Raft ordered apply retains a proposal only when it exceeds the applied high-water mark; a stale or duplicate reservation receives the next ID. The watermark includes prior items and entries in the same storage batch, is persisted atomically with messages under `metadata/event-repo/last-id`, and survives deletion, restart, replay, and snapshots. Local reservations never decide final Raft key uniqueness. `ObserveID` advances each replica's local allocator after commit.
-- Constructs the 24-byte keys and writes optional secondary indexes (proto-marshaled index payloads pointing back to the key).
+- Constructs the 25-byte keys and writes optional secondary indexes (proto-marshaled index payloads pointing back to the key).

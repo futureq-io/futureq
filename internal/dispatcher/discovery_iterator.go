@@ -16,7 +16,7 @@ type discoveryIterator struct {
 	hash, earliest, last uint64
 	deadline             time.Time
 	upper                []byte
-	owned                [2 * utils.MaxVirtualShards]bool
+	owned                shardSlotRanges
 	loadedOwnership      bool
 	seeks                int
 	resumeAt             []byte
@@ -47,7 +47,7 @@ func (i *discoveryIterator) advance(valid bool) bool {
 	}
 	for valid {
 		key := i.Key()
-		if len(key) != 24 {
+		if len(key) != utils.EventKeySize {
 			return true // let the scanner charge its work budget
 		}
 		_, bucket, _, _ := utils.ParseEventKey(key)
@@ -56,15 +56,14 @@ func (i *discoveryIterator) advance(valid bool) bool {
 			return true // legacy lower bound is already enforced by the iterator
 		}
 		if !i.loadedOwnership {
-			i.owned = i.view.ownedShardSlots()
 			if i.shards != nil {
-				for slot := range i.owned {
-					i.owned[slot] = i.owned[slot] && i.shards.slots[slot]
-				}
+				i.owned = i.shards.slots
+			} else {
+				i.owned = i.view.ownedShardSlots(2*utils.MaxVirtualShards - 1)
 			}
 			i.loadedOwnership = true
 		}
-		if slot >= 2 && i.owned[slot] {
+		if slot >= 2 && i.owned.next(slot) == slot {
 			if bucket < i.earliest {
 				valid = i.seek(slot)
 				continue
@@ -73,11 +72,8 @@ func (i *discoveryIterator) advance(valid bool) bool {
 				return true
 			}
 		}
-		next := max(2, slot+1)
-		for next < len(i.owned) && !i.owned[next] {
-			next++
-		}
-		if next == len(i.owned) {
+		next := i.owned.next(max(2, slot+1))
+		if next < 0 {
 			return false
 		}
 		valid = i.seek(next)
@@ -91,7 +87,7 @@ func (i *discoveryIterator) seek(slot int) bool {
 	if i.earliest > utils.MaxVirtualTimeBucket {
 		return false
 	}
-	key := utils.EventKey(utils.ShardStorageBucket(slot, i.earliest), i.hash, 0)[:16]
+	key := utils.ShardStorageBucket(slot, i.earliest).Prefix(i.hash)
 	if bytes.Compare(key, i.upper) >= 0 {
 		return false
 	}

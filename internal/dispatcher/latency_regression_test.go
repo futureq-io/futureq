@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/futureq-io/futureq/pkg/raft/metadata"
+	"github.com/futureq-io/futureq/pkg/utils"
 	pb "github.com/futureq-io/protocol/proto/go"
 	"github.com/lni/dragonboat/v4/statemachine"
 	"github.com/stretchr/testify/require"
@@ -49,9 +50,9 @@ func TestDiscoveryUsesLivePreloadKeysAndBoundedAssignedBatch(t *testing.T) {
 	p := &topicPreload{epoch: d.hub.InterestView("orders").Epoch}
 	for i := range keys {
 		keys[i] = putPipelineEvent(t, d, "orders", uint64(i+1), due)
-		p.addKey([24]byte(keys[i]))
+		p.addKey([utils.EventKeySize]byte(keys[i]))
 	}
-	d.db = scanStartupDB{DB: d.db, beforeFirst: func() { p.removeKey([24]byte(keys[0])); p.removeKey([24]byte(keys[2])) }}
+	d.db = scanStartupDB{DB: d.db, beforeFirst: func() { p.removeKey([utils.EventKeySize]byte(keys[0])); p.removeKey([utils.EventKeySize]byte(keys[2])) }}
 	// Exercise concurrent index updates as discovery reads it, without sharing heaps.
 	stop := make(chan struct{})
 	var wg sync.WaitGroup
@@ -61,12 +62,12 @@ func TestDiscoveryUsesLivePreloadKeysAndBoundedAssignedBatch(t *testing.T) {
 			case <-stop:
 				return
 			default:
-				p.addKey([24]byte{99})
-				p.removeKey([24]byte{99})
+				p.addKey([utils.EventKeySize]byte{99})
+				p.removeKey([utils.EventKeySize]byte{99})
 			}
 		}
 	})
-	result := d.discover(discoveryJob{topic: "orders", owner: p, dueSlots: 3, assigned: map[[24]byte]bool{[24]byte(keys[2]): true}})
+	result := d.discover(discoveryJob{topic: "orders", owner: p, dueSlots: 3, assigned: map[[utils.EventKeySize]byte]bool{[utils.EventKeySize]byte(keys[2]): true}})
 	close(stop)
 	wg.Wait()
 	require.Len(t, result.chunk.items, 1)

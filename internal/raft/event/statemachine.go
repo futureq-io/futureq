@@ -132,11 +132,12 @@ func (s *EventStateMachine) applyEntry(batch storage.Batch, delivery *DeliveryBa
 				it.ID = lastID + 1
 			}
 			lastID = it.ID
-			key, err := s.repo.StoreRawWithBatch(batch, it.ID, it.Bucket, it.TopicHash, it.Indexes, it.Msg)
+			bucket := utils.ShardStorageBucket(it.ShardSlot, it.Bucket)
+			key, err := s.repo.StoreRawWithBatch(batch, it.ID, bucket, it.TopicHash, it.Indexes, it.Msg)
 			if err != nil {
 				return statemachine.Result{}, nil, 0, fmt.Errorf("raft: StoreRawWithBatch: %w", err)
 			}
-			delivery.ObserveStore(utils.EventKey(it.Bucket, it.TopicHash, it.ID))
+			delivery.ObserveStore(key)
 			if len(it.Receipt) > 0 {
 				state, err := UnmarshalDeliveryState(it.Receipt)
 				if err != nil {

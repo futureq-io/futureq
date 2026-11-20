@@ -171,12 +171,12 @@ func (d *Dispatcher) collectDueRange(topic string, view InterestView, cursor *sc
 		// Appending zero is the inclusive lower bound strictly after this
 		// fixed-length event key, without assuming IDs are consecutive.
 		cursor.after = append(append([]byte(nil), key...), 0)
-		if len(key) != 24 {
+		if len(key) != utils.EventKeySize {
 			valid = iter.Next()
 			continue
 		}
 		metrics.DeliveryScannedKeysTotal.Inc()
-		if d.skipKeys != nil && d.skipKeys([24]byte(key)) {
+		if d.skipKeys != nil && d.skipKeys([utils.EventKeySize]byte(key)) {
 			valid = iter.Next()
 			continue
 		}
@@ -290,7 +290,7 @@ func (d *Dispatcher) collectMaintenance() deliveryChunk {
 		examined++
 		bytesRead += len(key) + len(value)
 		cursor.after = append(append([]byte(nil), key...), 0)
-		if len(key) != len(prefix)+24 {
+		if len(key) != len(prefix)+utils.EventKeySize {
 			valid = iter.Next()
 			continue
 		}

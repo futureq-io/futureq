@@ -11,7 +11,7 @@ FutureQ lets producers publish messages with a relative delay and guarantees rel
 ## Features
 
 - **⏱ Delayed messaging** — enqueue a message with a `delay_ms`; it becomes visible to consumers only after the delay expires. Optional per-message `ttl_ms` discards messages nobody consumed.
-- **💾 Durable storage** — disk-backed by [Pebble](https://github.com/cockroachdb/pebble) (CockroachDB's LSM store) with a time-optimized 24-byte key schema, a pure in-memory mode, and an alternative bbolt engine.
+- **💾 Durable storage** — disk-backed by [Pebble](https://github.com/cockroachdb/pebble) (CockroachDB's LSM store) with a time-optimized 25-byte key schema, a pure in-memory mode, and an alternative bbolt engine.
 - **🔀 High availability** — multi-node replication via [Dragonboat](https://github.com/lni/dragonboat) (multi-group Raft): an event shard for messages plus a metadata group for cluster topology.
 - **➕ Dynamic membership** — nodes join and leave a running cluster over gRPC (`JoinCluster` / `LeaveCluster`) with catch-up before voting. No static bootstrap list needed after the first node.
 - **👥 Consumer groups & topics** — topic-based routing with fan-out across groups and round-robin dispatch within a group. "Universal" consumers (no group) each receive every message.

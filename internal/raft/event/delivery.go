@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/futureq-io/futureq/internal/storage"
+	"github.com/futureq-io/futureq/pkg/utils"
 	deliverypb "github.com/futureq-io/protocol/proto/go/delivery"
 	"github.com/lni/dragonboat/v4/statemachine"
 )
@@ -73,13 +74,13 @@ func validatePrepares(items []DeliveryPrepare) error {
 	if len(items) == 0 || len(items) > MaxDeliveryPrepareItems {
 		return fmt.Errorf("delivery prepare batch must contain 1..%d items", MaxDeliveryPrepareItems)
 	}
-	seen := make(map[[24]byte]bool, len(items))
+	seen := make(map[[utils.EventKeySize]byte]bool, len(items))
 	views := make(map[prepareViewKey]bool)
 	for _, item := range items {
-		if len(item.Key) != 24 || seen[[24]byte(item.Key)] {
+		if len(item.Key) != utils.EventKeySize || seen[[utils.EventKeySize]byte(item.Key)] {
 			return fmt.Errorf("invalid or duplicate delivery key")
 		}
-		seen[[24]byte(item.Key)] = true
+		seen[[utils.EventKeySize]byte(item.Key)] = true
 		if len(item.Recipients) > MaxDeliveryRecipients {
 			return fmt.Errorf("too many delivery recipients")
 		}
@@ -218,7 +219,7 @@ func (b *DeliveryBatch) Flush() error {
 
 // Prepare validates and applies a single-key preparation without wire encoding.
 func (b *DeliveryBatch) Prepare(item DeliveryPrepare) (*DeliveryState, bool, error) {
-	if len(item.Key) != 24 {
+	if len(item.Key) != utils.EventKeySize {
 		return nil, false, fmt.Errorf("invalid delivery key length")
 	}
 	return b.prepare(item)

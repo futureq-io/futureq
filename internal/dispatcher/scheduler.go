@@ -22,7 +22,7 @@ type discoveryJob struct {
 	revision              uint64
 	shardRevisions        *storage.TopicRevisionSnapshot
 	repairGeneration      uint64
-	assigned              map[[24]byte]bool // immutable, bounded delivery batch
+	assigned              map[[utils.EventKeySize]byte]bool // immutable, bounded delivery batch
 	topic                 string
 	owner                 *topicPreload
 	cursor                scanCursor
@@ -78,7 +78,7 @@ func (d *Dispatcher) discover(job discoveryJob) discoveryResult {
 		return discoveryResult{job: job, layouts: layouts, layoutsFound: err == nil}
 	}
 	// Construct a scanner adapter rather than copying a Dispatcher (sync.Map).
-	scanner := &Dispatcher{scanOnly: true, skipKeys: func(key [24]byte) bool { return job.assigned[key] || job.owner.hasKey(key) }, db: d.db, hub: d.hub, deleter: d.deleter, logger: d.logger,
+	scanner := &Dispatcher{scanOnly: true, skipKeys: func(key [utils.EventKeySize]byte) bool { return job.assigned[key] || job.owner.hasKey(key) }, db: d.db, hub: d.hub, deleter: d.deleter, logger: d.logger,
 		TimeBucket: d.TimeBucket, Limits: d.Limits, PreloadLookahead: d.PreloadLookahead,
 		PreloadMaxMessages: job.futureSlots, MaintenanceRecipients: d.MaintenanceRecipients,
 		cursors: map[string]*scanCursor{job.topic: &job.cursor}}
@@ -137,10 +137,10 @@ func (d *Dispatcher) admitCandidate(p *topicPreload, c preloadCandidate) bool {
 	return true
 }
 
-func (d *Dispatcher) admitChunk(p *topicPreload, chunk deliveryChunk, assigned map[[24]byte]bool) int {
+func (d *Dispatcher) admitChunk(p *topicPreload, chunk deliveryChunk, assigned map[[utils.EventKeySize]byte]bool) int {
 	admitted := 0
 	for _, item := range chunk.items {
-		key := [24]byte(item.Key)
+		key := [utils.EventKeySize]byte(item.Key)
 		if assigned[key] {
 			continue
 		}
@@ -297,7 +297,7 @@ func (d *Dispatcher) runPipeline(parent context.Context) {
 	pending := make(map[string]deliveryJob)
 	scanning := make(map[string]discoveryPassState)
 	scanActive := 0
-	assigned := make(map[string]map[[24]byte]bool)
+	assigned := make(map[string]map[[utils.EventKeySize]byte]bool)
 	nextScan := make(map[string]time.Time)
 	retryAfter := make(map[string]time.Time)
 	busyDue := make(map[string]int64)
@@ -415,9 +415,9 @@ func (d *Dispatcher) runPipeline(parent context.Context) {
 				if len(chunk.items) > 0 {
 					busy[topic] = p
 					busyDue[topic] = chunk.oldestDueMs
-					keys := make(map[[24]byte]bool, len(chunk.items))
+					keys := make(map[[utils.EventKeySize]byte]bool, len(chunk.items))
 					for _, item := range chunk.items {
-						keys[[24]byte(item.Key)] = true
+						keys[[utils.EventKeySize]byte(item.Key)] = true
 					}
 					assigned[topic] = keys
 					jobs <- deliveryJob{chunk: chunk, owner: p}

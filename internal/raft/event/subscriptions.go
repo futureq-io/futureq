@@ -1,6 +1,8 @@
 package raft
 
 import (
+	"github.com/futureq-io/futureq/pkg/utils"
+
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -100,7 +102,7 @@ func MarshalSubscriptionCommand(command *deliverypb.SubscriptionCommand) ([]byte
 		}
 	}
 	for _, key := range command.Keys {
-		if len(key) != 24 {
+		if len(key) != utils.EventKeySize {
 			return nil, fmt.Errorf("invalid cleanup key")
 		}
 	}

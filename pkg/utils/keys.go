@@ -10,46 +10,58 @@ import (
 	"github.com/cespare/xxhash/v2"
 )
 
-var (
-	errInvalidKeyLength = "key length must be 24. got %d"
-)
-
 const (
-	MaxVirtualShards     = 128
+	MaxVirtualShards     = 1 << 16
 	MaxVirtualTimeBucket = (uint64(1) << virtualBucketShift) - 1
-	virtualBucketFlag    = uint64(1) << 63
 	virtualBucketShift   = 55
+	StorageBucketSize    = 9
+	eventKeyPrefixSize   = 8 + StorageBucketSize
+	EventKeySize         = eventKeyPrefixSize + 8
 )
 
-// ValidVirtualShardCount accepts zero (legacy writes) or a supported power of two.
+// StorageBucket holds a 17-bit shard slot followed by a 55-bit time bucket.
+// Slot zero is unsharded. Slot one is reserved.
+type StorageBucket [StorageBucketSize]byte
+
+// ValidVirtualShardCount accepts zero (unsharded writes) or a supported power of two.
 func ValidVirtualShardCount(count int) bool {
 	return count == 0 || (count >= 2 && count <= MaxVirtualShards && count&(count-1) == 0)
 }
 
 // ChooseStorageBucket assigns a shard once, before the producer proposes its
-// Raft command. The existing uint64 bucket field carries the layout and shard
-// through replication, replay, and changes to the leader's configuration.
-// Buckets beyond the packed range retain the legacy layout.
-func ChooseStorageBucket(bucket uint64, count int) uint64 {
+// Raft command. The encoded bucket carries the slot through replication and
+// replay regardless of the replicas' local shard count.
+func ChooseStorageBucket(bucket uint64, count int) (uint64, int) {
 	if count == 0 || bucket > MaxVirtualTimeBucket {
-		return bucket
+		return min(bucket, MaxVirtualTimeBucket), 0
 	}
-	return ShardStorageBucket(count+rand.IntN(count), bucket)
+	return bucket, count + rand.IntN(count)
 }
 
 // ShardStorageBucket packs the slot (shard count + shard ordinal) ahead of
-// the due-time bucket. Count is the highest set bit of the slot. The marker
-// lies outside the entire legacy range of nonnegative int64 millisecond buckets.
-func ShardStorageBucket(slot int, bucket uint64) uint64 {
-	return virtualBucketFlag | uint64(slot)<<virtualBucketShift | bucket
+// the due-time bucket. Count is the highest set bit of a sharded slot.
+func ShardStorageBucket(slot int, bucket uint64) StorageBucket {
+	var packed StorageBucket
+	packed[0] = byte(slot >> (64 - virtualBucketShift))
+	binary.BigEndian.PutUint64(packed[1:], uint64(slot)<<virtualBucketShift|min(bucket, MaxVirtualTimeBucket))
+	return packed
 }
 
-// EventShardSlot returns zero for a legacy event key or a non-event key.
+// Parts returns the time bucket and shard slot.
+func (b StorageBucket) Parts() (bucket uint64, slot int) {
+	return binary.BigEndian.Uint64(b[1:]) & MaxVirtualTimeBucket, storageBucketSlot(b[:])
+}
+
+func storageBucketSlot(b []byte) int {
+	return int(b[0])<<9 | int(b[1])<<1 | int(b[2]>>7)
+}
+
+// EventShardSlot returns zero for an unsharded event key or a non-event key.
 func EventShardSlot(key []byte) int {
-	if len(key) != 24 || key[8]&0x80 == 0 {
+	if len(key) != EventKeySize {
 		return 0
 	}
-	return int(key[8]&0x7f)<<1 | int(key[9]>>7)
+	return storageBucketSlot(key[8:eventKeyPrefixSize])
 }
 
 // SlotShardCount returns the layout's shard count for a nonzero shard slot.
@@ -78,20 +90,33 @@ func CalculateBucket(unixMs int64, bucketSize time.Duration) uint64 {
 	return uint64(unixMs) / uint64(bucketSize.Milliseconds())
 }
 
-// EventKey constructs the 24-byte Pebble key for a stored message.
+// EventKey constructs the 25-byte storage key for an unsharded message.
+func EventKey(bucket, topicHash, eventID uint64) []byte {
+	return ShardStorageBucket(0, bucket).EventKey(topicHash, eventID)
+}
+
+// EventKey constructs the 25-byte storage key for a stored message.
 //
 // Layout (big-endian, lexicographically sortable):
 //
-//	[0..7]   topicHash uint64 — xxhash64(topic)
-//	[8..15]  bucket    uint64 — time bucket, optionally preceded by a virtual shard slot
-//	[16..23] eventID   uint64 — monotonic counter from EventRepository
+//	[0..7]   topicHash uint64        — xxhash64(topic)
+//	[8..16]  bucket    StorageBucket — shard slot and time bucket
+//	[17..24] eventID   uint64        — monotonic counter from EventRepository
 //
 // Sorting groups messages by topic, then by shard slot and time bucket.
-func EventKey(bucket, topicHash, eventID uint64) []byte {
-	key := make([]byte, 24)
+func (b StorageBucket) EventKey(topicHash, eventID uint64) []byte {
+	key := make([]byte, EventKeySize)
 	binary.BigEndian.PutUint64(key[0:8], topicHash)
-	binary.BigEndian.PutUint64(key[8:16], bucket)
-	binary.BigEndian.PutUint64(key[16:24], eventID)
+	copy(key[8:eventKeyPrefixSize], b[:])
+	binary.BigEndian.PutUint64(key[eventKeyPrefixSize:], eventID)
+	return key
+}
+
+// Prefix returns the inclusive lower bound of this topic, slot and time bucket.
+func (b StorageBucket) Prefix(topicHash uint64) []byte {
+	key := make([]byte, eventKeyPrefixSize)
+	binary.BigEndian.PutUint64(key[:8], topicHash)
+	copy(key[8:], b[:])
 	return key
 }
 
@@ -111,16 +136,12 @@ func TopicUpperBound(topicHash uint64) []byte {
 	return key
 }
 
-// DueUpperBound returns the exclusive upper-bound key for scanning only the
-// due (already-scheduled) messages of a topic — those whose bucket is at most
-// maxBucket. The returned 16-byte prefix is [topicHash][maxBucket+1]; since
-// EventKey is [topicHash][bucket][eventID] with big-endian sortable fields,
-// this bound covers exactly the keys with bucket ≤ maxBucket.
+// DueUpperBound returns the exclusive end of the unsharded due range.
 func DueUpperBound(topicHash, maxBucket uint64) []byte {
-	key := make([]byte, 16)
-	binary.BigEndian.PutUint64(key[0:8], topicHash)
-	binary.BigEndian.PutUint64(key[8:16], maxBucket+1)
-	return key
+	if maxBucket >= MaxVirtualTimeBucket {
+		return ShardStorageBucket(1, 0).Prefix(topicHash)
+	}
+	return ShardStorageBucket(0, maxBucket+1).Prefix(topicHash)
 }
 
 // BucketUpperBound returns the exclusive upper-bound key for an iterator that
@@ -131,18 +152,13 @@ func BucketUpperBound(maxBucket uint64) []byte {
 	return key
 }
 
-// ParseEventKey extracts the three components of a 24-byte event key.
-// Returns (topicHash, bucket, eventID) matching the byte layout [topicHash][bucket][eventID].
-// Returns ok=false if the key length is not exactly 24 bytes.
+// ParseEventKey extracts a 25-byte event key's topic hash, time bucket and event ID.
 func ParseEventKey(key []byte) (topicHash, bucket, eventID uint64, err error) {
-	if len(key) != 24 {
-		return 0, 0, 0, fmt.Errorf(errInvalidKeyLength, len(key))
+	if len(key) != EventKeySize {
+		return 0, 0, 0, fmt.Errorf("key length must be %d, got %d", EventKeySize, len(key))
 	}
 	topicHash = binary.BigEndian.Uint64(key[0:8])
-	bucket = binary.BigEndian.Uint64(key[8:16])
-	if EventShardSlot(key) != 0 {
-		bucket &= MaxVirtualTimeBucket
-	}
-	eventID = binary.BigEndian.Uint64(key[16:24])
+	bucket = binary.BigEndian.Uint64(key[9:eventKeyPrefixSize]) & MaxVirtualTimeBucket
+	eventID = binary.BigEndian.Uint64(key[eventKeyPrefixSize:])
 	return topicHash, bucket, eventID, nil
 }

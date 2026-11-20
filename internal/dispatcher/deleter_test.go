@@ -9,6 +9,7 @@ import (
 
 	"github.com/futureq-io/futureq/internal/config"
 	"github.com/futureq-io/futureq/internal/storage"
+	"github.com/futureq-io/futureq/pkg/utils"
 	"github.com/stretchr/testify/suite"
 	"go.uber.org/zap"
 )
@@ -97,7 +98,7 @@ func (s *DeleterSuite) TestRaftDeleteBackend_ProposalsMarshalledCommand() {
 
 	backend := NewRaftDeleteBackend(proposeFn, zap.NewNop())
 
-	key := make([]byte, 24) // required key length for MarshalDeleteBatchCmd
+	key := make([]byte, utils.EventKeySize) // required key length for MarshalDeleteBatchCmd
 	require.NoError(backend.DeleteKeys([][]byte{key}))
 
 	require.NotNil(captured, "propose must be called")
@@ -111,7 +112,7 @@ func (s *DeleterSuite) TestRaftDeleteBackend_ProposalsErrorPropagates() {
 	proposeFn := func(cmd []byte) error { return sentinel }
 
 	backend := NewRaftDeleteBackend(proposeFn, zap.NewNop())
-	key := make([]byte, 24)
+	key := make([]byte, utils.EventKeySize)
 
 	err := backend.DeleteKeys([][]byte{key})
 	require.Error(err)
@@ -125,7 +126,7 @@ func (s *DeleterSuite) TestRaftDeleteBackend_InvalidKeyLength_Fails() {
 	backend := NewRaftDeleteBackend(proposeFn, zap.NewNop())
 
 	err := backend.DeleteKeys([][]byte{[]byte("short-key")})
-	require.Error(err, "a non-24-byte key must be rejected")
+	require.Error(err, "a non-25-byte key must be rejected")
 }
 
 // ─── Deleter ─────────────────────────────────────────────────────────────────

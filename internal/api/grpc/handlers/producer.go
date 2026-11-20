@@ -240,9 +240,11 @@ func (ph *ProducerHandler) processRaftBatch(
 		}
 
 		bucket := utils.CalculateBucket(data.EnqueuedAtUnixMs+data.DelayMs, cfg.Delivery.TimeBucket)
+		bucket, slot := utils.ChooseStorageBucket(bucket, cfg.Storage.VirtualShards)
 		raftItem := raft.StoreBatchItem{
 			ID:        app.A.Repositories.Events.NextID(),
-			Bucket:    utils.ChooseStorageBucket(bucket, cfg.Storage.VirtualShards),
+			Bucket:    bucket,
+			ShardSlot: slot,
 			TopicHash: utils.TopicHash(data.Topic),
 			Msg:       dataBytes,
 			Receipt:   receipts[data.Topic],

@@ -121,7 +121,7 @@ func NewDeleter(backend DeleteBackend, interval time.Duration, logger *zap.Logge
 	}
 }
 
-// MarkDeleted enqueues a key for batched deletion. The key is the 24-byte
+// MarkDeleted enqueues a key for batched deletion. The key is the 25-byte
 // storage key received as the delivery_tag from the consumer's AckRequest.
 func (d *Deleter) MarkDeleted(key []byte) {
 	if !d.TryMarkDeleted(key) {

@@ -66,7 +66,7 @@ func (j *TTLJanitor) sweep() {
 	var expiredKeys []expiredMessage
 
 	err := j.db.Scan(nil, func(key, val []byte) error {
-		// Only consider 24-byte event keys.
+		// Only consider 25-byte event keys.
 		if _, _, _, err := utils.ParseEventKey(key); err != nil {
 			// Not an event key (metadata, indexes, etc.) — skip silently.
 			return nil

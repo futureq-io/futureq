@@ -11,6 +11,7 @@ import (
 	"github.com/futureq-io/futureq/internal/config"
 	raft "github.com/futureq-io/futureq/internal/raft/event"
 	"github.com/futureq-io/futureq/internal/storage"
+	"github.com/futureq-io/futureq/pkg/utils"
 )
 
 // inFlightEntry tracks a single message that has been sent to a consumer but
@@ -30,9 +31,9 @@ type inFlightEntry struct {
 //   - Performs TTL checks at dispatch time; expired messages are batched for deletion
 //   - Snapshot-based iteration (never blocks concurrent writes)
 type Dispatcher struct {
-	skipKeys           func([24]byte) bool // synchronized preload lookup, isolated discovery adapter only
-	scanOnly           bool                // isolated worker adapter never publishes scheduler gauges
-	shardScan          *shardScanRange     // immutable range assigned to an isolated discovery worker
+	skipKeys           func([utils.EventKeySize]byte) bool // synchronized preload lookup, isolated discovery adapter only
+	scanOnly           bool                                // isolated worker adapter never publishes scheduler gauges
+	shardScan          *shardScanRange                     // immutable range assigned to an isolated discovery worker
 	scanSource         storage.IteratorSource
 	scanRevision       uint64
 	scanShardRevisions *storage.TopicRevisionSnapshot

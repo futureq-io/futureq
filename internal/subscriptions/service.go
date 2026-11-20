@@ -2,6 +2,8 @@
 package subscriptions
 
 import (
+	"github.com/futureq-io/futureq/pkg/utils"
+
 	"context"
 	"errors"
 	"fmt"
@@ -268,7 +270,7 @@ func (s *Service) Maintain(ctx context.Context, now time.Time) error {
 	var keys [][]byte
 	prefix := []byte("metadata/delivery/")
 	err = nextPage(s.DB, prefix, &s.cleanupCursor, func(key, data []byte) error {
-		if len(key) != len(prefix)+24 {
+		if len(key) != len(prefix)+utils.EventKeySize {
 			return nil
 		}
 		state, err := raft.UnmarshalDeliveryState(data)

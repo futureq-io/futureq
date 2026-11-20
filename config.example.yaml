@@ -64,7 +64,7 @@ cluster:
 storage:
   engine: pebble
   # Virtual delivery shards for clustered publishes. Use 0 to disable for new messages.
-  virtualShards: 64
+  virtualShards: 256 # 0 to disable, or a power of two from 2 through 65536
   pebble:
     # memory uses a virtual filesystem and discards data on exit.
     mode: disk

@@ -322,12 +322,12 @@ func (s *SchedulerSuite) TestReleaseReadyPreservesFuturePayloadsAndRewindsRepair
 	require.Zero(p.readyCount)
 	require.Len(p.items, 1)
 	require.Len(p.keys, 1)
-	require.Equal([24]byte(future), p.items[0].key)
+	require.Equal([utils.EventKeySize]byte(future), p.items[0].key)
 	require.Equal([]byte("payload"), p.items[0].payload.message.Payload)
 	for _, slot := range backing {
 		require.False(slot.ready, "removed due references must be cleared from the old array")
 		if slot.payload.message != nil {
-			require.Equal([24]byte(future), slot.key, "the old backing array must not retain evicted payloads")
+			require.Equal([utils.EventKeySize]byte(future), slot.key, "the old backing array must not retain evicted payloads")
 		}
 	}
 	require.Equal(uint64(1), p.repairGeneration)
@@ -355,7 +355,7 @@ func (s *SchedulerSuite) TestFutureOnlyDiscoveryDoesNotScanOrAdvanceDueCursor() 
 	require.Empty(result.chunk.items)
 	require.Equal(cursor, result.cursor)
 	require.Len(result.future, 1)
-	require.Equal([24]byte(future), result.future[0].key)
+	require.Equal([utils.EventKeySize]byte(future), result.future[0].key)
 	require.Equal([]byte("payload"), result.future[0].payload.message.Payload)
 }
 
@@ -423,7 +423,7 @@ type workloadDB struct {
 }
 
 func (db *workloadDB) Get(key []byte) ([]byte, io.Closer, error) {
-	if len(key) == 24 {
+	if len(key) == utils.EventKeySize {
 		db.payloadGets.Add(1)
 	} else {
 		db.metadataGets.Add(1)
@@ -532,7 +532,7 @@ func (s *SchedulerSuite) TestSchedulerWorkload() {
 					if !hub.BeginSend(id, msg) {
 						continue
 					}
-					if every := workloadInt("FUTUREQ_WORKLOAD_NACK_EVERY", 0); every > 0 && binary.BigEndian.Uint64(msg.DeliveryTag[16:])%uint64(every) == 0 && !nacked[string(msg.DeliveryTag)] {
+					if every := workloadInt("FUTUREQ_WORKLOAD_NACK_EVERY", 0); every > 0 && binary.BigEndian.Uint64(msg.DeliveryTag[utils.EventKeySize-8:])%uint64(every) == 0 && !nacked[string(msg.DeliveryTag)] {
 						nacked[string(msg.DeliveryTag)] = true
 						intentionalRetries.Add(1)
 						hub.AcknowledgeSent(id, msg.DeliveryTag)

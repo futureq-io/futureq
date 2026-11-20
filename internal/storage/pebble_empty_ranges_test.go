@@ -10,6 +10,7 @@ import (
 
 	"github.com/cockroachdb/pebble/v2"
 	"github.com/futureq-io/futureq/internal/config"
+	"github.com/futureq-io/futureq/pkg/utils"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 )
@@ -202,8 +203,8 @@ func BenchmarkPebbleTombstoneFirst(b *testing.B) {
 			// profiled deployment. Reproduce the internal work, not just timing.
 			batch := db.NewBatch()
 			for i := range count {
-				key := make([]byte, 24)
-				binary.BigEndian.PutUint64(key[16:], uint64(i))
+				key := make([]byte, utils.EventKeySize)
+				binary.BigEndian.PutUint64(key[utils.EventKeySize-8:], uint64(i))
 				require.NoError(b, batch.Set(key, bytes.Repeat([]byte("v"), 200)))
 				require.NoError(b, batch.Delete(key))
 			}
@@ -296,8 +297,8 @@ func BenchmarkPebblePublishDiscoveryChurn(b *testing.B) {
 			db := emptyRangeDB(b)
 			const history = 100000
 			keyAt := func(id uint64) []byte {
-				key := make([]byte, 24)
-				binary.BigEndian.PutUint64(key[16:], id)
+				key := make([]byte, utils.EventKeySize)
+				binary.BigEndian.PutUint64(key[utils.EventKeySize-8:], id)
 				return key
 			}
 			batch := db.NewBatch()

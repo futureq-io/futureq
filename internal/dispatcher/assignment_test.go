@@ -33,7 +33,7 @@ func TestShardAssignmentCacheTracksCommittedAndLocalMembership(t *testing.T) {
 	first, joining := make(chan *pb.QueueMessage, 2), make(chan *pb.QueueMessage, 2)
 	hub.Register("first", "orders", "workers", first)
 	hub.Register("joining", "orders", "workers", joining)
-	key := func(id uint64) []byte { return utils.EventKey(utils.ShardStorageBucket(2, 1), 1, id) }
+	key := func(id uint64) []byte { return utils.ShardStorageBucket(2, 1).EventKey(1, id) }
 	for id := uint64(1); id <= 2; id++ {
 		require.True(t, hub.InterestView("orders").hasLocalOwner(key(id)))
 		require.Equal(t, []string{"workers"}, hub.DispatchToTopic("orders", &pb.QueueMessage{Topic: "orders"}, key(id)))
@@ -78,7 +78,7 @@ func TestAssignedGroupFallsBackWhenSelectedWorkerQueueIsFull(t *testing.T) {
 	msg := &pb.QueueMessage{Topic: topic}
 	bucket := utils.ShardStorageBucket(2, 1)
 	for i := range 10 {
-		key := utils.EventKey(bucket, utils.TopicHash(topic), uint64(i+1))
+		key := bucket.EventKey(utils.TopicHash(topic), uint64(i+1))
 		require.Equal(t, []string{group}, h.DispatchPrepared(topic, msg, key, nil))
 		require.Equal(t, key, receiveReplicaMessage(t, healthy).DeliveryTag)
 		require.Empty(t, h.DispatchPrepared(topic, msg, key, nil), "the group's reservation prevents a duplicate")

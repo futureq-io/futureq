@@ -227,7 +227,7 @@ func (s *EventRepositorySuite) TestStoreRawWithBatch_StoresRawBytes() {
 	indexes := [][]byte{[]byte("idx-key-1")}
 
 	b := s.db.NewBatch()
-	key, err := repo.StoreRawWithBatch(b, 9, 42, 12345, indexes, rawMsg)
+	key, err := repo.StoreRawWithBatch(b, 9, utils.ShardStorageBucket(0, 42), 12345, indexes, rawMsg)
 	require.NoError(err)
 	require.NoError(b.Commit(storage.Sync))
 	require.NoError(b.Close())
@@ -263,7 +263,7 @@ func (s *EventRepositorySuite) TestStoreRawWithBatch_MultipleIndexes() {
 	}
 
 	b := s.db.NewBatch()
-	key, err := repo.StoreRawWithBatch(b, 1, 1, 2, indexes, []byte("v"))
+	key, err := repo.StoreRawWithBatch(b, 1, utils.ShardStorageBucket(0, 1), 2, indexes, []byte("v"))
 	require.NoError(err)
 	require.NoError(b.Commit(storage.Sync))
 	require.NoError(b.Close())

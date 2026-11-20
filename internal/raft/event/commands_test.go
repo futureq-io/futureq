@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"testing"
 
+	"github.com/futureq-io/futureq/pkg/utils"
 	"github.com/stretchr/testify/suite"
 )
 
@@ -22,7 +23,7 @@ func (s *CommandsSuite) TestStoreBatchCmd_BasicRoundTrip() {
 
 	items := []StoreBatchItem{
 		{Bucket: 100, TopicHash: 42, Msg: []byte("hello")},
-		{Bucket: 200, TopicHash: 43, Msg: []byte("world")},
+		{Bucket: utils.MaxVirtualTimeBucket, ShardSlot: 2*utils.MaxVirtualShards - 1, TopicHash: 43, Msg: []byte("world")},
 	}
 
 	cmd, err := MarshalStoreBatchCmd(items)
@@ -35,7 +36,9 @@ func (s *CommandsSuite) TestStoreBatchCmd_BasicRoundTrip() {
 	require.Equal(uint64(100), got[0].Bucket)
 	require.Equal(uint64(42), got[0].TopicHash)
 	require.Equal([]byte("hello"), got[0].Msg)
-	require.Equal(uint64(200), got[1].Bucket)
+	require.Zero(got[0].ShardSlot)
+	require.Equal(utils.MaxVirtualTimeBucket, got[1].Bucket)
+	require.Equal(2*utils.MaxVirtualShards-1, got[1].ShardSlot)
 	require.Equal(uint64(43), got[1].TopicHash)
 	require.Equal([]byte("world"), got[1].Msg)
 }
@@ -97,7 +100,7 @@ func (s *CommandsSuite) TestStoreBatchCmd_TooShort_Fails() {
 func (s *CommandsSuite) TestStoreBatchCmd_WrongType_Fails() {
 	require := s.Require()
 
-	deleteCmd, _ := MarshalDeleteBatchCmd([][]byte{make([]byte, 24)})
+	deleteCmd, _ := MarshalDeleteBatchCmd([][]byte{make([]byte, utils.EventKeySize)})
 
 	_, err := UnmarshalStoreBatchCmd(deleteCmd)
 	require.Error(err)
@@ -153,8 +156,8 @@ func (s *CommandsSuite) TestDeleteBatchCmd_BasicRoundTrip() {
 	require := s.Require()
 
 	keys := [][]byte{
-		make([]byte, 24),
-		make([]byte, 24),
+		make([]byte, utils.EventKeySize),
+		make([]byte, utils.EventKeySize),
 	}
 	// Make keys distinct.
 	keys[0][0] = 0xAA
@@ -175,6 +178,8 @@ func (s *CommandsSuite) TestDeleteBatchCmd_InvalidKeyLength_Fails() {
 	require := s.Require()
 
 	_, err := MarshalDeleteBatchCmd([][]byte{[]byte("short")})
+	require.Error(err)
+	_, err = MarshalDeleteBatchCmd([][]byte{make([]byte, 24)})
 	require.Error(err)
 }
 
@@ -208,7 +213,7 @@ func (s *CommandsSuite) TestDeleteBatchCmd_WrongType_Fails() {
 func (s *CommandsSuite) TestDeleteBatchCmd_TruncatedKeyData_Fails() {
 	require := s.Require()
 
-	keys := [][]byte{make([]byte, 24)}
+	keys := [][]byte{make([]byte, utils.EventKeySize)}
 	cmd, _ := MarshalDeleteBatchCmd(keys)
 
 	// Cut mid-key.
@@ -224,7 +229,7 @@ func (s *CommandsSuite) TestDeleteBatchCmd_ImpossibleCountAndTrailingDataFail() 
 	_, err := UnmarshalDeleteBatchCmd(cmd)
 	require.ErrorContains(err, "too short")
 
-	valid, err := MarshalDeleteBatchCmd([][]byte{make([]byte, 24)})
+	valid, err := MarshalDeleteBatchCmd([][]byte{make([]byte, utils.EventKeySize)})
 	require.NoError(err)
 	_, err = UnmarshalDeleteBatchCmd(append(valid, 0))
 	require.ErrorContains(err, "trailing bytes")

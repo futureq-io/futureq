@@ -73,7 +73,7 @@ func (s *PreloadSuite) TestPreloadBoundsExactHorizonAndDeduplication() {
 				require.Empty(d.collectScheduledTopic("a", now).items)
 			}
 			require.Equal(2, d.preloadCount, "repeat scans deduplicate candidates")
-			require.Equal([24]byte(first), d.preloads["a"].items[0].key)
+			require.Equal([utils.EventKeySize]byte(first), d.preloads["a"].items[0].key)
 			require.Empty(d.collectScheduledTopic("b", now).items)
 			require.Equal(3, d.preloadCount, "cap applies across topics")
 			state, err := raft.ReadDeliveryState(d.db, first)
@@ -315,7 +315,7 @@ func (s *PreloadSuite) TestPreloadPartialDrainBoundsRetainedCapacityAcrossTopics
 		d.preloads[topic] = p
 		available := d.PreloadMaxMessages - d.preloadCount
 		batch := d.db.NewBatch()
-		var retainedKey [24]byte
+		var retainedKey [utils.EventKeySize]byte
 		for id := range available {
 			due := now + 1000
 			if id == 0 {
@@ -323,7 +323,7 @@ func (s *PreloadSuite) TestPreloadPartialDrainBoundsRetainedCapacityAcrossTopics
 			}
 			key := utils.EventKey(utils.CalculateBucket(due, d.TimeBucket), utils.TopicHash(topic), uint64(id))
 			if id == 0 {
-				retainedKey = [24]byte(key)
+				retainedKey = [utils.EventKeySize]byte(key)
 			}
 			value, err := proto.Marshal(&storagepb.StoredMessage{Topic: topic, EnqueuedAtUnixMs: due - 1000, DelayMs: 1000})
 			require.NoError(err)
@@ -335,12 +335,12 @@ func (s *PreloadSuite) TestPreloadPartialDrainBoundsRetainedCapacityAcrossTopics
 		require.Equal(d.PreloadMaxMessages, d.preloadCount)
 		require.Len(p.items, available)
 		oldKeys := p.keys
-		seen := make(map[[24]byte]bool)
+		seen := make(map[[utils.EventKeySize]byte]bool)
 		for len(p.items) > 1 {
 			chunk := d.collectPreloaded(topic, p, view, now+1000)
 			require.NotEmpty(chunk.items)
 			for _, item := range chunk.items {
-				key := [24]byte(item.Key)
+				key := [utils.EventKeySize]byte(item.Key)
 				require.False(seen[key], "compaction must preserve heap contents without duplicates")
 				seen[key] = true
 			}
@@ -459,7 +459,7 @@ type payloadReadDB struct {
 }
 
 func (db *payloadReadDB) Get(key []byte) ([]byte, io.Closer, error) {
-	if len(key) == 24 {
+	if len(key) == utils.EventKeySize {
 		db.payloadReads.Add(1)
 	}
 	return db.DB.Get(key)
@@ -854,7 +854,7 @@ func BenchmarkDueCandidateCollection(b *testing.B) {
 			candidates := make(candidateHeap, 64)
 			for i := range candidates {
 				key := utils.EventKey(uint64(now-1000), utils.TopicHash("orders"), uint64(i))
-				candidates[i] = preloadCandidate{key: [24]byte(key), due: now - 1000}
+				candidates[i] = preloadCandidate{key: [utils.EventKeySize]byte(key), due: now - 1000}
 				if err := batch.Set(key, value); err != nil {
 					b.Fatal(err)
 				}
@@ -869,7 +869,7 @@ func BenchmarkDueCandidateCollection(b *testing.B) {
 			for b.Loop() {
 				var chunk deliveryChunk
 				if cached {
-					p := &topicPreload{items: append(candidateHeap(nil), candidates...), keys: make(map[[24]byte]bool, len(candidates))}
+					p := &topicPreload{items: append(candidateHeap(nil), candidates...), keys: make(map[[utils.EventKeySize]byte]bool, len(candidates))}
 					for _, candidate := range candidates {
 						p.keys[candidate.key] = true
 					}

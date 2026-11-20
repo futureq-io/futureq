@@ -511,8 +511,8 @@ func moduloWorker(members []metadata.ConsumerMember, consumers []*ConsumerEntry,
 // deliveryOrdinal is the event ID in the topic-first storage key. Using the
 // same ordinal on every replica gives a stable modulo assignment.
 func deliveryOrdinal(tag []byte) uint64 {
-	if len(tag) == 24 {
-		return binary.BigEndian.Uint64(tag[16:24])
+	if len(tag) == utils.EventKeySize {
+		return binary.BigEndian.Uint64(tag[utils.EventKeySize-8:])
 	}
 	h := fnv.New64a()
 	_, _ = h.Write(tag)

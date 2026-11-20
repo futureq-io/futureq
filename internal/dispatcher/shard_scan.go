@@ -12,8 +12,7 @@ import (
 )
 
 type shardScanRange struct {
-	slots           [2 * utils.MaxVirtualShards]bool
-	first, last     int
+	slots           shardSlotRanges
 	includeLegacy   bool
 	epoch           uint64
 	assignmentEpoch uint64
@@ -33,7 +32,6 @@ type shardScanState struct {
 func splitShardScans(view InterestView, workers int, layouts int) []shardScanState {
 	// Each layout has at most this many slots to split into nonempty ranges.
 	workers = min(workers, utils.MaxVirtualShards)
-	owned := view.ownedShardSlots()
 	lanes := make([]shardScanState, workers)
 	lanes[0].rangeKeys.includeLegacy = true
 	lanes[0].rangeKeys.epoch = view.Epoch
@@ -43,28 +41,27 @@ func splitShardScans(view InterestView, workers int, layouts int) []shardScanSta
 		if layouts&count == 0 {
 			continue
 		}
-		var slots [utils.MaxVirtualShards]int
+		slots := view.ownedShardSlots(count)
 		n := 0
-		for slot := count; slot < 2*count; slot++ {
-			if owned[slot] {
-				slots[n] = slot
-				n++
-			}
+		for _, r := range slots {
+			n += r.end - r.first
 		}
 		parallel := min(n, workers)
 		used = max(used, parallel)
+		rangeIdx, assigned := 0, 0
 		for lane := range parallel {
 			r := &lanes[lane].rangeKeys
 			r.epoch = view.Epoch
 			r.assignmentEpoch = view.assignmentEpoch
-			start := lane * n / parallel
-			end := (lane + 1) * n / parallel
-			if r.first == 0 {
-				r.first = slots[start]
-			}
-			r.last = slots[end-1]
-			for _, slot := range slots[start:end] {
-				r.slots[slot] = true
+			for end := (lane + 1) * n / parallel; assigned < end; {
+				first := slots[rangeIdx].first
+				size := min(end-assigned, slots[rangeIdx].end-first)
+				r.slots = append(r.slots, shardSlotRange{first, first + size})
+				assigned += size
+				slots[rangeIdx].first += size
+				if slots[rangeIdx].first == slots[rangeIdx].end {
+					rangeIdx++
+				}
 			}
 		}
 	}
@@ -102,13 +99,17 @@ func discoverShardLayouts(source storage.IteratorSource, hash uint64) (int, erro
 
 func (r *shardScanRange) bounds(hash uint64, lower, upper []byte) ([]byte, []byte) {
 	if !r.includeLegacy {
-		first := shardScanBound(hash, r.first)
+		first := shardScanBound(hash, r.slots[0].first)
 		if bytes.Compare(lower, first) < 0 {
 			lower = first
 		}
 	}
-	if r.last+1 < len(r.slots) {
-		end := shardScanBound(hash, r.last+1)
+	last := 1 // include the unsharded range even when no layouts are present
+	if len(r.slots) != 0 {
+		last = r.slots[len(r.slots)-1].end
+	}
+	if last < 2*utils.MaxVirtualShards {
+		end := shardScanBound(hash, last)
 		if bytes.Compare(end, upper) < 0 {
 			upper = end
 		}
@@ -117,11 +118,11 @@ func (r *shardScanRange) bounds(hash uint64, lower, upper []byte) ([]byte, []byt
 }
 
 func shardScanBound(hash uint64, slot int) []byte {
-	return utils.EventKey(utils.ShardStorageBucket(slot, 0), hash, 0)[:16]
+	return utils.ShardStorageBucket(slot, 0).Prefix(hash)
 }
 
 func topicScanEnd(hash uint64) []byte {
-	return append(utils.EventKey(^uint64(0), hash, ^uint64(0)), 0)
+	return append(utils.ShardStorageBucket(2*utils.MaxVirtualShards-1, utils.MaxVirtualTimeBucket).EventKey(hash, ^uint64(0)), 0)
 }
 
 func splitScanBudget(total, index, workers int) int {
@@ -171,7 +172,7 @@ func (d *Dispatcher) shardDiscoveryJobs(base discoveryJob, now time.Time) []disc
 		index       int
 		due, future bool
 	}
-	var selected [utils.MaxVirtualShards]selectedLane
+	selected := make([]selectedLane, parallel)
 	n, dueLanes, futureLanes := 0, 0, 0
 	dueBucket := utils.CalculateBucket(now.UnixMilli(), d.TimeBucket)
 	lead := -1

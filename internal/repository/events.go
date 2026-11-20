@@ -61,7 +61,7 @@ func (er *EventRepository) NextID() uint64 {
 }
 
 // StoreWithBatch marshals msg and adds it to an existing Pebble batch using
-// the caller-supplied leader-assigned ID. It returns the 24-byte Pebble key.
+// the caller-supplied leader-assigned ID. It returns the 25-byte event key.
 func (er *EventRepository) StoreWithBatch(b storage.Batch, id uint64, msg *storagepb.StoredMessage) ([]byte, error) {
 	fireAtMs := msg.EnqueuedAtUnixMs + msg.DelayMs
 	bucket := utils.CalculateBucket(fireAtMs, er.bucketSize)
@@ -98,9 +98,9 @@ func (er *EventRepository) StoreWithBatch(b storage.Batch, id uint64, msg *stora
 
 // StoreRawWithBatch stores raw message bytes under the final ID selected by
 // ordered Raft apply. It does not allocate or validate IDs itself.
-// It returns the 24-byte Pebble key for the caller to use as a delivery_tag.
-func (er *EventRepository) StoreRawWithBatch(b storage.Batch, id uint64, bucket uint64, topicHash uint64, indexes [][]byte, msg []byte) ([]byte, error) {
-	key := utils.EventKey(bucket, topicHash, id)
+// It returns the 25-byte event key for the caller to use as a delivery_tag.
+func (er *EventRepository) StoreRawWithBatch(b storage.Batch, id uint64, bucket utils.StorageBucket, topicHash uint64, indexes [][]byte, msg []byte) ([]byte, error) {
+	key := bucket.EventKey(topicHash, id)
 
 	if err := b.Set(key, msg); err != nil {
 		return nil, err

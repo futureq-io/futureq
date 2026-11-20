@@ -56,7 +56,7 @@ func putShardBudgetPayload(t *testing.T, d *Dispatcher, topic string, slot, id, 
 	})
 	require.NoError(t, err)
 	bucket := utils.ShardStorageBucket(slot, utils.CalculateBucket(at.UnixMilli(), d.TimeBucket))
-	key := utils.EventKey(bucket, utils.TopicHash(topic), uint64(id))
+	key := bucket.EventKey(utils.TopicHash(topic), uint64(id))
 	require.NoError(t, storeProbeEvent(d.db, key, value))
 	return key
 }
@@ -104,7 +104,7 @@ func TestShardDiscoveryRetriesOversizedPayloadOnRotatingLead(t *testing.T) {
 			base.owner.shardScans[result.job.shardLane].cursor = result.cursor
 			for _, item := range result.chunk.items {
 				admitted = append(admitted, item.Key)
-				base.owner.addKey([24]byte(item.Key))
+				base.owner.addKey([utils.EventKeySize]byte(item.Key))
 			}
 		}
 		require.Equal(t, [][]byte{want}, admitted)
@@ -129,5 +129,26 @@ func TestShardDiscoveryPreloadSharesPayloadBudgetAndRetriesDeferredKey(t *testin
 	results = runShardBudgetPass(d, base)
 	require.Len(t, results, 1)
 	require.Len(t, results[0].future, 1)
-	require.Equal(t, [24]byte(future), results[0].future[0].key)
+	require.Equal(t, [utils.EventKeySize]byte(future), results[0].future[0].key)
+}
+
+func TestShardDiscoveryAtMaxLayoutFindsSparseDueAndFutureKeys(t *testing.T) {
+	d, base := newShardBudgetTest(t, utils.MaxVirtualShards, 2)
+	d.Limits.Examined = 32
+	base.futureSlots = 2
+	now := time.Now()
+	const firstSlot = utils.MaxVirtualShards
+	const lastSlot = 2*utils.MaxVirtualShards - 1
+	due := putShardBudgetPayload(t, d, base.topic, firstSlot+1024, 1, 32, now.Add(-time.Second))
+	future := putShardBudgetPayload(t, d, base.topic, lastSlot, 2, 32, now.Add(30*time.Second))
+	byLane := make(map[int]discoveryResult)
+	for _, result := range runShardBudgetPass(d, base) {
+		byLane[result.job.shardLane] = result
+	}
+	require.Len(t, byLane, 2)
+	require.Len(t, byLane[0].chunk.items, 1)
+	require.Equal(t, due, byLane[0].chunk.items[0].Key)
+	require.Empty(t, byLane[1].chunk.items)
+	require.Len(t, byLane[1].future, 1)
+	require.Equal(t, [utils.EventKeySize]byte(future), byLane[1].future[0].key)
 }

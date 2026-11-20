@@ -20,7 +20,7 @@ futureq/
 ├── pkg/
 │   ├── raft/metadata/       # metadata-group Raft (public: cluster membership)
 │   ├── log/                 # zap logger setup
-│   └── utils/               # 24-byte event key helpers
+│   └── utils/               # 25-byte event key helpers
 ├── config.example.yaml      # documented defaults
 ├── Dockerfile
 └── CHANGELOG.md
