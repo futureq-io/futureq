@@ -27,6 +27,7 @@ and publish-bound delivery in `internal/raft/event/published_delivery.go`:
 | `StoreDeliveryBatchCmd (8)` | Leader/no-ACK publish: encoded store batch followed by a length-prefixed frozen receipt per message; payload and destinations commit atomically. |
 | `SubscriptionCmd (9)` | Protobuf subscription create/remove, worker connect/disconnect, batched session renewal, conditional idle expiry, and bounded retired-recipient cleanup. |
 | `PublishBatchCmd (10)` | Quorum publish: encoded store batch without receipts. Apply selects destinations from subscription state at this log position and writes payload plus receipt atomically. |
+| `PublishGroupCmd (11)` | Optional internal publish batching. One Raft entry carries an ordered sequence of length-prefixed publish commands of the same kind. Apply evaluates each client batch independently and returns its result in the same order. |
 
 Quorum publishers use one proposal with no admission quorum read. Apply merges
 persisted subscriptions with earlier subscription commands in the same Update,
