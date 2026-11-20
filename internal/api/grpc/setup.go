@@ -18,9 +18,10 @@ import (
 
 // Server wraps a *grpc.Server and exposes lifecycle methods.
 type Server struct {
-	srv    *grpc.Server
-	logger *zap.Logger
-	addr   string
+	srv      *grpc.Server
+	producer *handlers.ProducerHandler
+	logger   *zap.Logger
+	addr     string
 }
 
 // New creates a fully configured gRPC server and registers all service
@@ -53,14 +54,16 @@ func New(
 	)
 
 	// Register all service implementations.
-	pb.RegisterFutureQProducerServer(srv, handlers.NewProducerHandler(log))
+	producer := handlers.NewProducerHandler(log)
+	pb.RegisterFutureQProducerServer(srv, producer)
 	pb.RegisterFutureQConsumerServer(srv, handlers.NewConsumerHandler(log, hub, deleter))
 	pb.RegisterFutureQClusterServer(srv, handlers.NewClusterHandler(log))
 
 	return &Server{
-		srv:    srv,
-		logger: log,
-		addr:   cfg.Listen,
+		srv:      srv,
+		producer: producer,
+		logger:   log,
+		addr:     cfg.Listen,
 	}
 }
 
@@ -97,6 +100,7 @@ func (s *Server) WaitForShutdown(ctx context.Context) {
 
 	go func() {
 		defer app.A.ComponentShutdownDone()
+		defer s.producer.Close()
 
 		<-ctx.Done()
 

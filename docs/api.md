@@ -21,6 +21,7 @@ FutureQ speaks gRPC; protobuf definitions live in [futureq-io/protocol](https://
 `/futureq.FutureQProducer/PublishStream` — bidi stream of `PublishBatch` → `PublishBatchAck`.
 
 - Each `PublishBatch` carries `messages` (topic, payload, delay_ms, ttl_ms, optional indexes) and an `ack_level`.
+- When [internal batching](configuration.md#publish) is enabled, concurrent streams can share a local commit or Raft proposal. Each client batch keeps its own admission result and acknowledgment guarantee. Cancellation before a flush can remove a request from the group. Cancellation after submission can leave the publish outcome unknown to the client.
 - Exactly one `PublishBatchAck{success, error_message}` is sent per received batch — **batch-level** semantics: the batch fails atomically (no partial write) on negative delays/TTLs, a too-weak ack level, or non-leader contact in Raft mode. On failure the RPC-level gRPC status also carries the error.
 - An empty batch returns a default (unsuccessful) ack and performs no write.
 - Client half-close (EOF) ends the stream cleanly.
