@@ -1,6 +1,7 @@
 package dispatcher
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"strings"
@@ -32,10 +33,11 @@ func DefaultScanLimits() ScanLimits {
 }
 
 type scanCursor struct {
-	after []byte
-	upper []byte // fixed exclusive end of this repair pass
-	epoch uint64
-	last  uint64 // fixed due bucket cutoff for sharded repair passes
+	after           []byte
+	upper           []byte // fixed exclusive end of this repair pass
+	epoch           uint64
+	assignmentEpoch uint64
+	shards          *shardedDueScan
 }
 type deliveryChunk struct {
 	unfit       bool // at least one recipient command cannot fit even an empty batch
@@ -80,51 +82,81 @@ func (d *Dispatcher) collectTopic(topic string, nowMs int64) deliveryChunk {
 		observeCollection("due_scan", started)
 	}()
 	view := d.hub.InterestView(topic)
-	if !view.Active || (d.shardScan != nil && d.shardScan.epoch != view.Epoch) {
+	if !view.Active || !d.shardScan.matches(view) {
 		return chunk
 	}
 	cursor := d.cursors[topic]
-	if cursor == nil || cursor.epoch != view.Epoch {
-		cursor = &scanCursor{epoch: view.Epoch}
+	if cursor == nil || cursor.epoch != view.Epoch || cursor.assignmentEpoch != view.assignmentEpoch {
+		cursor = &scanCursor{epoch: view.Epoch, assignmentEpoch: view.assignmentEpoch}
 		d.cursors[topic] = cursor
 	}
 	hash := utils.TopicHash(topic)
-	lower := utils.TopicLowerBound(hash)
-	if len(cursor.after) > 0 {
+	last := utils.CalculateBucket(nowMs, d.TimeBucket)
+	work := dueScanWork{started: started}
+	if view.sharded {
+		d.collectShardedDue(topic, hash, last, view, cursor, &chunk, &work)
+	} else {
+		d.collectDueRange(topic, view, cursor, utils.TopicLowerBound(hash), utils.DueUpperBound(hash, last), &chunk, &work)
+	}
+	return chunk
+}
+
+type dueScanWork struct {
+	started         time.Time
+	examined, bytes int
+	commandSize     raft.DeliveryPrepareSizer
+}
+
+func (d *Dispatcher) dueScanFull(chunk *deliveryChunk, work *dueScanWork) bool {
+	return work.examined >= d.Limits.Examined || len(chunk.items) >= d.Limits.Candidates || work.bytes >= d.Limits.Bytes ||
+		(work.examined > 0 && time.Since(work.started) >= d.Limits.WorkTime) || !d.hub.DeliveryPermitted()
+}
+
+// collectDueRange scans one shard's due-time window. An empty result from an
+// initial position proves that the whole current window is empty.
+func (d *Dispatcher) collectDueRange(topic string, view InterestView, cursor *scanCursor, lower, upper []byte, chunk *deliveryChunk, work *dueScanWork) bool {
+	if len(cursor.after) != 0 {
 		lower = cursor.after
 	}
-	upper := cursor.upper
-	last := utils.CalculateBucket(nowMs, d.TimeBucket)
-	if len(upper) != 0 && view.sharded {
-		last = cursor.last
-	} else if len(upper) == 0 && !view.sharded {
-		upper = utils.DueUpperBound(hash, last)
+	if len(cursor.upper) != 0 && bytes.Compare(cursor.upper, upper) < 0 {
+		upper = cursor.upper
 	}
-	iter, err := openDiscoveryIterator(d.discoverySource(), view, hash, lower, upper, 0, last, started.Add(d.Limits.WorkTime), d.shardScan)
+	if bytes.Compare(lower, upper) >= 0 {
+		cursor.after, cursor.upper = nil, nil
+		return false
+	}
+	iter, err := d.discoverySource().NewIter(&storage.IterOptions{LowerBound: lower, UpperBound: upper})
 	if err != nil {
 		d.logger.Error("delivery iterator failed", zap.Error(err))
-		return chunk
+		return false
 	}
 	defer iter.Close() //nolint:errcheck
-	examined, bytesRead := 0, 0
-	var commandSize raft.DeliveryPrepareSizer
-	// Freeze a concrete key boundary from this iterator's snapshot. A moving
-	// publishing tail (even within the same time bucket) cannot extend this pass.
-	if len(cursor.upper) == 0 && iter.Last() {
+	initial := len(cursor.upper) == 0 && len(cursor.after) == 0
+	if len(cursor.upper) == 0 {
+		if !iter.Last() {
+			// Let storage record its empty-range proof for this positioning.
+			if iter.Error() == nil {
+				iter.First()
+			}
+			if err := iter.Error(); err != nil {
+				d.logger.Error("delivery scan failed", zap.Error(err))
+				return false
+			}
+			cursor.after = nil
+			return initial
+		}
 		cursor.upper = append(append([]byte(nil), iter.Key()...), 0)
-		cursor.last = last
-		iter.upper = cursor.upper
 	}
 	valid := iter.First()
 	for valid {
 		// Iterator setup may consume the entire time budget. Examine one key
 		// before yielding on time so repeated scans can advance the cursor.
-		if examined >= d.Limits.Examined || len(chunk.items) >= d.Limits.Candidates || bytesRead >= d.Limits.Bytes || (examined > 0 && time.Since(started) >= d.Limits.WorkTime) || !d.hub.DeliveryPermitted() {
+		if d.dueScanFull(chunk, work) {
 			break
 		}
 		key := iter.Key()
-		examined++
-		bytesRead += len(key)
+		work.examined++
+		work.bytes += len(key)
 		metrics.DeliveryDiscoveryBytesTotal.Add(float64(len(key)))
 		// Appending zero is the inclusive lower bound strictly after this
 		// fixed-length event key, without assuming IDs are consecutive.
@@ -138,18 +170,18 @@ func (d *Dispatcher) collectTopic(topic string, nowMs int64) deliveryChunk {
 			valid = iter.Next()
 			continue
 		}
-		owners := view.localOwners(key)
-		if len(owners) == 0 {
+		owned, ready := d.hub.hasReadyOwner(view, key)
+		if !owned {
 			metrics.DeliveryOwnershipFilteredTotal.Inc()
 			valid = iter.Next()
 			continue // receipt cleanup has its own bounded maintenance cursor
 		}
-		if !d.hub.hasReadyOwner(owners, key) {
+		if !ready {
 			valid = iter.Next()
 			continue
 		}
 		value := iter.Value()
-		bytesRead += len(value)
+		work.bytes += len(value)
 		metrics.DeliveryDiscoveryBytesTotal.Add(float64(len(value)))
 		payload, err := cachePayload(value)
 		if err != nil {
@@ -173,7 +205,7 @@ func (d *Dispatcher) collectTopic(topic string, nowMs int64) deliveryChunk {
 		// recipients and enforces preparation command bytes when selecting due
 		// entries; avoid serialising a speculative recipient set twice.
 		if !d.scanOnly {
-			if commandSize.SizeWith(item) > d.Limits.Bytes {
+			if work.commandSize.SizeWith(item) > d.Limits.Bytes {
 				// Revisit this item next chunk rather than advancing past a byte
 				// boundary. A single oversized interest set is reported explicitly.
 				cursor.after = append([]byte(nil), key...)
@@ -182,7 +214,7 @@ func (d *Dispatcher) collectTopic(topic string, nowMs int64) deliveryChunk {
 				}
 				break
 			}
-			commandSize.Add(item)
+			work.commandSize.Add(item)
 		}
 
 		chunk.items = append(chunk.items, item)
@@ -192,16 +224,14 @@ func (d *Dispatcher) collectTopic(topic string, nowMs int64) deliveryChunk {
 		}
 		valid = iter.Next()
 	}
-	if iter.resumeAt != nil {
-		cursor.after = iter.resumeAt
-	} else if !valid {
+	if !valid {
 		cursor.after, cursor.upper = nil, nil
 	}
 	if err := iter.Error(); err != nil {
 		d.logger.Error("delivery scan failed", zap.Error(err))
 		cursor.after, cursor.upper = nil, nil
 	}
-	return chunk
+	return false
 }
 
 // Maintenance is independent of local ownership and active topics. It only

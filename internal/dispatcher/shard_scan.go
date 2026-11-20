@@ -12,10 +12,11 @@ import (
 )
 
 type shardScanRange struct {
-	slots         [2 * utils.MaxVirtualShards]bool
-	first, last   int
-	includeLegacy bool
-	epoch         uint64
+	slots           [2 * utils.MaxVirtualShards]bool
+	first, last     int
+	includeLegacy   bool
+	epoch           uint64
+	assignmentEpoch uint64
 }
 
 type shardScanState struct {
@@ -29,14 +30,19 @@ type shardScanState struct {
 
 // Split each layout independently so a mixed backlog cannot put all of the
 // active layout's shards in one lane. Lane zero also covers unsharded keys.
-func splitShardScans(view InterestView, workers int) []shardScanState {
+func splitShardScans(view InterestView, workers int, layouts int) []shardScanState {
 	// Each layout has at most this many slots to split into nonempty ranges.
 	workers = min(workers, utils.MaxVirtualShards)
 	owned := view.ownedShardSlots()
 	lanes := make([]shardScanState, workers)
 	lanes[0].rangeKeys.includeLegacy = true
+	lanes[0].rangeKeys.epoch = view.Epoch
+	lanes[0].rangeKeys.assignmentEpoch = view.assignmentEpoch
 	used := 1
 	for count := 2; count <= utils.MaxVirtualShards; count *= 2 {
+		if layouts&count == 0 {
+			continue
+		}
 		var slots [utils.MaxVirtualShards]int
 		n := 0
 		for slot := count; slot < 2*count; slot++ {
@@ -50,6 +56,7 @@ func splitShardScans(view InterestView, workers int) []shardScanState {
 		for lane := range parallel {
 			r := &lanes[lane].rangeKeys
 			r.epoch = view.Epoch
+			r.assignmentEpoch = view.assignmentEpoch
 			start := lane * n / parallel
 			end := (lane + 1) * n / parallel
 			if r.first == 0 {
@@ -61,10 +68,36 @@ func splitShardScans(view InterestView, workers int) []shardScanState {
 			}
 		}
 	}
-	if used == 1 {
-		return nil
-	}
 	return lanes[:used]
+}
+
+func (r *shardScanRange) matches(view InterestView) bool {
+	return r == nil || (r.epoch == view.Epoch && r.assignmentEpoch == view.assignmentEpoch)
+}
+
+// One positioned key establishes that a layout is present. Skip directly to
+// the next layout boundary, so the probe costs no more seeks than layouts.
+func discoverShardLayouts(source storage.IteratorSource, hash uint64) (int, error) {
+	iter, err := source.NewIter(&storage.IterOptions{LowerBound: shardScanBound(hash, 2), UpperBound: topicScanEnd(hash)})
+	if err != nil {
+		return 0, err
+	}
+	defer iter.Close() //nolint:errcheck
+	layouts := 0
+	for valid := iter.First(); valid; {
+		slot := utils.EventShardSlot(iter.Key())
+		if slot < 2 {
+			valid = iter.Next()
+			continue
+		}
+		count := utils.SlotShardCount(slot)
+		layouts |= count
+		if count == utils.MaxVirtualShards {
+			break
+		}
+		valid = iter.SeekGE(shardScanBound(hash, 2*count))
+	}
+	return layouts, iter.Error()
 }
 
 func (r *shardScanRange) bounds(hash uint64, lower, upper []byte) ([]byte, []byte) {
@@ -87,6 +120,10 @@ func shardScanBound(hash uint64, slot int) []byte {
 	return utils.EventKey(utils.ShardStorageBucket(slot, 0), hash, 0)[:16]
 }
 
+func topicScanEnd(hash uint64) []byte {
+	return append(utils.EventKey(^uint64(0), hash, ^uint64(0)), 0)
+}
+
 func splitScanBudget(total, index, workers int) int {
 	share := total / workers
 	if index < total%workers {
@@ -104,31 +141,46 @@ func (d *Dispatcher) shardDiscoveryJobs(base discoveryJob, now time.Time) []disc
 	if parallel <= 0 {
 		return nil
 	}
-	var selected [utils.MaxVirtualShards]int
-	n, futureLanes := 0, 0
+	type selectedLane struct {
+		index       int
+		due, future bool
+	}
+	var selected [utils.MaxVirtualShards]selectedLane
+	n, dueLanes, futureLanes := 0, 0, 0
+	dueBucket := utils.CalculateBucket(now.UnixMilli(), d.TimeBucket)
 	start := p.nextShardScan
 	p.nextShardScan = (start + 1) % len(lanes)
 	for attempts := 0; attempts < len(lanes) && n < parallel; attempts++ {
 		index := (start + attempts) % len(lanes)
-		futureReady := base.futureSlots > 0 && !now.Before(lanes[index].futureScanAt)
-		if base.dueSlots == 0 && !futureReady {
+		lane := &lanes[index]
+		idle := lane.cursor.shards
+		dueReady := base.dueSlots > 0 && !(base.tracksRevision && lane.generation == p.repairGeneration &&
+			idle != nil && idle.idleRev == base.revision && idle.idleUntil > dueBucket)
+		futureReady := base.futureSlots > 0 && !now.Before(lane.futureScanAt)
+		if !dueReady && !futureReady {
 			continue
 		}
-		selected[n] = index
+		selected[n] = selectedLane{index: index, due: dueReady, future: futureReady}
 		n++
+		if dueReady {
+			dueLanes++
+		}
 		if futureReady {
 			futureLanes++
 		}
 	}
 	jobs := make([]discoveryJob, 0, n)
-	futureIndex := 0
-	for index, laneIndex := range selected[:n] {
-		lane := &lanes[laneIndex]
+	dueIndex, futureIndex := 0, 0
+	for index, slot := range selected[:n] {
+		lane := &lanes[slot.index]
 		job := base
-		job.shardLane, job.shards = laneIndex, &lane.rangeKeys
-		job.dueSlots = splitScanBudget(base.dueSlots, index, n)
-		job.futureSlots = 0
-		if base.futureSlots > 0 && !now.Before(lane.futureScanAt) {
+		job.shardLane, job.shards = slot.index, &lane.rangeKeys
+		job.dueSlots, job.futureSlots = 0, 0
+		if slot.due {
+			job.dueSlots = splitScanBudget(base.dueSlots, dueIndex, dueLanes)
+			dueIndex++
+		}
+		if slot.future {
 			job.futureSlots = splitScanBudget(base.futureSlots, futureIndex, futureLanes)
 			futureIndex++
 		}
@@ -139,6 +191,10 @@ func (d *Dispatcher) shardDiscoveryJobs(base discoveryJob, now time.Time) []disc
 		job.bytes = splitScanBudget(d.Limits.Bytes, index, n)
 		if lane.generation == p.repairGeneration && lane.cursor.epoch == p.epoch {
 			job.cursor = lane.cursor
+		} else if prior := lane.cursor.shards; prior != nil {
+			// Retry rewinds the shard positions without resetting which shard
+			// gets the next turn.
+			job.cursor.shards = &shardedDueScan{shards: prior.shards, next: prior.next, state: make(map[int]shardDueState)}
 		}
 		job.futureAfter = lane.futureAfter
 		jobs = append(jobs, job)

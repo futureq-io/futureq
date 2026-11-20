@@ -26,7 +26,7 @@ type discoveryIterator struct {
 func openDiscoveryIterator(db storage.IteratorSource, view InterestView, hash uint64, lower, upper []byte, earliest, last uint64, deadline time.Time, shards *shardScanRange) (*discoveryIterator, error) {
 	if view.sharded && len(upper) == 0 {
 		// Include every possible layout, including when the topic hash is MaxUint64.
-		upper = append(utils.EventKey(^uint64(0), hash, ^uint64(0)), 0)
+		upper = topicScanEnd(hash)
 	}
 	if shards != nil {
 		lower, upper = shards.bounds(hash, lower, upper)

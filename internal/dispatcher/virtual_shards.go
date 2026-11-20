@@ -64,13 +64,17 @@ func (r replicaMembership) owns(slot, count int, key []byte) bool {
 }
 
 func (r replicaMembership) localWorkers(members []metadata.ConsumerMember, consumers []*ConsumerEntry) []*ConsumerEntry {
-	var local []*ConsumerEntry
+	if r.workers == 0 {
+		return nil
+	}
+	committed := make(map[string]struct{}, r.workers)
+	for _, member := range members[r.before : r.before+r.workers] {
+		committed[member.ID] = struct{}{}
+	}
+	local := make([]*ConsumerEntry, 0, min(r.workers, len(consumers)))
 	for _, consumer := range consumers {
-		for _, member := range members[r.before : r.before+r.workers] {
-			if consumer.ID == member.ID {
-				local = append(local, consumer)
-				break
-			}
+		if _, ok := committed[consumer.ID]; ok {
+			local = append(local, consumer)
 		}
 	}
 	return local

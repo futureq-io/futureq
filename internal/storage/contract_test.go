@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/futureq-io/futureq/pkg/utils"
 	"github.com/stretchr/testify/suite"
 )
 
@@ -30,6 +31,32 @@ type DBContractSuite struct {
 func TestDBContract(t *testing.T) {
 	// Placeholder so this file is a valid test target; real suites are
 	// registered by the per-engine files below.
+}
+
+func (s *DBContractSuite) TestTopicCacheRevisionTracksSuccessfulEventWrites() {
+	revisions, ok := s.db.(TopicCacheRevisioner)
+	if !ok {
+		s.T().Skip("engine does not track topic revisions")
+	}
+	require := s.Require()
+	a, b := utils.TopicHash("a"), utils.TopicHash("b")
+	startA, startB := revisions.TopicCacheRevision(a), revisions.TopicCacheRevision(b)
+	batch := s.db.NewBatch()
+	require.NoError(batch.Set(utils.EventKey(1, b, 1), []byte("event")))
+	require.Equal(startB, revisions.TopicCacheRevision(b))
+	require.NoError(batch.Commit(Sync))
+	require.NoError(batch.Close())
+	require.Equal(startA, revisions.TopicCacheRevision(a))
+	require.NotEqual(startB, revisions.TopicCacheRevision(b))
+	previousB := revisions.TopicCacheRevision(b)
+
+	batch = s.db.NewBatch()
+	require.NoError(batch.Set(utils.EventKey(1, a, 1), []byte("event")))
+	require.NoError(batch.Set(utils.EventKey(1, b, 2), []byte("event")))
+	require.NoError(batch.Commit(Sync))
+	require.NoError(batch.Close())
+	require.NotEqual(startA, revisions.TopicCacheRevision(a))
+	require.NotEqual(previousB, revisions.TopicCacheRevision(b))
 }
 
 func (s *DBContractSuite) SetupTest() {

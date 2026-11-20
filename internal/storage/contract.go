@@ -41,6 +41,13 @@ type CacheRevisioner interface {
 	CacheRevision() uint64
 }
 
+// TopicCacheRevisioner scopes cache invalidation to the 8-byte topic prefix
+// of event keys. A reader captures the token before opening its snapshot.
+// Implementations may evict old tokens and issue fresh ones on the next read.
+type TopicCacheRevisioner interface {
+	TopicCacheRevision(topicHash uint64) uint64
+}
+
 // IteratorSource opens independently positioned iterators.
 type IteratorSource interface {
 	NewIter(*IterOptions) (Iterator, error)

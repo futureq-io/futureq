@@ -11,6 +11,7 @@ import (
 	"github.com/futureq-io/futureq/internal/metrics"
 	raft "github.com/futureq-io/futureq/internal/raft/event"
 	"github.com/futureq-io/futureq/internal/storage"
+	"github.com/futureq-io/futureq/pkg/utils"
 	"go.uber.org/zap"
 )
 
@@ -31,6 +32,8 @@ type discoveryJob struct {
 	examined, bytes       int
 	source                storage.IteratorSource
 	now                   int64
+	probeLayouts          bool
+	tracksRevision        bool
 }
 type discoveryResult struct {
 	futureExhausted bool
@@ -39,6 +42,8 @@ type discoveryResult struct {
 	future          candidateHeap
 	cursor          scanCursor
 	after           []byte
+	layouts         int
+	layoutsFound    bool
 }
 type discoveryPassState struct {
 	remaining int
@@ -63,12 +68,20 @@ type permitRenewal struct {
 }
 
 func (d *Dispatcher) discover(job discoveryJob) discoveryResult {
+	if job.probeLayouts {
+		layouts, err := discoverShardLayouts(d.db, utils.TopicHash(job.topic))
+		if err != nil {
+			d.logger.Warn("delivery shard layout probe failed", zap.Error(err))
+		}
+		return discoveryResult{job: job, layouts: layouts, layoutsFound: err == nil}
+	}
 	// Construct a scanner adapter rather than copying a Dispatcher (sync.Map).
 	scanner := &Dispatcher{scanOnly: true, skipKeys: func(key [24]byte) bool { return job.assigned[key] || job.owner.hasKey(key) }, db: d.db, hub: d.hub, deleter: d.deleter, logger: d.logger,
 		TimeBucket: d.TimeBucket, Limits: d.Limits, PreloadLookahead: d.PreloadLookahead,
 		PreloadMaxMessages: job.futureSlots, MaintenanceRecipients: d.MaintenanceRecipients,
 		cursors: map[string]*scanCursor{job.topic: &job.cursor}}
 	scanner.shardScan, scanner.scanSource = job.shards, job.source
+	scanner.scanRevision, scanner.tracksScanRevision = job.revision, job.tracksRevision
 	scanner.Limits.Candidates = job.dueSlots
 	if job.shards != nil {
 		scanner.Limits.Examined, scanner.Limits.Bytes = job.examined, job.bytes
@@ -291,22 +304,8 @@ func (d *Dispatcher) runPipeline(parent context.Context) {
 	timer.Stop()
 	defer timer.Stop()
 
-	revisions, tracksRevisions := d.db.(storage.CacheRevisioner)
-	var revision uint64
 	schedule := func() {
 		now := time.Now()
-		if tracksRevisions {
-			current := revisions.CacheRevision()
-			if current != revision {
-				revision = current
-				for _, p := range d.preloads {
-					p.futureScanAfter, p.futureScanIdle = time.Time{}, 0
-					for i := range p.shardScans {
-						p.shardScans[i].futureScanAt, p.shardScans[i].futureIdle = time.Time{}, 0
-					}
-				}
-			}
-		}
 		if !now.Before(housekeepAfter) {
 			d.hub.ExpireInFlight(now)
 			d.hub.ObserveQueues()
@@ -371,12 +370,9 @@ func (d *Dispatcher) runPipeline(parent context.Context) {
 					continue
 				}
 				p = d.preloads[topic]
-				if p == nil || p.epoch != view.Epoch {
+				if p == nil || p.epoch != view.Epoch || p.assignmentEpoch != view.assignmentEpoch {
 					d.dropPreload(topic)
-					p = &topicPreload{epoch: view.Epoch, valid: &atomic.Bool{}, heapShift: candidateHeapShift(d.HeapType)}
-					if shardWorkers > 1 && view.sharded {
-						p.shardScans = splitShardScans(view, shardWorkers)
-					}
+					p = &topicPreload{epoch: view.Epoch, assignmentEpoch: view.assignmentEpoch, valid: &atomic.Bool{}, heapShift: candidateHeapShift(d.HeapType), sharded: view.sharded}
 					p.valid.Store(true)
 					d.preloads[topic] = p
 				}
@@ -417,6 +413,18 @@ func (d *Dispatcher) runPipeline(parent context.Context) {
 			}
 			// A busy topic may prefetch one batch, never the entire shared
 			// allowance. Already retained entries consume its topic credit.
+			var revision uint64
+			var tracksRevisions bool
+			if topic != maintenanceTopic {
+				revision, tracksRevisions = d.cacheRevision(utils.TopicHash(topic))
+				if p.revision != revision {
+					p.revision = revision
+					p.futureScanAfter, p.futureScanIdle = time.Time{}, 0
+					for i := range p.shardScans {
+						p.shardScans[i].futureScanAt, p.shardScans[i].futureIdle = time.Time{}, 0
+					}
+				}
+			}
 			dueSlots := min(max(0, d.Limits.Candidates-p.readyCount), dueCapacity-d.readyCount-reservedDue)
 			futureSlots := 0
 			if topic != maintenanceTopic && d.PreloadLookahead > 0 && !now.Before(p.futureScanAfter) {
@@ -427,10 +435,16 @@ func (d *Dispatcher) runPipeline(parent context.Context) {
 			}
 
 			job := discoveryJob{revision: revision, repairGeneration: p.repairGeneration, assigned: assigned[topic], topic: topic, owner: p,
-				cursor: scanCursor{epoch: p.epoch}, futureSlots: futureSlots, dueSlots: dueSlots}
+				cursor: scanCursor{epoch: p.epoch, assignmentEpoch: p.assignmentEpoch}, futureSlots: futureSlots, dueSlots: dueSlots, tracksRevision: tracksRevisions}
 			var pass []discoveryJob
-			if len(p.shardScans) > 0 {
+			if p.sharded && !p.dueBeforeRefresh && !now.Before(p.layoutProbeAt) && (len(p.shardScans) == 0 || !tracksRevisions || p.layoutRevision != revision) {
+				job.probeLayouts = true
+				job.dueSlots, job.futureSlots = 0, 0
+				pass = []discoveryJob{job}
+			} else if len(p.shardScans) > 0 {
 				pass = d.shardDiscoveryJobs(job, now)
+			} else if p.sharded {
+				continue // retry the unsuccessful layout probe on a later pass
 			} else {
 				if current := d.cursors[topic]; current != nil {
 					job.cursor = *current
@@ -446,6 +460,11 @@ func (d *Dispatcher) runPipeline(parent context.Context) {
 			for _, task := range pass {
 				reservedDue += task.dueSlots
 				reservedFuture += task.futureSlots
+				if task.dueSlots > 0 {
+					// Scanning admission prevents another refresh from
+					// overtaking the due work queued here.
+					p.dueBeforeRefresh = false
+				}
 			}
 			scanJobs <- pass
 			rotation = (start + offset + 1) % len(topics)
@@ -529,6 +548,22 @@ func (d *Dispatcher) runPipeline(parent context.Context) {
 			}
 			admitted := 0
 			if current == job.owner {
+				if job.probeLayouts {
+					current.layoutProbeAt = time.Now().Add(d.interval)
+					if result.layoutsFound {
+						view := d.hub.InterestView(job.topic)
+						if view.Active && view.Epoch == current.epoch && view.assignmentEpoch == current.assignmentEpoch {
+							current.layoutRevision = job.revision
+							if len(current.shardScans) == 0 || current.layouts != result.layouts {
+								current.layouts = result.layouts
+								current.shardScans = splitShardScans(view, shardWorkers, result.layouts)
+								current.nextShardScan = 0
+							}
+							pass.admitted = true // schedule the planned scans immediately
+						}
+					}
+					current.dueBeforeRefresh = len(current.shardScans) > 0
+				}
 				if job.dueSlots > 0 && current.repairGeneration == job.repairGeneration {
 					if job.shards == nil {
 						d.cursors[job.topic] = &result.cursor
@@ -544,7 +579,8 @@ func (d *Dispatcher) runPipeline(parent context.Context) {
 					}
 				} else {
 					if job.futureSlots > 0 {
-						backoff := tracksRevisions && d.PreloadScanIdleMaxInterval > 0 && job.revision == revision && result.futureExhausted && len(result.future) == 0
+						revision, _ := d.cacheRevision(utils.TopicHash(job.topic))
+						backoff := job.tracksRevision && d.PreloadScanIdleMaxInterval > 0 && job.revision == revision && result.futureExhausted && len(result.future) == 0
 						d.recordFutureScan(current, result, backoff)
 					}
 					if !time.Now().Before(retryAfter[job.topic]) {

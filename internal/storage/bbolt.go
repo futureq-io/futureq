@@ -37,6 +37,7 @@ type BoltConfig struct {
 // boltDB wraps *bolt.DB and implements storage.DB.
 type boltDB struct {
 	revision atomic.Uint64
+	topics   topicRevisions
 	db       *bolt.DB
 	bucket   []byte
 }
@@ -92,7 +93,7 @@ func (b *boltDB) Get(key []byte) ([]byte, io.Closer, error) {
 // NewBatch returns a boltBatch that accumulates Set/Delete operations and
 // applies them in a single read-write transaction on Commit.
 func (b *boltDB) NewBatch() Batch {
-	return &boltBatch{db: b.db, bucket: b.bucket, revision: &b.revision}
+	return &boltBatch{db: b.db, bucket: b.bucket, revision: &b.revision, topics: &b.topics}
 }
 
 // NewIter opens a read-only transaction and returns an iterator over the bucket.
@@ -177,11 +178,12 @@ func (b *boltDB) Close() error { return b.db.Close() }
 // ── boltBatch ────────────────────────────────────────────────────────────────
 
 type boltBatch struct {
-	revision   *atomic.Uint64
-	payloadSet bool
-	db         *bolt.DB
-	bucket     []byte
-	ops        []boltOp
+	revision *atomic.Uint64
+	topics   *topicRevisions
+	writes   eventTopicWrites
+	db       *bolt.DB
+	bucket   []byte
+	ops      []boltOp
 }
 
 type boltOp struct {
@@ -191,9 +193,7 @@ type boltOp struct {
 }
 
 func (bb *boltBatch) Set(key, value []byte) error {
-	if len(key) == 24 {
-		bb.payloadSet = true
-	}
+	bb.writes.add(key)
 	k := make([]byte, len(key))
 	copy(k, key)
 	v := make([]byte, len(value))
@@ -231,7 +231,8 @@ func (bb *boltBatch) Commit(_ SyncMode) error {
 		}
 		return nil
 	})
-	if err == nil && bb.payloadSet {
+	if err == nil && bb.writes.set {
+		bb.topics.commit(bb.writes)
 		bb.revision.Add(1)
 	}
 	return err
@@ -240,7 +241,7 @@ func (bb *boltBatch) Commit(_ SyncMode) error {
 // Close discards the pending operations. Safe to call after Commit.
 func (bb *boltBatch) Close() error {
 	bb.ops = bb.ops[:0]
-	bb.payloadSet = false
+	bb.writes = eventTopicWrites{}
 	return nil
 }
 
@@ -337,5 +338,7 @@ var (
 )
 
 func (b *boltDB) CacheRevision() uint64 { return b.revision.Load() }
+
+func (b *boltDB) TopicCacheRevision(hash uint64) uint64 { return b.topics.revision(hash) }
 
 var _ CacheRevisioner = (*boltDB)(nil)

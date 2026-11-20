@@ -63,12 +63,23 @@ func TestShardScanConcurrencyMultipliesAndWaitingTopicsGetATurn(t *testing.T) {
 	db := &parallelScanDB{DB: d.db, ctx: ctx, started: make(chan parallelScanStart, 16), release: make(map[uint64]chan struct{})}
 	d.db = db
 	hashes := make(map[uint64]string)
-	for _, topic := range []string{"a", "b", "c", "d"} {
+	topics := []string{"a", "b", "c", "d"}
+	batch := d.db.NewBatch()
+	defer batch.Close() //nolint:errcheck
+	at := time.Now().Add(-time.Second).UnixMilli()
+	value, err := proto.Marshal(&storagepb.StoredMessage{EnqueuedAtUnixMs: at})
+	require.NoError(t, err)
+	for _, topic := range topics {
 		hash := utils.TopicHash(topic)
 		hashes[hash] = topic
 		db.release[hash] = make(chan struct{})
 		d.hub.Register(topic, topic, "group", make(chan *pb.QueueMessage, 1))
+		for slot := 2; slot < 4; slot++ {
+			bucket := utils.ShardStorageBucket(slot, utils.CalculateBucket(at, d.TimeBucket))
+			require.NoError(t, batch.Set(utils.EventKey(bucket, hash, uint64(slot)), value))
+		}
 	}
+	require.NoError(t, batch.Commit(storage.Sync))
 	done := make(chan struct{})
 	go func() { defer close(done); d.Run(ctx) }()
 	t.Cleanup(func() {
@@ -95,16 +106,26 @@ func TestShardScanConcurrencyMultipliesAndWaitingTopicsGetATurn(t *testing.T) {
 		topic := hashes[event.topic]
 		started[topic] = append(started[topic], event.snapshot)
 	}
-	for _, topic := range []string{"a", "b", "c"} {
+	require.Len(t, started, 3)
+	var waiting, released string
+	for _, topic := range topics {
+		if len(started[topic]) == 0 {
+			waiting = topic
+			continue
+		}
+		released = topic
 		require.Len(t, started[topic], 2)
 		require.Same(t, started[topic][0], started[topic][1], "both shard scans share the topic's snapshot")
 	}
-	require.Empty(t, started["d"], "the fourth topic waits for a discovery worker")
-	close(db.release[utils.TopicHash("b")])
-	first, second := readStart(), readStart()
-	require.Equal(t, "d", hashes[first.topic])
-	require.Equal(t, "d", hashes[second.topic])
-	require.Same(t, first.snapshot, second.snapshot)
+	close(db.release[utils.TopicHash(released)])
+	var waitingScans []*parallelScanSnapshot
+	for len(waitingScans) < 2 {
+		event := readStart()
+		if hashes[event.topic] == waiting {
+			waitingScans = append(waitingScans, event.snapshot)
+		}
+	}
+	require.Same(t, waitingScans[0], waitingScans[1])
 }
 
 func TestShardScanRangesCoverOnlyOwnedShards(t *testing.T) {
@@ -113,7 +134,7 @@ func TestShardScanRangesCoverOnlyOwnedShards(t *testing.T) {
 		replica: describeReplica(members, 2, metadata.ShardDistributionConsumerCount),
 		local:   []*ConsumerEntry{{ID: "local"}},
 	}}}
-	lanes := splitShardScans(view, 2)
+	lanes := splitShardScans(view, 2, 64)
 	require.Len(t, lanes, 2)
 	require.True(t, lanes[0].rangeKeys.includeLegacy)
 	require.False(t, lanes[1].rangeKeys.includeLegacy)
@@ -146,7 +167,7 @@ func TestShardScansFindDueAndFutureKeysInBothRanges(t *testing.T) {
 	}
 	require.NoError(t, batch.Commit(storage.Sync))
 	view := d.hub.InterestView("orders")
-	owner := &topicPreload{epoch: view.Epoch, shardScans: splitShardScans(view, 2)}
+	owner := &topicPreload{epoch: view.Epoch, shardScans: splitShardScans(view, 2, 64)}
 	jobs := d.shardDiscoveryJobs(discoveryJob{topic: "orders", owner: owner, cursor: scanCursor{epoch: view.Epoch}, dueSlots: 4, futureSlots: 4}, now)
 	require.Len(t, jobs, 2)
 	require.Equal(t, d.Limits.Examined, jobs[0].examined+jobs[1].examined)

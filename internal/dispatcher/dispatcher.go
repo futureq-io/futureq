@@ -30,18 +30,20 @@ type inFlightEntry struct {
 //   - Performs TTL checks at dispatch time; expired messages are batched for deletion
 //   - Snapshot-based iteration (never blocks concurrent writes)
 type Dispatcher struct {
-	skipKeys        func([24]byte) bool // synchronized preload lookup, isolated discovery adapter only
-	scanOnly        bool                // isolated worker adapter never publishes scheduler gauges
-	shardScan       *shardScanRange     // immutable range assigned to an isolated discovery worker
-	scanSource      storage.IteratorSource
-	db              storage.DB
-	hub             *Hub
-	deleter         *Deleter
-	logger          *zap.Logger
-	interval        time.Duration
-	inFlightTimeout time.Duration
-	wakeCh          chan struct{}
-	inFlight        sync.Map // key: string(pebbleKey) → *inFlightEntry
+	skipKeys           func([24]byte) bool // synchronized preload lookup, isolated discovery adapter only
+	scanOnly           bool                // isolated worker adapter never publishes scheduler gauges
+	shardScan          *shardScanRange     // immutable range assigned to an isolated discovery worker
+	scanSource         storage.IteratorSource
+	scanRevision       uint64
+	tracksScanRevision bool
+	db                 storage.DB
+	hub                *Hub
+	deleter            *Deleter
+	logger             *zap.Logger
+	interval           time.Duration
+	inFlightTimeout    time.Duration
+	wakeCh             chan struct{}
+	inFlight           sync.Map // key: string(pebbleKey) → *inFlightEntry
 	// Installed before Run. Cluster reads also refresh the bounded metadata permit.
 	ReadBarrier                func() error
 	PrepareDelivery            func(string, []byte) (*raft.DeliveryState, error) // legacy single-key hook

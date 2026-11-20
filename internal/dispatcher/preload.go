@@ -63,6 +63,7 @@ type topicPreload struct {
 	repairGeneration uint64       // fences cursor resets against older scan results
 	valid            *atomic.Bool // optional generation fence, set by the production owner
 	epoch            uint64
+	assignmentEpoch  uint64
 	after            []byte // independent of the live due cursor; never a watermark
 	items            candidateHeap
 	keyMu            sync.RWMutex // protects keys only; never held across storage or Hub calls
@@ -72,6 +73,12 @@ type topicPreload struct {
 	futureScanIdle   time.Duration
 	shardScans       []shardScanState // scheduler-owned cursors for parallel discovery
 	nextShardScan    int
+	sharded          bool
+	layouts          int
+	layoutRevision   uint64
+	layoutProbeAt    time.Time
+	revision         uint64
+	dueBeforeRefresh bool
 }
 
 // Discovery reads this small synchronized index without copying the entire
@@ -168,8 +175,7 @@ func (d *Dispatcher) collectPreloaded(topic string, p *topicPreload, view Intere
 			metrics.DeliveryRejectedTotal.WithLabelValues("prepare_bytes").Inc()
 			break // retry on bounded backoff with a fresh recipient view
 		}
-		owners := view.localOwners(item.Key)
-		if len(owners) == 0 || !d.hub.hasReadyOwner(owners, item.Key) {
+		if _, ready := d.hub.hasReadyOwner(view, item.Key); !ready {
 			continue
 		}
 		commandSize.Add(item)
@@ -195,7 +201,7 @@ func (d *Dispatcher) collectPreloaded(topic string, p *topicPreload, view Intere
 // true only when the range was exhausted without an iterator error.
 func (d *Dispatcher) preloadTopic(topic string, p *topicPreload, view InterestView, nowMs int64) bool {
 	defer d.observePreload()
-	if !view.Active || (d.shardScan != nil && d.shardScan.epoch != view.Epoch) || d.preloadCount >= d.PreloadMaxMessages {
+	if !view.Active || !d.shardScan.matches(view) || d.preloadCount >= d.PreloadMaxMessages {
 		return false
 	}
 	started := time.Now()
@@ -245,7 +251,7 @@ func (d *Dispatcher) preloadTopic(topic string, p *topicPreload, view InterestVi
 				valid = iter.Next()
 				continue
 			}
-			if len(view.localOwners(key)) == 0 {
+			if !view.hasLocalOwner(key) {
 				filtered++
 				valid = iter.Next()
 				continue

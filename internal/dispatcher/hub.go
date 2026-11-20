@@ -5,9 +5,11 @@ import (
 	"encoding/binary"
 	"fmt"
 	"hash/fnv"
+	"iter"
 	"math"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/futureq-io/futureq/internal/metrics"
@@ -103,6 +105,8 @@ type TopicSubscription struct {
 	// own their maps/slices and remain immutable across later mutations.
 	groupsView    map[string][]*ConsumerEntry
 	universalView []*ConsumerEntry
+	assignment    atomic.Pointer[topicAssignment]
+	assignmentMu  sync.Mutex
 }
 
 // newTopicSubscription returns an empty TopicSubscription.
@@ -159,6 +163,7 @@ func (ts *TopicSubscription) universalSnapshot() []*ConsumerEntry {
 }
 
 func (ts *TopicSubscription) rebuildSnapshots() {
+	ts.assignment.Store(nil)
 	groups := make(map[string][]*ConsumerEntry, len(ts.groups))
 	for id, consumers := range ts.groups {
 		groups[id] = append([]*ConsumerEntry(nil), consumers...)
@@ -201,6 +206,7 @@ type Hub struct {
 	permitUntil     time.Time
 	readPermit      time.Duration
 	registryEpoch   uint64
+	assignmentEpoch uint64
 	inFlightTimeout time.Duration
 
 	// topics: topic → *TopicSubscription
@@ -235,6 +241,7 @@ func (h *Hub) WithConsumerRegistry(apply func() error) error {
 func (h *Hub) SetGroupMembership(source func(topic, group string) []metadata.ConsumerMember) {
 	h.deliveryMu.Lock()
 	h.groupMembers = source
+	h.assignmentEpoch++
 	h.deliveryMu.Unlock()
 }
 
@@ -244,6 +251,7 @@ func (h *Hub) SetLocalReplica(nodeID uint64) {
 	h.deliveryMu.Lock()
 	defer h.deliveryMu.Unlock()
 	h.localReplica = nodeID
+	h.assignmentEpoch++
 }
 
 // SetShardDistribution installs the committed policy source alongside the
@@ -252,6 +260,7 @@ func (h *Hub) SetShardDistribution(source func() metadata.ShardDistribution) {
 	h.deliveryMu.Lock()
 	defer h.deliveryMu.Unlock()
 	h.distribution = source
+	h.assignmentEpoch++
 }
 
 func (h *Hub) shardDistribution() metadata.ShardDistribution {
@@ -277,6 +286,7 @@ func (h *Hub) WithConsumerBarrier(apply func() bool) {
 	defer h.deliveryMu.Unlock()
 	if apply() {
 		h.permitUntil = time.Time{}
+		h.assignmentEpoch++
 	}
 }
 
@@ -414,6 +424,14 @@ func (h *Hub) DispatchPrepared(topic string, msg *pb.QueueMessage, deliveryTag [
 	// Snapshot groups and universal consumers while holding the lock.
 	groups := sub.groupSnapshot()
 	universal := sub.universalSnapshot()
+	var assignment *topicAssignment
+	if h.groupMembers != nil && h.deliveryView != nil && h.version != nil {
+		assignment = h.topicAssignmentLocked(topic, sub)
+		if assignment == nil {
+			h.mu.RUnlock()
+			return nil
+		}
+	}
 	h.mu.RUnlock()
 
 	sentTo := make([]string, 0, len(groups)+len(universal))
@@ -422,7 +440,10 @@ func (h *Hub) DispatchPrepared(topic string, msg *pb.QueueMessage, deliveryTag [
 	if slot != 0 && h.localReplica != 0 {
 		shardCount = utils.SlotShardCount(slot)
 	}
-	distribution := h.shardDistribution()
+	distribution := metadata.ShardDistributionConsumerCount
+	if assignment == nil {
+		distribution = h.shardDistribution()
+	}
 
 	// Dispatch to each group — strategy picks one consumer per group.
 	for gid, consumers := range groups {
@@ -430,7 +451,11 @@ func (h *Hub) DispatchPrepared(topic string, msg *pb.QueueMessage, deliveryTag [
 			continue
 		}
 		var selected *ConsumerEntry
-		if h.groupMembers != nil {
+		if assignment != nil {
+			if group, ok := assignment.groups[gid]; ok {
+				selected = h.assignedWorker(group, msg, deliveryTag, slot, shardCount)
+			}
+		} else if h.groupMembers != nil {
 			members := h.groupMembers(topic, gid)
 			if len(members) == 0 {
 				continue // no committed assignment, or rebalance is pending
@@ -715,18 +740,20 @@ type localGroup struct {
 // used to filter a chunk. Queueing still validates the live epoch under the
 // rebalance lock; this view is never itself a delivery permit.
 type InterestView struct {
-	Epoch      uint64
-	Active     bool
-	Recipients []string
-	groups     []localGroup
-	universal  []*ConsumerEntry
-	sharded    bool
+	Epoch           uint64
+	Active          bool
+	Recipients      []string
+	groups          []localGroup
+	universal       []*ConsumerEntry
+	sharded         bool
+	assignmentEpoch uint64
 }
 
 func (h *Hub) SetDeliveryView(source func(string) metadata.TopicDeliveryView) {
 	h.deliveryMu.Lock()
 	defer h.deliveryMu.Unlock()
 	h.deliveryView = source
+	h.assignmentEpoch++
 }
 
 func (h *Hub) InterestView(topic string) InterestView {
@@ -737,7 +764,14 @@ func (h *Hub) InterestView(topic string) InterestView {
 	}
 	h.mu.RLock()
 	defer h.mu.RUnlock()
-	view := InterestView{Active: true, Epoch: h.registryEpoch, sharded: h.localReplica != 0}
+	sub := h.topics[topic]
+	if sub != nil && h.deliveryView != nil && h.version != nil {
+		if assignment := h.topicAssignmentLocked(topic, sub); assignment != nil {
+			return assignment.view
+		}
+		return InterestView{}
+	}
+	view := InterestView{Active: true, Epoch: h.registryEpoch, sharded: h.localReplica != 0, assignmentEpoch: h.assignmentEpoch}
 	var global metadata.TopicDeliveryView
 	if h.deliveryView != nil {
 		global = h.deliveryView(topic)
@@ -748,7 +782,6 @@ func (h *Hub) InterestView(topic string) InterestView {
 	} else if h.version != nil {
 		view.Epoch = h.permitEpoch
 	}
-	sub := h.topics[topic]
 	if sub == nil {
 		return view
 	}
@@ -791,47 +824,69 @@ func (h *Hub) InterestView(topic string) InterestView {
 	return view
 }
 
-// localOwners returns eligible workers separately for each group's assignment.
-func (v InterestView) localOwners(key []byte) []*ConsumerEntry {
-	owners := append([]*ConsumerEntry(nil), v.universal...)
-	slot := utils.EventShardSlot(key)
-	var shardCount int
-	if slot != 0 && v.sharded {
-		shardCount = utils.SlotShardCount(slot)
-	}
-	for _, group := range v.groups {
-		if len(group.members) == 0 {
-			owners = append(owners, group.consumers...)
-			continue
-		}
-		if group.replica.usesReplicaWorkers(shardCount) {
-			if group.replica.owns(slot, shardCount, key) {
-				owners = append(owners, group.local...)
+// localOwners yields one representative of each owned named group, and every
+// local universal recipient. A named group shares one in-flight reservation.
+func (v InterestView) localOwners(key []byte) iter.Seq[*ConsumerEntry] {
+	return func(yield func(*ConsumerEntry) bool) {
+		for _, owner := range v.universal {
+			if !yield(owner) {
+				return
 			}
-			continue
 		}
-		if owner := moduloWorker(group.members, group.consumers, key); owner != nil {
-			owners = append(owners, owner)
+		slot := utils.EventShardSlot(key)
+		var shardCount int
+		if slot != 0 && v.sharded {
+			shardCount = utils.SlotShardCount(slot)
+		}
+		for _, group := range v.groups {
+			if owner := group.owner(slot, shardCount, key); owner != nil && !yield(owner) {
+				return
+			}
 		}
 	}
-	return owners
 }
 
-func (h *Hub) hasReadyOwner(owners []*ConsumerEntry, key []byte) bool {
-	h.inFlightMu.Lock()
-	defer h.inFlightMu.Unlock()
-	for _, owner := range owners {
-		if owner.Group != "" {
-			reservation := groupDeliveryKey{topic: owner.Topic, group: owner.Group, key: string(key)}
-			if _, exists := h.groupInFlight[reservation]; exists {
-				continue
-			}
+func (group localGroup) owner(slot, count int, key []byte) *ConsumerEntry {
+	if len(group.members) == 0 {
+		if len(group.consumers) > 0 {
+			return group.consumers[0]
 		}
-		if _, exists := h.deliveryRecords[owner.ID][string(key)]; !exists {
-			return true
+		return nil
+	}
+	if group.replica.usesReplicaWorkers(count) {
+		if len(group.local) > 0 && group.replica.owns(slot, count, key) {
+			return group.local[0]
 		}
+		return nil
+	}
+	return moduloWorker(group.members, group.consumers, key)
+}
+
+func (v InterestView) hasLocalOwner(key []byte) bool {
+	for range v.localOwners(key) {
+		return true
 	}
 	return false
+}
+
+func (h *Hub) hasReadyOwner(view InterestView, key []byte) (owned, ready bool) {
+	h.inFlightMu.Lock()
+	defer h.inFlightMu.Unlock()
+	tag := string(key)
+	for owner := range view.localOwners(key) {
+		owned = true
+		if owner.Group != "" {
+			reservation := groupDeliveryKey{topic: owner.Topic, group: owner.Group, key: tag}
+			if _, exists := h.groupInFlight[reservation]; !exists {
+				return true, true
+			}
+			continue
+		}
+		if _, exists := h.deliveryRecords[owner.ID][tag]; !exists {
+			return true, true
+		}
+	}
+	return owned, false
 }
 
 func (h *Hub) DeliveryPermitted() bool {

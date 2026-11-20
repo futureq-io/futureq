@@ -15,6 +15,7 @@ import (
 // Pebble holds an open pebble database and implements storage.DB.
 type Pebble struct {
 	revision atomic.Uint64
+	topics   topicRevisions
 	empty    pebbleEmptyRanges
 	db       *pebble.DB
 	logger   *zap.Logger
@@ -86,7 +87,7 @@ func (p *Pebble) Get(key []byte) ([]byte, io.Closer, error) {
 }
 
 func (p *Pebble) NewBatch() Batch {
-	return &pebbleBatch{b: p.db.NewBatch(), revision: &p.revision, empty: &p.empty}
+	return &pebbleBatch{b: p.db.NewBatch(), revision: &p.revision, topics: &p.topics, empty: &p.empty}
 }
 
 // NewIter opens a snapshot internally and returns an iterator scoped to it.
@@ -172,18 +173,19 @@ func (p *Pebble) Close() error { return p.db.Close() }
 // ── pebbleBatch ───────────────────────────────────────────────────────────────
 
 type pebbleBatch struct {
-	empty      *pebbleEmptyRanges
-	sets       pebbleKeySpan
-	revision   *atomic.Uint64
-	payloadSet bool
-	b          *pebble.Batch
+	empty    *pebbleEmptyRanges
+	sets     pebbleKeySpan
+	revision *atomic.Uint64
+	topics   *topicRevisions
+	writes   eventTopicWrites
+	b        *pebble.Batch
 }
 
 func (pb *pebbleBatch) Set(key, value []byte) error {
 	pb.sets.include(key)
 	err := pb.b.Set(key, value, nil)
-	if err == nil && len(key) == 24 {
-		pb.payloadSet = true
+	if err == nil {
+		pb.writes.add(key)
 	}
 	return err
 }
@@ -204,7 +206,8 @@ func (pb *pebbleBatch) Commit(mode SyncMode) error {
 	if err := pb.b.Commit(opts); err != nil {
 		return err
 	}
-	if pb.payloadSet {
+	if pb.writes.set {
+		pb.topics.commit(pb.writes)
 		pb.revision.Add(1)
 	}
 	return nil
@@ -265,5 +268,7 @@ var (
 )
 
 func (p *Pebble) CacheRevision() uint64 { return p.revision.Load() }
+
+func (p *Pebble) TopicCacheRevision(hash uint64) uint64 { return p.topics.revision(hash) }
 
 var _ CacheRevisioner = (*Pebble)(nil)

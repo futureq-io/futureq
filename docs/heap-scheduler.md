@@ -59,10 +59,14 @@ workers with two shard workers can run six scans across three topics. A topic
 holds one discovery slot, and waiting topics participate in the rotation when
 a pass finishes.
 
-Each shard scan opens its own bounded iterator and resumes with its own cursor.
-Pebble iterators in the same pass share a snapshot. Other engines use independent
-read views. The scans divide the topic's key, byte, and candidate allowances,
-and report into the same heap for delivery.
+Discovery splits layouts found in the topic's stored keys, including layouts
+with queued messages from before a resize. Due scans give each assigned shard
+an independent cursor and a frozen endpoint in its due-time range. Empty-range
+probes count toward the scan budget. Future-only ranges can sleep until their
+first due bucket or a write to the same topic. Layout refreshes give due scans
+a turn between probes. Pebble workers in the same pass share a snapshot and
+open their own bounded iterators. The workers divide
+the topic's key, byte, and candidate allowances and report into the same heap.
 
 ## Comparing heaps
 
