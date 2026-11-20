@@ -73,21 +73,41 @@ all lanes report into the same heap.
 
 ## Comparing heaps
 
-`delivery.heapType` selects the candidate heap when the broker starts:
+`delivery.heapType` selects the heap policy when the broker starts.
 
 | Value | Implementation |
 | --- | --- |
 | `binary` (default) | Typed binary heap without interface boxing |
 | `4ary` | Typed heap with four children per node |
 | `8ary` | Typed heap with eight children per node |
+| `auto` | Starts binary and switches each topic's retained heap between binary and four children per node |
 
 All variants retain the same full-message candidate layout, exact due-time/key
 ordering, count limits, topic ownership and generation fencing. The selection
-also applies to discovery workers' temporary heaps and rebuilds after retry
-eviction. Typed variants use hole-based sifting and clear popped payload slots.
-Heap choice does not enable speculative preloading; configure lookahead and
-capacity separately. Changing the selector requires a restart and rebuilds the
-local cache from authoritative storage.
+applies to the scheduler's retained heaps. In fixed modes discovery workers use
+the configured arity. In auto mode workers build their independent temporary
+heaps as binary. All variants use hole-based sifting and clear popped payload
+slots. Configure speculative lookahead and capacity separately.
+
+Auto mode tracks each topic's recent pushes, pops, and the fraction of available
+levels traversed by their sifts. It projects that work onto both heap shapes.
+Pushes compare with one parent per level they rise. Pops compare across children,
+so the estimate uses the number of full levels and how much of the bottom level
+is occupied. Earlier-deadline arrivals that often rise through the heap can
+benefit from fewer levels. A workload that rarely moves entries has less to
+gain from a wider heap, which can inspect more children on each pop.
+
+The scheduler evaluates after at least 256 operations or half the current heap
+size, whichever is larger. It requires more than 12.5% estimated savings and
+accumulates them across agreeing windows until they cover the estimated rebuild.
+The heap is rebuilt in place up to a limit of 8,192 entries per switch. Larger
+heaps keep their current arity until they shrink. A drained topic starts again
+in binary mode.
+Watch `futureq_delivery_heap_switches_total{heap_type="4ary"}` and
+`{heap_type="binary"}` to see how often topics change arity.
+
+The model estimates comparisons and candidate moves. Actual timings depend on
+the workload and hardware. The eight-child heap is available as a fixed choice.
 
 The former `typed-binary` selector is now named `binary`; update configurations
 using that old value. The interface-based `container/heap` implementation has

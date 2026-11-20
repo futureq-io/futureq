@@ -104,6 +104,9 @@ var (
 	DeliveryPreloadCapacity = promauto.NewGauge(prometheus.GaugeOpts{
 		Name: "futureq_delivery_preload_capacity", Help: "Configured maximum retained preload candidates on this node; zero when preloading is disabled or the scheduler stops.",
 	})
+	DeliveryHeapSwitchesTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "futureq_delivery_heap_switches_total", Help: "Adaptive candidate heap switches by destination heap type.",
+	}, []string{"heap_type"})
 	DeliveryPreloadLoadedTotal = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "futureq_delivery_preload_loaded_total", Help: "Candidates newly retained in the preload cache; reloading after invalidation counts again. Loading is not delivery or readiness to send.",
 	})
