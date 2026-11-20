@@ -199,3 +199,32 @@ func TestSingleShardLayoutDiscoversDueAndFutureKeys(t *testing.T) {
 	require.Len(t, preload.items, 1)
 	require.Equal(t, [utils.EventKeySize]byte(future), preload.items[0].key)
 }
+
+func TestShardDiscoveryResumesSeekWhileCurrentShardReceivesWrites(t *testing.T) {
+	d, base := newShardBudgetTest(t, utils.MaxVirtualShards, 1)
+	d.Limits.Examined = 1
+	watch := d.watchTopic(utils.TopicHash(base.topic))
+	defer watch.Close()
+	base.shardRevisions = new(storage.TopicRevisionSnapshot)
+	base.tracksRevision = true
+
+	now := time.Now()
+	const writingSlot = utils.MaxVirtualShards
+	const lastSlot = 2*utils.MaxVirtualShards - 1
+	due := putShardBudgetPayload(t, d, base.topic, lastSlot, 1, 32, now.Add(-time.Second))
+	for pass := range 6 {
+		putShardBudgetPayload(t, d, base.topic, writingSlot, pass+2, 32, now.Add(time.Hour))
+		base.revision = watch.Read(base.shardRevisions)
+
+		results := runShardBudgetPass(d, base)
+		require.Len(t, results, 1)
+		result := results[0]
+		base.owner.shardScans[0].cursor = result.cursor
+		if len(result.chunk.items) != 0 {
+			require.Len(t, result.chunk.items, 1)
+			require.Equal(t, due, result.chunk.items[0].Key)
+			return
+		}
+	}
+	t.Fatal("discovery did not reach the last shard while the first shard received writes")
+}

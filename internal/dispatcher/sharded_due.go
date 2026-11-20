@@ -86,12 +86,15 @@ func (d *Dispatcher) collectShardedDue(topic string, hash, last uint64, view Int
 				idleUntil = 0
 				break
 			}
+			skipEmpty := slot >= 256
 			if state.revision != slotRevision {
-				state.notBefore, state.peek = 0, false
+				state.notBefore = 0
+				// The wide seek starts at this shard in a fresh view, so it
+				// can run even when writes invalidate the previous due check.
+				state.peek = state.peek && skipEmpty
 				state.revision = slotRevision
 			}
 			lower, upper, end := dueShardBounds(hash, last, slot)
-			skipEmpty := slot >= 256
 			if !state.peek {
 				examined := work.examined
 				empty := d.collectDueRange(topic, view, &state.cursor, lower, upper, chunk, work)
