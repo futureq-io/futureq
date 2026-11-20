@@ -60,8 +60,9 @@ func (d *Dispatcher) readPayload(key []byte, stage string) (cachedPayload, error
 type candidateHeap []preloadCandidate
 
 type topicPreload struct {
-	heapShift        uint         // 0/1: typed binary; 2/3: typed 4-ary/8-ary
-	adaptiveHeap     bool         // only the scheduler's retained heap adapts
+	heapShift        uint // 0/1: typed binary; 2/3: typed 4-ary/8-ary
+	adaptiveHeap     bool // only the scheduler's retained heap adapts
+	heapWork         candidateHeapWork
 	readyCount       int          // scheduler-owned due credits; future entries are charged separately
 	repairGeneration uint64       // fences cursor resets against older scan results
 	valid            *atomic.Bool // optional generation fence, set by the production owner
@@ -166,7 +167,7 @@ func (d *Dispatcher) collectPreloaded(topic string, p *topicPreload, view Intere
 		if commandSize.SizeWith(item) > d.Limits.Bytes && len(chunk.items) > 0 {
 			break // retain this candidate for a subsequent bounded chunk
 		}
-		p.items.popCandidate(p.heapShift)
+		p.removeCandidateHead()
 		p.removeKey(candidate.key)
 		if candidate.ready {
 			p.readyCount--
@@ -195,9 +196,6 @@ func (d *Dispatcher) collectPreloaded(topic string, p *topicPreload, view Intere
 		if chunk.oldestDueMs == 0 || candidate.due < chunk.oldestDueMs {
 			chunk.oldestDueMs = candidate.due
 		}
-	}
-	if examined > 0 {
-		p.rebuildAfterDrain(false)
 	}
 	p.compact()
 	return chunk
@@ -401,7 +399,11 @@ func (d *Dispatcher) releaseReady(topic string, p *topicPreload) {
 	}
 	clear(p.items[len(kept):])
 	p.items = kept
-	p.rebuildAfterDrain(true)
+	p.heapWork = candidateHeapWork{}
+	if len(p.items) == 0 && p.adaptiveHeap {
+		p.setHeapShift(binaryHeapShift)
+	}
+	p.items.initCandidates(p.heapShift)
 	p.compact()
 	p.repairGeneration++
 	d.forgetCursor(topic)

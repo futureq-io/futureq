@@ -89,18 +89,25 @@ the configured arity. In auto mode workers build their independent temporary
 heaps as binary. All variants use hole-based sifting and clear popped payload
 slots. Configure speculative lookahead and capacity separately.
 
-Auto mode widens a topic's heap when it reaches **2,048 retained candidates**
-and returns to binary after it drops to **1,024 or fewer**. The count includes
-both due and future candidates in memory. The gap avoids repeated switches
-around a single cutoff. The scheduler rebuilds the existing array in place
-before using the new arity. The growth check runs per insertion, so a large
-discovery batch cannot make the upgrade rebuild more than 2,048 entries.
+Auto mode tracks each topic's recent pushes, pops, and the fraction of available
+levels traversed by their sifts. It projects that work onto both heap shapes.
+Pushes compare with one parent per level they rise. Pops compare across children,
+so the estimate uses the number of full levels and how much of the bottom level
+is occupied. Earlier-deadline arrivals that often rise through the heap can
+benefit from fewer levels. A workload that rarely moves entries has less to
+gain from a wider heap, which can inspect more children on each pop.
+
+The scheduler evaluates after at least 256 operations or half the current heap
+size, whichever is larger. It requires more than 12.5% estimated savings and
+accumulates them across agreeing windows until they cover the estimated rebuild.
+The heap is rebuilt in place up to a limit of 8,192 entries per switch. Larger
+heaps keep their current arity until they shrink. A drained topic starts again
+in binary mode.
 Watch `futureq_delivery_heap_switches_total{heap_type="4ary"}` and
 `{heap_type="binary"}` to see how often topics change arity.
 
-The thresholds are a starting policy based on heap benchmarks. Binary has a
-short child scan for small heaps, and a four-child heap reduces tree depth
-for larger ones. The eight-child heap remains available as a fixed choice.
+The model estimates comparisons and candidate moves. Actual timings depend on
+the workload and hardware. The eight-child heap is available as a fixed choice.
 
 The former `typed-binary` selector is now named `binary`; update configurations
 using that old value. The interface-based `container/heap` implementation has

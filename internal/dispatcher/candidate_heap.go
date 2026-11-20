@@ -4,16 +4,11 @@ import (
 	"bytes"
 
 	"github.com/futureq-io/futureq/internal/config"
-	"github.com/futureq-io/futureq/internal/metrics"
 )
 
 const (
-	binaryHeapShift = 1
-	quadHeapShift   = 2
-
-	// Separate thresholds avoid rebuilding when a topic hovers near a cutoff.
-	adaptiveHeapGrowAt   = 2048
-	adaptiveHeapShrinkAt = 1024
+	binaryHeapShift uint = 1
+	quadHeapShift   uint = 2
 )
 
 // candidateHeapShift returns the initial arity, also used for worker-local
@@ -31,30 +26,6 @@ func candidateHeapShift(kind config.HeapType) uint {
 	}
 }
 
-func (p *topicPreload) pushCandidate(candidate preloadCandidate) {
-	p.items.pushCandidate(candidate, p.heapShift)
-	// Check after each push so even a large discovery result cannot make the
-	// upgrade rebuild more than adaptiveHeapGrowAt entries.
-	if p.adaptiveHeap && p.heapShift == binaryHeapShift && len(p.items) == adaptiveHeapGrowAt {
-		p.heapShift = quadHeapShift
-		p.items.initCandidates(p.heapShift)
-		metrics.DeliveryHeapSwitchesTotal.WithLabelValues("4ary").Inc()
-	}
-}
-
-// rebuildAfterDrain also handles filtering, which requires a rebuild even
-// when the arity stays the same. Ordinary pops already maintain heap order.
-func (p *topicPreload) rebuildAfterDrain(needsRebuild bool) {
-	if p.adaptiveHeap && p.heapShift == quadHeapShift && len(p.items) <= adaptiveHeapShrinkAt {
-		p.heapShift = binaryHeapShift
-		needsRebuild = true
-		metrics.DeliveryHeapSwitchesTotal.WithLabelValues("binary").Inc()
-	}
-	if needsRebuild {
-		p.items.initCandidates(p.heapShift)
-	}
-}
-
 func candidateBefore(a, b preloadCandidate) bool {
 	if a.due == b.due {
 		return bytes.Compare(a.key[:], b.key[:]) < 0
@@ -65,7 +36,7 @@ func candidateBefore(a, b preloadCandidate) bool {
 // All heaps use the same entries and ordering. A shift
 // selects 2, 4, or 8 children without division in the sift loops. Hole-based
 // sifting moves one entry per level rather than swapping two full candidates.
-func (h *candidateHeap) pushCandidate(candidate preloadCandidate, shift uint) {
+func (h *candidateHeap) pushCandidate(candidate preloadCandidate, shift uint) int {
 	shift = max(1, shift) // zero-value topic heaps also use typed binary operations
 	items := append(*h, candidate)
 	child := len(items) - 1
@@ -79,25 +50,33 @@ func (h *candidateHeap) pushCandidate(candidate preloadCandidate, shift uint) {
 	}
 	items[child] = candidate
 	*h = items
+	return child
 }
 
 // Callers check for an eligible head before popping. Clear the removed slot in
 // every implementation so drained backing arrays cannot retain payloads.
 func (h *candidateHeap) popCandidate(shift uint) preloadCandidate {
+	first := (*h)[0]
+	h.removeHead(shift)
+	return first
+}
+
+// removeHead returns the index where the replacement landed after sifting.
+func (h *candidateHeap) removeHead(shift uint) int {
 	items := *h
-	first := items[0]
 	last := len(items) - 1
 	replacement := items[last]
 	items[last] = preloadCandidate{}
 	items = items[:last]
+	landing := 0
 	if last > 0 {
-		items.siftCandidateDown(0, replacement, max(1, shift))
+		landing = items.siftCandidateDown(0, replacement, max(1, shift))
 	}
 	*h = items
-	return first
+	return landing
 }
 
-func (h candidateHeap) siftCandidateDown(parent int, candidate preloadCandidate, shift uint) {
+func (h candidateHeap) siftCandidateDown(parent int, candidate preloadCandidate, shift uint) int {
 	for {
 		child := (parent << shift) + 1
 		if child >= len(h) {
@@ -116,6 +95,7 @@ func (h candidateHeap) siftCandidateDown(parent int, candidate preloadCandidate,
 		parent = child
 	}
 	h[parent] = candidate
+	return parent
 }
 
 // Rebuild in place after filtering ready candidates or changing the arity.
