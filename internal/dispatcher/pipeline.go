@@ -113,10 +113,12 @@ type dueScanWork struct {
 	started         time.Time
 	examined, bytes int
 	commandSize     raft.DeliveryPrepareSizer
+	payloadDeferred bool
 }
 
 func (d *Dispatcher) dueScanFull(chunk *deliveryChunk, work *dueScanWork) bool {
-	return work.examined >= d.Limits.Examined || len(chunk.items) >= d.Limits.Candidates || work.bytes >= d.Limits.Bytes ||
+	return work.payloadDeferred || d.scanPayload.full() || work.examined >= d.Limits.Examined ||
+		len(chunk.items) >= d.Limits.Candidates || work.bytes >= d.Limits.Bytes ||
 		(work.examined > 0 && time.Since(work.started) >= d.Limits.WorkTime) || !d.hub.DeliveryPermitted()
 }
 
@@ -191,6 +193,11 @@ func (d *Dispatcher) collectDueRange(topic string, view InterestView, cursor *sc
 		value := iter.Value()
 		work.bytes += len(value)
 		metrics.DeliveryDiscoveryBytesTotal.Add(float64(len(value)))
+		if !d.scanPayload.reserve(len(value)) {
+			cursor.after = append(cursor.after[:0], key...)
+			work.payloadDeferred = true
+			break
+		}
 		payload, err := cachePayload(value)
 		if err != nil {
 			d.logger.Error("invalid stored message", zap.Error(err))

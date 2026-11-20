@@ -65,9 +65,11 @@ directly to the active plan. Due scans give each assigned shard
 an independent cursor and a frozen endpoint in its due-time range. Empty-range
 probes count toward the scan budget. Future-only ranges can sleep until their
 first due bucket or a write to the same shard. Layout refreshes give ready due
-scans a turn between probes. Pebble workers in the same pass share a snapshot and
-open their own bounded iterators. The workers divide
-the topic's key, byte, and candidate allowances and report into the same heap.
+scans a turn between probes. The planner reserves a lane for due work before
+assigning speculative scans. Pebble workers share a snapshot and open their own
+bounded iterators. The lanes share a payload allowance across the topic pass,
+and a single oversized message can use an otherwise empty pass. Candidates from
+all lanes report into the same heap.
 
 ## Comparing heaps
 

@@ -35,6 +35,7 @@ type discoveryJob struct {
 	now                   int64
 	probeLayouts          bool
 	tracksRevision        bool
+	payloadAdmission      scanPayloadAdmission
 }
 type discoveryResult struct {
 	futureExhausted bool
@@ -84,6 +85,7 @@ func (d *Dispatcher) discover(job discoveryJob) discoveryResult {
 	scanner.shardScan, scanner.scanSource = job.shards, job.source
 	scanner.scanRevision, scanner.tracksScanRevision = job.revision, job.tracksRevision
 	scanner.scanShardRevisions = job.shardRevisions
+	scanner.scanPayload = job.payloadAdmission
 	scanner.Limits.Candidates = job.dueSlots
 	if job.shards != nil {
 		scanner.Limits.Examined, scanner.Limits.Bytes = job.examined, job.bytes
@@ -98,10 +100,13 @@ func (d *Dispatcher) discover(job discoveryJob) discoveryResult {
 	} else if job.dueSlots > 0 {
 		metrics.DeliveryRepairScansTotal.Inc()
 		chunk = scanner.collectTopic(job.topic, now)
+		if job.payloadAdmission.release != nil {
+			job.payloadAdmission.release()
+		}
 	}
 	p := &topicPreload{epoch: job.owner.epoch, after: job.futureAfter, heapShift: job.owner.heapShift}
-	// Future scans have independent work budgets and run even with productive
-	// due traffic, provided the scheduler reserved future admission first.
+	// Future scans keep their own key and time allowances. They share the
+	// topic pass's remaining payload allowance with due discovery.
 	exhausted := false
 	if job.topic != maintenanceTopic && job.futureSlots > 0 && d.PreloadLookahead > 0 {
 		if job.now == 0 {
@@ -110,6 +115,7 @@ func (d *Dispatcher) discover(job discoveryJob) discoveryResult {
 		exhausted = scanner.preloadTopic(job.topic, p, d.hub.InterestView(job.topic), now)
 	}
 	job.source = nil
+	job.payloadAdmission = scanPayloadAdmission{}
 	return discoveryResult{futureExhausted: exhausted, job: job, chunk: chunk, future: p.items, cursor: *scanner.cursors[job.topic], after: p.after}
 }
 

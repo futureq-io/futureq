@@ -74,6 +74,7 @@ type topicPreload struct {
 	futureScanIdle   time.Duration
 	shardScans       []shardScanState // scheduler-owned cursors for parallel discovery
 	nextShardScan    int
+	nextDueShardScan int
 	sharded          bool
 	layouts          int
 	layoutRevision   uint64
@@ -240,7 +241,8 @@ func (d *Dispatcher) preloadTopic(topic string, p *topicPreload, view InterestVi
 	examined, bytesRead := 0, 0
 	valid := iter.First()
 	for valid {
-		if d.preloadCount >= d.PreloadMaxMessages || examined >= d.Limits.Examined || bytesRead >= d.Limits.Bytes || (examined > 0 && time.Since(started) >= d.Limits.WorkTime) || !d.hub.DeliveryPermitted() {
+		if d.scanPayload.full() || d.preloadCount >= d.PreloadMaxMessages || examined >= d.Limits.Examined || bytesRead >= d.Limits.Bytes ||
+			(examined > 0 && time.Since(started) >= d.Limits.WorkTime) || !d.hub.DeliveryPermitted() {
 			break
 		}
 		key := iter.Key()
@@ -273,6 +275,10 @@ func (d *Dispatcher) preloadTopic(topic string, p *topicPreload, view InterestVi
 			if due <= nowMs || due > horizon || d.isExpired(&header, nowMs) {
 				valid = iter.Next()
 				continue
+			}
+			if !d.scanPayload.reserve(len(value)) {
+				p.after = append(p.after[:0], key...)
+				break
 			}
 			payload, err := cachePayload(value)
 			if err == nil {

@@ -36,6 +36,7 @@ type Dispatcher struct {
 	scanSource         storage.IteratorSource
 	scanRevision       uint64
 	scanShardRevisions *storage.TopicRevisionSnapshot
+	scanPayload        scanPayloadAdmission
 	tracksScanRevision bool
 	db                 storage.DB
 	hub                *Hub

@@ -138,7 +138,7 @@ func (p *topicPreload) planShardScans(view InterestView, workers, layouts int) {
 	if len(p.shardScans) == 0 || p.layouts != layouts {
 		p.layouts = layouts
 		p.shardScans = splitShardScans(view, workers, layouts)
-		p.nextShardScan = 0
+		p.nextShardScan, p.nextDueShardScan = 0, 0
 	}
 }
 
@@ -158,8 +158,8 @@ func (job discoveryJob) knownLanesIdle(dueBucket uint64) bool {
 	return true
 }
 
-// Reserve a topic's original quota across tasks. Rotate the first lane so
-// even when one budget is scarce, each lane eventually receives a share.
+// Reserve a lane for due work first. Rotate that priority separately from
+// the scan order used to fill the remaining lanes.
 func (d *Dispatcher) shardDiscoveryJobs(base discoveryJob, now time.Time) []discoveryJob {
 	p := base.owner
 	lanes := p.shardScans
@@ -174,13 +174,34 @@ func (d *Dispatcher) shardDiscoveryJobs(base discoveryJob, now time.Time) []disc
 	var selected [utils.MaxVirtualShards]selectedLane
 	n, dueLanes, futureLanes := 0, 0, 0
 	dueBucket := utils.CalculateBucket(now.UnixMilli(), d.TimeBucket)
+	lead := -1
+	if base.dueSlots > 0 {
+		for offset := range lanes {
+			index := (p.nextDueShardScan + offset) % len(lanes)
+			lane := &lanes[index]
+			if !base.laneIdle(lane, dueBucket) {
+				lead = index
+				future := base.futureSlots > 0 && !now.Before(lane.futureScanAt)
+				selected[0] = selectedLane{index: index, due: true, future: future}
+				n, dueLanes = 1, 1
+				if future {
+					futureLanes = 1
+				}
+				p.nextDueShardScan = (index + 1) % len(lanes)
+				break
+			}
+		}
+	}
 	start := p.nextShardScan
 	p.nextShardScan = (start + 1) % len(lanes)
 	for attempts := 0; attempts < len(lanes) && n < parallel; attempts++ {
 		index := (start + attempts) % len(lanes)
+		if index == lead {
+			continue
+		}
 		lane := &lanes[index]
-		dueReady := base.dueSlots > 0 && !base.laneIdle(lane, dueBucket)
-		futureReady := base.futureSlots > 0 && !now.Before(lane.futureScanAt)
+		dueReady := dueLanes < base.dueSlots && !base.laneIdle(lane, dueBucket)
+		futureReady := futureLanes < base.futureSlots && !now.Before(lane.futureScanAt)
 		if !dueReady && !futureReady {
 			continue
 		}
@@ -208,9 +229,6 @@ func (d *Dispatcher) shardDiscoveryJobs(base discoveryJob, now time.Time) []disc
 			job.futureSlots = splitScanBudget(base.futureSlots, futureIndex, futureLanes)
 			futureIndex++
 		}
-		if job.dueSlots == 0 && job.futureSlots == 0 {
-			continue
-		}
 		job.examined = splitScanBudget(d.Limits.Examined, index, n)
 		job.bytes = splitScanBudget(d.Limits.Bytes, index, n)
 		if lane.generation == p.repairGeneration && lane.cursor.epoch == p.epoch {
@@ -230,7 +248,9 @@ func (d *Dispatcher) shardDiscoveryJobs(base discoveryJob, now time.Time) []disc
 // and close their iterators before the shared snapshot is released.
 func (d *Dispatcher) runDiscoveryPass(ctx context.Context, jobs []discoveryJob, results chan<- discoveryResult) {
 	var source storage.IteratorSource = d.db
-	if snapshots, ok := d.db.(storage.IteratorSnapshotter); len(jobs) > 1 && ok {
+	snapshots, canShareSnapshot := d.db.(storage.IteratorSnapshotter)
+	sharedSnapshot := len(jobs) > 1 && canShareSnapshot
+	if sharedSnapshot {
 		snapshot := snapshots.NewIteratorSnapshot()
 		defer func() {
 			if err := snapshot.Close(); err != nil {
@@ -243,12 +263,33 @@ func (d *Dispatcher) runDiscoveryPass(ctx context.Context, jobs []discoveryJob, 
 	if len(jobs) > 1 {
 		now = time.Now().UnixMilli()
 	}
-	run := func(job discoveryJob) {
+	budget := &scanPayloadBudget{limit: int64(d.Limits.Bytes)}
+	budget.remaining.Store(budget.limit)
+	lead := scanPayloadAdmission{budget: budget, ctx: ctx}
+	follower := lead
+	if len(jobs) > 1 {
+		first := make(chan struct{})
+		lead.release = sync.OnceFunc(func() { close(first) })
+		follower.wait = first
+	}
+	run := func(job discoveryJob, admission scanPayloadAdmission) {
+		if admission.release != nil {
+			defer admission.release()
+		}
 		if ctx.Err() != nil {
 			return
 		}
+		// A separate read transaction can block another lane from opening
+		// its iterator when bbolt needs to remap. Wait before opening it.
+		if !sharedSnapshot && !admission.awaitTurn() {
+			return
+		}
 		job.source, job.now = source, now
+		job.payloadAdmission = admission
 		result := d.discover(job)
+		if admission.release != nil {
+			admission.release()
+		}
 		select {
 		case results <- result:
 		case <-ctx.Done():
@@ -256,9 +297,9 @@ func (d *Dispatcher) runDiscoveryPass(ctx context.Context, jobs []discoveryJob, 
 	}
 	var running sync.WaitGroup
 	for _, job := range jobs[1:] {
-		running.Go(func() { run(job) })
+		running.Go(func() { run(job, follower) })
 	}
-	run(jobs[0])
+	run(jobs[0], lead)
 	running.Wait()
 }
 
