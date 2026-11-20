@@ -105,8 +105,8 @@ func (s *EventStateMachineSuite) TestUpdate_StoreBatch_AppliesItems() {
 	// Proposed IDs ahead of the applied high-water mark are retained.
 	var foundIDs []uint64
 	err = s.db.Scan(nil, func(k, v []byte) error {
-		if len(k) == 24 {
-			_, _, id, err := parseKeyEventID(k)
+		if len(k) == utils.EventKeySize {
+			_, _, id, err := utils.ParseEventKey(k)
 			require.NoError(err)
 			foundIDs = append(foundIDs, id)
 		}
@@ -117,17 +117,6 @@ func (s *EventStateMachineSuite) TestUpdate_StoreBatch_AppliesItems() {
 
 	// Applied IDs must be observed: next reserved ID must be past them.
 	require.Equal(uint64(3), s.repo.NextID())
-}
-
-// Helper to parse eventID from a key — small local helper to avoid circular import.
-func parseKeyEventID(key []byte) (uint64, uint64, uint64, error) {
-	if len(key) != 24 {
-		return 0, 0, 0, bytes.ErrTooLarge
-	}
-	topicHash := binary.BigEndian.Uint64(key[0:8])
-	bucket := binary.BigEndian.Uint64(key[8:16])
-	eventID := binary.BigEndian.Uint64(key[16:24])
-	return topicHash, bucket, eventID, nil
 }
 
 func (s *EventStateMachineSuite) TestUpdate_EmptyCmd_Skipped() {
@@ -156,12 +145,12 @@ func (s *EventStateMachineSuite) TestUpdate_InvalidCommandAbortsWholeBatch() {
 
 	var storedKey []byte
 	require.NoError(s.db.Scan(nil, func(key, _ []byte) error {
-		if len(key) == 24 {
+		if len(key) == utils.EventKeySize {
 			storedKey = append([]byte(nil), key...)
 		}
 		return nil
 	}))
-	require.Len(storedKey, 24)
+	require.Len(storedKey, utils.EventKeySize)
 	deleteCmd, err := MarshalDeleteBatchCmd([][]byte{storedKey})
 	require.NoError(err)
 
@@ -192,8 +181,8 @@ func (s *EventStateMachineSuite) TestUpdate_InvalidCommandAbortsWholeBatch() {
 			}
 			var ids []uint64
 			require.NoError(s.db.Scan(nil, func(key, _ []byte) error {
-				if len(key) == 24 {
-					ids = append(ids, binary.BigEndian.Uint64(key[16:24]))
+				if len(key) == utils.EventKeySize {
+					ids = append(ids, binary.BigEndian.Uint64(key[utils.EventKeySize-8:]))
 				}
 				return nil
 			}))
@@ -219,7 +208,7 @@ func (s *EventStateMachineSuite) TestUpdate_DeleteBatch_RemovesKeys() {
 	// Find the stored key.
 	var storedKey []byte
 	err = s.db.Scan(nil, func(k, v []byte) error {
-		if len(k) == 24 {
+		if len(k) == utils.EventKeySize {
 			storedKey = append([]byte(nil), k...)
 		}
 		return nil
@@ -246,9 +235,9 @@ func (s *EventStateMachineSuite) TestUpdate_DeleteBatch_CallsOnDeleteKeys() {
 	var captured [][]byte
 	sm := s.newSM(func(keys [][]byte) { captured = keys })
 
-	key1 := make([]byte, 24)
+	key1 := make([]byte, utils.EventKeySize)
 	key1[0] = 0x01
-	key2 := make([]byte, 24)
+	key2 := make([]byte, utils.EventKeySize)
 	key2[0] = 0x02
 
 	deleteCmd, _ := MarshalDeleteBatchCmd([][]byte{key1, key2})
@@ -263,7 +252,7 @@ func (s *EventStateMachineSuite) TestUpdate_NoDeleteCallback_DoesNotPanic() {
 
 	sm := s.newSM(nil) // nil OnDeleteKeys
 
-	key := make([]byte, 24)
+	key := make([]byte, utils.EventKeySize)
 	deleteCmd, _ := MarshalDeleteBatchCmd([][]byte{key})
 	_, err := sm.Update([]statemachine.Entry{{Index: 1, Cmd: deleteCmd}})
 	require.NoError(err) // must not panic
@@ -449,7 +438,7 @@ func (s *EventStateMachineSuite) TestSnapshot_RoundTrip() {
 	// The stored message bytes must also be recoverable.
 	var found []byte
 	require.NoError(db2.Scan(nil, func(k, v []byte) error {
-		if len(k) == 24 {
+		if len(k) == utils.EventKeySize {
 			found = append([]byte(nil), v...)
 		}
 		return nil
@@ -542,8 +531,8 @@ func TestSnapshot_PrepareFreezesAppliedState(t *testing.T) {
 			}
 			var foundIDs []uint64
 			if err := recoveredDB.Scan(nil, func(key, _ []byte) error {
-				if len(key) == 24 {
-					foundIDs = append(foundIDs, binary.BigEndian.Uint64(key[16:24]))
+				if len(key) == utils.EventKeySize {
+					foundIDs = append(foundIDs, binary.BigEndian.Uint64(key[utils.EventKeySize-8:]))
 				}
 				return nil
 			}); err != nil {

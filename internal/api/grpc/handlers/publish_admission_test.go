@@ -96,7 +96,7 @@ func openRaftAdmissionTest(t *testing.T) (*app.App, *ProducerHandler, *observedA
 	address := listener.Addr().String()
 	require.NoError(t, listener.Close())
 	root := t.TempDir()
-	cfg := &config.Config{Cluster: config.Cluster{Enabled: true, NodeID: 1, ShardID: 1}, Storage: config.Storage{Engine: "pebble", Pebble: config.Pebble{Mode: "disk", DataDir: filepath.Join(root, "events"), WALEnabled: false}}, Delivery: config.DefaultDelivery(), Publish: config.Publish{MinAckLevel: config.NoAck, ProposalTimeout: 3 * time.Second}}
+	cfg := &config.Config{Cluster: config.Cluster{Enabled: true, NodeID: 1, ShardID: 1}, Storage: config.Storage{Engine: "pebble", VirtualShards: 1, Pebble: config.Pebble{Mode: "disk", DataDir: filepath.Join(root, "events"), WALEnabled: false}}, Delivery: config.DefaultDelivery(), Publish: config.Publish{MinAckLevel: config.NoAck, ProposalTimeout: 3 * time.Second}}
 	previous := app.A
 	a, err := app.Init(cfg, zap.NewNop())
 	require.NoError(t, err)
@@ -127,7 +127,7 @@ func TestRaftPublishPersistsEachVirtualShardLayout(t *testing.T) {
 	defer cancel()
 	group, err := a.Subscriptions.Create(ctx, "orders", "workers", "")
 	require.NoError(t, err)
-	counts := []int{64, 8, 0}
+	counts := []int{utils.MaxVirtualShards, 64, 8, 1}
 	for _, count := range counts {
 		a.Config().Storage.VirtualShards = count
 		ack, err := producer.processBatch(ctx, &pb.PublishBatch{Messages: []*pb.PublishMessage{{Topic: "orders"}}})
@@ -142,11 +142,8 @@ func TestRaftPublishPersistsEachVirtualShardLayout(t *testing.T) {
 		require.Positive(t, bucket)
 		wanted := counts[id-1]
 		slot := utils.EventShardSlot(key)
-		if wanted == 0 {
-			require.Zero(t, slot)
-		} else {
-			require.Equal(t, wanted, utils.SlotShardCount(slot))
-		}
+		require.Positive(t, slot)
+		require.Equal(t, wanted, utils.SlotShardCount(slot))
 		state, err := raft.ReadDeliveryState(a.DB, key)
 		require.NoError(t, err)
 		require.Equal(t, []string{group.Recipient}, state.Recipients)

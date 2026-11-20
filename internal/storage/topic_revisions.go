@@ -2,20 +2,18 @@ package storage
 
 import (
 	"encoding/binary"
-	"math/bits"
+	"maps"
 	"sync"
 
 	"github.com/futureq-io/futureq/pkg/utils"
 )
-
-const shardSlots = 2 * utils.MaxVirtualShards
 
 // TopicRevisionSnapshot records event writes by storage slot. Slot zero
 // tracks unsharded keys. Capture it before opening the matching DB snapshot.
 type TopicRevisionSnapshot struct {
 	Version        uint64
 	WrittenLayouts int // bitmask of shard counts written during this watch
-	Shards         [shardSlots]uint64
+	Shards         map[int]uint64
 }
 
 type topicRevisions struct {
@@ -28,7 +26,7 @@ type topicRevisionState struct {
 	version        uint64
 	watchers       int
 	writtenLayouts int
-	shards         *[shardSlots]uint64
+	shards         map[int]uint64
 }
 
 // TopicRevision retains a topic's revision state until Close. Callers own
@@ -64,10 +62,11 @@ func (t *TopicRevision) Read(dst *TopicRevisionSnapshot) uint64 {
 	if dst != nil && dst.Version != state.version {
 		dst.Version = state.version
 		dst.WrittenLayouts = state.writtenLayouts
-		if state.shards == nil {
-			clear(dst.Shards[:])
+		if dst.Shards == nil {
+			dst.Shards = maps.Clone(state.shards)
 		} else {
-			dst.Shards = *state.shards
+			clear(dst.Shards)
+			maps.Copy(dst.Shards, state.shards)
 		}
 	}
 	return state.version
@@ -88,13 +87,23 @@ func (t *TopicRevision) Close() {
 	}
 }
 
-type writtenSlots [shardSlots / 64]uint64
-
-func (s *writtenSlots) add(slot int) {
-	s[slot/64] |= 1 << (slot % 64)
+type writtenSlots struct {
+	first int // slot plus one, leaving zero as the empty sentinel
+	other map[int]struct{}
 }
 
-// Inline the first topic's slots so single-topic batches need no map.
+func (s *writtenSlots) add(slot int) {
+	if s.first == 0 {
+		s.first = slot + 1
+	} else if s.first != slot+1 {
+		if s.other == nil {
+			s.other = make(map[int]struct{})
+		}
+		s.other[slot] = struct{}{}
+	}
+}
+
+// Inline the first topic so single-topic, single-slot writes need no map.
 type eventTopicWrites struct {
 	first  uint64
 	slots  writtenSlots
@@ -103,7 +112,7 @@ type eventTopicWrites struct {
 }
 
 func (w *eventTopicWrites) add(key []byte) {
-	if len(key) != 24 {
+	if len(key) != utils.EventKeySize {
 		return
 	}
 	hash := binary.BigEndian.Uint64(key[:8])
@@ -140,16 +149,17 @@ func (r *topicRevisions) commit(w eventTopicWrites) {
 func (s *topicRevisionState) record(version uint64, slots writtenSlots) {
 	s.version = version
 	if s.shards == nil {
-		s.shards = new([shardSlots]uint64)
+		s.shards = make(map[int]uint64)
 	}
-	for i, word := range slots {
-		for word != 0 {
-			slot := i*64 + bits.TrailingZeros64(word)
-			s.shards[slot] = version
-			if slot >= 2 {
-				s.writtenLayouts |= utils.SlotShardCount(slot)
-			}
-			word &= word - 1
-		}
+	s.recordSlot(version, slots.first-1)
+	for slot := range slots.other {
+		s.recordSlot(version, slot)
+	}
+}
+
+func (s *topicRevisionState) recordSlot(version uint64, slot int) {
+	s.shards[slot] = version
+	if slot > 0 {
+		s.writtenLayouts |= utils.SlotShardCount(slot)
 	}
 }

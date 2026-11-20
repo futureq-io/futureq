@@ -18,7 +18,7 @@ import (
 
 func TestDeliveryPrepareSizeMatchesProtobuf(t *testing.T) {
 	names := []string{"", "g:plain", "u:\"\\\b\f\n\r\t", "g:<>&", "g:\x00\x01\x1f", "g:فارسی日本語😀", "g:\u2028\u2029", "g:\xff\xfe", "g:\ufffd"}
-	for _, key := range [][]byte{nil, {}, make([]byte, 1), make([]byte, 23), make([]byte, 24), make([]byte, 25)} {
+	for _, key := range [][]byte{nil, {}, make([]byte, 1), make([]byte, utils.EventKeySize-1), make([]byte, utils.EventKeySize), make([]byte, utils.EventKeySize+1)} {
 		for _, epoch := range []uint64{0, 9, 10, 99, 100, math.MaxUint64} {
 			for _, recipients := range [][]string{nil, {}, names} {
 				item := DeliveryPrepare{Key: key, Epoch: epoch, Recipients: recipients}
@@ -30,7 +30,7 @@ func TestDeliveryPrepareSizeMatchesProtobuf(t *testing.T) {
 	}
 	// Exercise every byte, including all short escapes and invalid UTF-8.
 	for i := 0; i < 256; i++ {
-		item := DeliveryPrepare{Key: make([]byte, 24), Recipients: []string{"g:" + string([]byte{byte(i)})}}
+		item := DeliveryPrepare{Key: make([]byte, utils.EventKeySize), Recipients: []string{"g:" + string([]byte{byte(i)})}}
 		encoded, err := proto.Marshal(&delivery.DeliveryPrepareBatch{Groups: []*delivery.DeliveryPrepareGroup{{Epoch: item.Epoch, Recipients: normalizedRecipients(item.Recipients), Keys: [][]byte{item.Key}}}})
 		require.NoError(t, err)
 		require.Equal(t, len(encoded)+1, DeliveryPrepareSize(item))
@@ -49,7 +49,7 @@ func FuzzDeliveryPrepareSize(f *testing.F) {
 }
 
 func TestDeliveryPrepareValidationExactByteBoundary(t *testing.T) {
-	item := DeliveryPrepare{Key: make([]byte, 24), Epoch: math.MaxUint64, Recipients: []string{"g:x"}}
+	item := DeliveryPrepare{Key: make([]byte, utils.EventKeySize), Epoch: math.MaxUint64, Recipients: []string{"g:x"}}
 	padding := MaxDeliveryPrepareBytes - DeliveryPrepareSize(item)
 	item.Recipients[0] += strings.Repeat("x", padding)
 	for DeliveryPrepareSize(item) > MaxDeliveryPrepareBytes {

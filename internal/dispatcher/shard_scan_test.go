@@ -76,7 +76,7 @@ func TestShardScanConcurrencyMultipliesAndWaitingTopicsGetATurn(t *testing.T) {
 		d.hub.Register(topic, topic, "group", make(chan *pb.QueueMessage, 1))
 		for slot := 2; slot < 4; slot++ {
 			bucket := utils.ShardStorageBucket(slot, utils.CalculateBucket(at, d.TimeBucket))
-			require.NoError(t, batch.Set(utils.EventKey(bucket, hash, uint64(slot)), value))
+			require.NoError(t, batch.Set(bucket.EventKey(hash, uint64(slot)), value))
 		}
 	}
 	require.NoError(t, batch.Commit(storage.Sync))
@@ -139,8 +139,8 @@ func TestShardScanRangesCoverOnlyOwnedShards(t *testing.T) {
 	require.True(t, lanes[0].rangeKeys.includeLegacy)
 	require.False(t, lanes[1].rangeKeys.includeLegacy)
 	for shard := range 64 {
-		require.Equal(t, shard >= 32 && shard < 48, lanes[0].rangeKeys.slots[64+shard])
-		require.Equal(t, shard >= 48, lanes[1].rangeKeys.slots[64+shard])
+		require.Equal(t, shard >= 32 && shard < 48, lanes[0].rangeKeys.slots.next(64+shard) == 64+shard)
+		require.Equal(t, shard >= 48, lanes[1].rangeKeys.slots.next(64+shard) == 64+shard)
 	}
 }
 
@@ -161,7 +161,7 @@ func TestShardScansFindDueAndFutureKeysInBothRanges(t *testing.T) {
 			value, err := proto.Marshal(&storagepb.StoredMessage{Topic: "orders", EnqueuedAtUnixMs: due.UnixMilli()})
 			require.NoError(t, err)
 			bucket := utils.CalculateBucket(due.UnixMilli(), d.TimeBucket)
-			key := utils.EventKey(utils.ShardStorageBucket(64+shard, bucket), hash, uint64(id*2+i+1))
+			key := utils.ShardStorageBucket(64+shard, bucket).EventKey(hash, uint64(id*2+i+1))
 			require.NoError(t, batch.Set(key, value))
 		}
 	}

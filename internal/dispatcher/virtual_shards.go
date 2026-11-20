@@ -1,6 +1,9 @@
 package dispatcher
 
 import (
+	"slices"
+	"sort"
+
 	"github.com/futureq-io/futureq/pkg/raft/metadata"
 	"github.com/futureq-io/futureq/pkg/utils"
 )
@@ -39,12 +42,13 @@ func (r replicaMembership) shardRange(count int) (first, end int) {
 		return 0, count
 	}
 	if r.distribution == metadata.ShardDistributionReplicaCount {
-		return r.ordinal * count / r.replicas, (r.ordinal + 1) * count / r.replicas
+		ordinal, total, replicas := int64(r.ordinal), int64(count), int64(r.replicas)
+		return int(ordinal * total / replicas), int((ordinal + 1) * total / replicas)
 	}
 	// Give every replica one shard and split the rest by worker count. Rounded
 	// cumulative boundaries meet exactly, with no overlaps or uncovered shards.
-	extra := count - r.replicas
-	boundary := func(workers int) int { return (extra*workers + r.totalWorkers/2) / r.totalWorkers }
+	extra, totalWorkers := int64(count-r.replicas), int64(r.totalWorkers)
+	boundary := func(workers int) int { return int((extra*int64(workers) + totalWorkers/2) / totalWorkers) }
 	return r.ordinal + boundary(r.before), r.ordinal + 1 + boundary(r.before+r.workers)
 }
 
@@ -80,26 +84,51 @@ func (r replicaMembership) localWorkers(members []metadata.ConsumerMember, consu
 	return local
 }
 
-// ownedShardSlots is the union of the ranges for the local groups. A universal
-// subscriber needs every range. Each layout remains discoverable after resize.
-func (v InterestView) ownedShardSlots() [2 * utils.MaxVirtualShards]bool {
-	var owned [2 * utils.MaxVirtualShards]bool
-	if len(v.universal) != 0 {
-		for slot := 2; slot < len(owned); slot++ {
-			owned[slot] = true
-		}
-		return owned
+type shardSlotRange struct {
+	first, end int // half-open
+}
+
+type shardSlotRanges []shardSlotRange
+
+// next returns the first owned slot at or after slot, or -1.
+func (r shardSlotRanges) next(slot int) int {
+	i := sort.Search(len(r), func(i int) bool { return r[i].end > slot })
+	if i == len(r) {
+		return -1
 	}
-	for _, group := range v.groups {
-		if len(group.local) == 0 {
+	return max(slot, r[i].first)
+}
+
+// ownedShardSlots returns the union of local group ranges for the requested layouts.
+func (v InterestView) ownedShardSlots(layouts int) shardSlotRanges {
+	var owned shardSlotRanges
+	for count := 1; count <= utils.MaxVirtualShards; count *= 2 {
+		if layouts&count == 0 {
 			continue
 		}
-		for count := 2; count <= utils.MaxVirtualShards; count *= 2 {
+		if len(v.universal) != 0 {
+			owned = append(owned, shardSlotRange{count, 2 * count})
+			continue
+		}
+		for _, group := range v.groups {
+			if len(group.local) == 0 {
+				continue
+			}
 			first, end := group.replica.shardRange(count)
-			for slot := count + first; slot < count+end; slot++ {
-				owned[slot] = true
+			if first < end {
+				owned = append(owned, shardSlotRange{count + first, count + end})
 			}
 		}
 	}
-	return owned
+	slices.SortFunc(owned, func(a, b shardSlotRange) int { return a.first - b.first })
+	merged := owned[:0]
+	for _, r := range owned {
+		last := len(merged) - 1
+		if last >= 0 && r.first <= merged[last].end {
+			merged[last].end = max(merged[last].end, r.end)
+		} else {
+			merged = append(merged, r)
+		}
+	}
+	return merged
 }

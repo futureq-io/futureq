@@ -1,10 +1,10 @@
 package dispatcher
 
 import (
-	"encoding/binary"
 	"testing"
 
 	"github.com/futureq-io/futureq/pkg/raft/metadata"
+	"github.com/futureq-io/futureq/pkg/utils"
 	pb "github.com/futureq-io/protocol/proto/go"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
@@ -25,8 +25,7 @@ func TestReplicaGroupModuloAssignment(t *testing.T) {
 	}
 
 	dispatch := func(id uint64) string {
-		tag := make([]byte, 24)
-		binary.BigEndian.PutUint64(tag[16:], id)
+		tag := utils.EventKey(0, utils.TopicHash("orders"), id)
 		msg := &pb.QueueMessage{Topic: "orders", DeliveryTag: tag}
 		node1.DispatchToTopic("orders", msg, tag)
 		node2.DispatchToTopic("orders", msg, tag)

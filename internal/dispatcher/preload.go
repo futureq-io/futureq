@@ -18,10 +18,10 @@ import (
 // Entries own decoded protobuf data. Default proto.Unmarshal copies byte fields;
 // no iterator-owned memory or recipient decisions survive discovery.
 type preloadCandidate struct {
-	key     [24]byte
+	key     [utils.EventKeySize]byte
+	ready   bool // charged to the independent overdue admission allowance
 	due     int64
 	payload cachedPayload
-	ready   bool // charged to the independent overdue admission allowance
 }
 
 // cachedPayload owns immutable message data, never cached delivery eligibility.
@@ -68,7 +68,7 @@ type topicPreload struct {
 	after            []byte // independent of the live due cursor; never a watermark
 	items            candidateHeap
 	keyMu            sync.RWMutex // protects keys only; never held across storage or Hub calls
-	keys             map[[24]byte]bool
+	keys             map[[utils.EventKeySize]byte]bool
 	scanNext         bool
 	futureScanAfter  time.Time // scheduler-owned speculative scan deadline
 	futureScanIdle   time.Duration
@@ -87,20 +87,20 @@ type topicPreload struct {
 
 // Discovery reads this small synchronized index without copying the entire
 // preload. Heaps and accounting remain exclusively scheduler-owned.
-func (p *topicPreload) hasKey(key [24]byte) bool {
+func (p *topicPreload) hasKey(key [utils.EventKeySize]byte) bool {
 	p.keyMu.RLock()
 	defer p.keyMu.RUnlock()
 	return p.keys[key]
 }
-func (p *topicPreload) addKey(key [24]byte) {
+func (p *topicPreload) addKey(key [utils.EventKeySize]byte) {
 	p.keyMu.Lock()
 	defer p.keyMu.Unlock()
 	if p.keys == nil {
-		p.keys = make(map[[24]byte]bool)
+		p.keys = make(map[[utils.EventKeySize]byte]bool)
 	}
 	p.keys[key] = true
 }
-func (p *topicPreload) removeKey(key [24]byte) {
+func (p *topicPreload) removeKey(key [utils.EventKeySize]byte) {
 	p.keyMu.Lock()
 	defer p.keyMu.Unlock()
 	delete(p.keys, key)
@@ -250,9 +250,9 @@ func (d *Dispatcher) preloadTopic(topic string, p *topicPreload, view InterestVi
 		bytesRead += len(key)
 		metrics.DeliveryDiscoveryBytesTotal.Add(float64(len(key)))
 		p.after = append(append([]byte(nil), key...), 0)
-		if len(key) == 24 {
+		if len(key) == utils.EventKeySize {
 			scanned++
-			if p.hasKey([24]byte(key)) || (d.skipKeys != nil && d.skipKeys([24]byte(key))) {
+			if p.hasKey([utils.EventKeySize]byte(key)) || (d.skipKeys != nil && d.skipKeys([utils.EventKeySize]byte(key))) {
 				valid = iter.Next()
 				continue
 			}
@@ -261,7 +261,7 @@ func (d *Dispatcher) preloadTopic(topic string, p *topicPreload, view InterestVi
 				valid = iter.Next()
 				continue
 			}
-			candidate := preloadCandidate{key: [24]byte(key)}
+			candidate := preloadCandidate{key: [utils.EventKeySize]byte(key)}
 			value := iter.Value()
 			bytesRead += len(value)
 			metrics.DeliveryDiscoveryBytesTotal.Add(float64(len(value)))
@@ -369,7 +369,7 @@ func (p *topicPreload) compact() {
 		items := make(candidateHeap, len(p.items))
 		copy(items, p.items)
 		p.items = items
-		p.keys = make(map[[24]byte]bool, len(items))
+		p.keys = make(map[[utils.EventKeySize]byte]bool, len(items))
 		for _, candidate := range items {
 			p.keys[candidate.key] = true
 		}

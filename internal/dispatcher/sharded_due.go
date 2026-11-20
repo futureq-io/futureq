@@ -12,13 +12,13 @@ type shardDueState struct {
 	cursor    scanCursor
 	revision  uint64
 	notBefore uint64
-	peek      bool // the bounded due range was empty; check its next live bucket
+	peek      bool // the bounded due range was empty; check for live keys
 }
 
 // A discovery lane owns this state until its result is returned to the
 // scheduler. Each shard has a frozen endpoint and its own cyclic cursor.
 type shardedDueScan struct {
-	shards    []int // zero denotes the unsharded time-ordered range
+	shards    shardSlotRanges // zero denotes the unsharded time-ordered range
 	state     map[int]shardDueState
 	next      int
 	layouts   int
@@ -70,41 +70,63 @@ func (d *Dispatcher) collectShardedDue(topic string, hash, last uint64, view Int
 		return
 	}
 
-	start := scan.next
+	first := scan.shards.next(0)
+	start := scan.shards.next(scan.next)
+	if start < 0 {
+		start = first
+	}
 	idleUntil := noDueBucket
-	for offset := range len(scan.shards) {
-		index := (start + offset) % len(scan.shards)
-		slot := scan.shards[index]
+	wrapped := false
+	for slot := start; slot >= 0; slot = scan.next {
 		state := scan.state[slot]
 		slotRevision := scanSlotRevision(revision, shards, slot)
-		if tracked && state.revision == slotRevision && state.notBefore > last {
-			idleUntil = min(idleUntil, state.notBefore)
-			continue
+		next := slot + 1
+		if !tracked || state.revision != slotRevision || state.notBefore <= last {
+			if d.dueScanFull(chunk, work) {
+				idleUntil = 0
+				break
+			}
+			skipEmpty := slot >= 256
+			if state.revision != slotRevision {
+				state.notBefore = 0
+				// The wide seek starts at this shard in a fresh view, so it
+				// can run even when writes invalidate the previous due check.
+				state.peek = state.peek && skipEmpty
+				state.revision = slotRevision
+			}
+			lower, upper, end := dueShardBounds(hash, last, slot)
+			if !state.peek {
+				examined := work.examined
+				empty := d.collectDueRange(topic, view, &state.cursor, lower, upper, chunk, work)
+				if examined == work.examined {
+					work.examined++ // even a range without keys consumes a work unit
+				}
+				state.peek = empty && (tracked || skipEmpty)
+			}
+			if state.peek && !d.dueScanFull(chunk, work) {
+				work.examined++
+				if skipEmpty {
+					state.notBefore, next = d.nextLiveShard(hash, slot, last)
+				} else {
+					state.notBefore = d.nextShardBucket(lower, end, last)
+				}
+				state.peek = false
+			}
+			scan.state[slot] = state
+			if skipEmpty && state.peek {
+				// Resume the seek here if the due check used the last work unit.
+				scan.next, idleUntil = slot, 0
+				break
+			}
 		}
-		if d.dueScanFull(chunk, work) {
-			idleUntil = 0
+		idleUntil = min(idleUntil, state.notBefore)
+		scan.next = scan.shards.next(next)
+		if scan.next < 0 {
+			scan.next, wrapped = first, true
+		}
+		if wrapped && scan.next >= start {
 			break
 		}
-		scan.next = (index + 1) % len(scan.shards)
-		if state.revision != slotRevision {
-			state.notBefore, state.peek = 0, false
-			state.revision = slotRevision
-		}
-		lower, upper, end := dueShardBounds(hash, last, slot)
-		if !state.peek {
-			examined := work.examined
-			empty := d.collectDueRange(topic, view, &state.cursor, lower, upper, chunk, work)
-			if examined == work.examined {
-				work.examined++ // even a range without keys consumes a work unit
-			}
-			state.peek = tracked && empty
-		}
-		if state.peek && !d.dueScanFull(chunk, work) {
-			work.examined++
-			state.notBefore, state.peek = d.nextShardBucket(lower, end, last), false
-		}
-		scan.state[slot] = state
-		idleUntil = min(idleUntil, state.notBefore)
 	}
 	if tracked {
 		scan.idleRev, scan.idleUntil = revision, idleUntil
@@ -123,8 +145,8 @@ func (scan *shardedDueScan) idle(last, revision uint64, shards *storage.TopicRev
 	if shards == nil {
 		return false
 	}
-	for _, slot := range scan.shards {
-		if scan.state[slot].revision != shards.Shards[slot] {
+	for slot, version := range shards.Shards {
+		if version > scan.idleRev && scan.shards.next(slot) == slot {
 			return false
 		}
 	}
@@ -155,22 +177,16 @@ func (d *Dispatcher) cacheRevision(watch *storage.TopicRevision, shards *storage
 	return 0, false
 }
 
-func dueShardOrder(shards *shardScanRange) []int {
-	var order []int
-	if shards.includeLegacy {
-		order = append(order, 0)
+func dueShardOrder(shards *shardScanRange) shardSlotRanges {
+	if !shards.includeLegacy {
+		return shards.slots
 	}
-	for slot, owned := range shards.slots {
-		if owned {
-			order = append(order, slot)
-		}
-	}
-	return order
+	return append(shardSlotRanges{{0, 1}}, shards.slots...)
 }
 
 func dueShardBounds(hash, last uint64, slot int) (lower, dueEnd, end []byte) {
 	if slot == 0 {
-		return utils.TopicLowerBound(hash), utils.DueUpperBound(hash, last), shardScanBound(hash, 2)
+		return utils.TopicLowerBound(hash), utils.DueUpperBound(hash, last), shardScanBound(hash, 1)
 	}
 	lower = shardScanBound(hash, slot)
 	if slot < 2*utils.MaxVirtualShards-1 {
@@ -180,9 +196,33 @@ func dueShardBounds(hash, last uint64, slot int) (lower, dueEnd, end []byte) {
 	}
 	dueEnd = end
 	if last < utils.MaxVirtualTimeBucket {
-		dueEnd = utils.EventKey(utils.ShardStorageBucket(slot, last+1), hash, 0)[:16]
+		dueEnd = utils.ShardStorageBucket(slot, last+1).Prefix(hash)
 	}
 	return lower, dueEnd, end
+}
+
+// nextLiveShard finds the current slot's earliest future bucket or skips to
+// the next slot with keys. New writes invalidate hints through their revision.
+func (d *Dispatcher) nextLiveShard(hash uint64, slot int, last uint64) (notBefore uint64, next int) {
+	iter, err := d.discoverySource().NewIter(&storage.IterOptions{LowerBound: shardScanBound(hash, slot), UpperBound: topicScanEnd(hash)})
+	if err != nil {
+		return 0, slot + 1
+	}
+	defer iter.Close() //nolint:errcheck
+	if iter.First() {
+		key := iter.Key()
+		if liveSlot := utils.EventShardSlot(key); liveSlot > slot {
+			return noDueBucket, liveSlot
+		}
+		if _, bucket, _, err := utils.ParseEventKey(key); err == nil && bucket > last {
+			return bucket, slot + 1
+		}
+		return 0, slot + 1
+	}
+	if iter.Error() != nil {
+		return 0, slot + 1
+	}
+	return noDueBucket, 2 * utils.MaxVirtualShards
 }
 
 // Empty-shard hints are scoped to the topic revision captured before the

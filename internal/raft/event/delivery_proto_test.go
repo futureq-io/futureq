@@ -160,7 +160,7 @@ func FuzzProtoPreparationDecode(f *testing.F) {
 
 func TestProtoPreparationRejectsExcessFieldsBeforeDecode(t *testing.T) {
 	group := protowire.AppendTag(nil, 3, protowire.BytesType)
-	group = protowire.AppendBytes(group, make([]byte, 24))
+	group = protowire.AppendBytes(group, make([]byte, utils.EventKeySize))
 	group = bytes.Repeat(group, MaxDeliveryPrepareItems+1)
 	data := protowire.AppendTag(nil, 1, protowire.BytesType)
 	data = protowire.AppendBytes(data, group)

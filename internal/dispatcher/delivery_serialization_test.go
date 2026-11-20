@@ -204,7 +204,7 @@ func TestPreparationSizingHonorsExactChunkBoundary(t *testing.T) {
 			case "scan":
 				chunk = d.collectTopic("orders", now)
 			case "preload":
-				p := &topicPreload{epoch: view.Epoch, keys: map[[24]byte]bool{[24]byte(a): true}, items: candidateHeap{{key: [24]byte(a), due: now - 1000}}}
+				p := &topicPreload{epoch: view.Epoch, keys: map[[utils.EventKeySize]byte]bool{[utils.EventKeySize]byte(a): true}, items: candidateHeap{{key: [utils.EventKeySize]byte(a), due: now - 1000}}}
 				d.preloadCount = 1
 				chunk = d.collectPreloaded("orders", p, view, now)
 			case "maintenance":

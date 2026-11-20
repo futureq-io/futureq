@@ -95,7 +95,7 @@ func TestVirtualShardDiscoverySkipsRemoteKeys(t *testing.T) {
 						require.NoError(t, err)
 						id++
 						packed := utils.ShardStorageBucket(count+ordinal, utils.CalculateBucket(at, d.TimeBucket))
-						key := utils.EventKey(packed, hash, id)
+						key := packed.EventKey(hash, id)
 						require.NoError(t, batch.Set(key, value))
 						if ordinal >= firstLocal && message < 8 {
 							dueKeys = append(dueKeys, string(key))
@@ -144,11 +144,11 @@ func TestVirtualShardReplicaRebalancePreservesOldTagAndFanout(t *testing.T) {
 	value, err := proto.Marshal(&storagepb.StoredMessage{Topic: "orders", EnqueuedAtUnixMs: now})
 	require.NoError(t, err)
 	hash := utils.TopicHash("orders")
-	oldBucket := utils.ShardStorageBucket(2, utils.CalculateBucket(now, time.Second))
-	newBucket := utils.ShardStorageBucket(7, utils.CalculateBucket(now, time.Second))
+	bucket := utils.CalculateBucket(now, time.Second)
+	const oldSlot, newSlot = 2, 2*utils.MaxVirtualShards - 1
 	cmd, err := raft.MarshalStoreBatchCmd([]raft.StoreBatchItem{
-		{ID: 1, Bucket: oldBucket, TopicHash: hash, Msg: value},
-		{ID: 2, Bucket: newBucket, TopicHash: hash, Msg: value},
+		{ID: 1, Bucket: bucket, ShardSlot: oldSlot, TopicHash: hash, Msg: value},
+		{ID: 2, Bucket: bucket, ShardSlot: newSlot, TopicHash: hash, Msg: value},
 	})
 	require.NoError(t, err)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -156,7 +156,14 @@ func TestVirtualShardReplicaRebalancePreservesOldTagAndFanout(t *testing.T) {
 	_, err = c.nodes[1].nh.SyncPropose(ctx, c.nodes[1].nh.GetNoOPSession(replicaTestShard), cmd)
 	require.NoError(t, err)
 	c.sync()
-	oldKey, newKey := utils.EventKey(oldBucket, hash, 1), utils.EventKey(newBucket, hash, 2)
+	oldKey := utils.ShardStorageBucket(oldSlot, bucket).EventKey(hash, 1)
+	newKey := utils.ShardStorageBucket(newSlot, bucket).EventKey(hash, 2)
+	for _, node := range c.nodes {
+		stored, closer, err := node.db.Get(newKey)
+		require.NoError(t, err)
+		require.Equal(t, value, stored)
+		require.NoError(t, closer.Close())
+	}
 	require.Eventually(t, func() bool { return c.nodes[2].dispatcher.dispatchAll() == 1 }, 5*time.Second, 20*time.Millisecond)
 	newMessage := receiveReplicaMessage(t, worker)
 	require.Equal(t, newKey, newMessage.DeliveryTag)
@@ -201,12 +208,12 @@ func TestVirtualShardDispatchUsesLocalRoundRobin(t *testing.T) {
 	hub.Register("joining", "orders", "workers", uncommitted)
 	for id, expected := range []chan *pb.QueueMessage{first, second, first, second} {
 		// One shard, with IDs that always give the same legacy modulo owner.
-		key := utils.EventKey(utils.ShardStorageBucket(64, 1), utils.TopicHash("orders"), uint64(3*id+1))
+		key := utils.ShardStorageBucket(64, 1).EventKey(utils.TopicHash("orders"), uint64(3*id+1))
 		msg := &pb.QueueMessage{Topic: "orders", DeliveryTag: key}
 		require.Equal(t, []string{"workers"}, hub.DispatchToTopic("orders", msg, key))
 		require.Equal(t, key, receiveReplicaMessage(t, expected).DeliveryTag)
 	}
-	remote := utils.EventKey(utils.ShardStorageBucket(127, 1), utils.TopicHash("orders"), 5)
+	remote := utils.ShardStorageBucket(127, 1).EventKey(utils.TopicHash("orders"), 5)
 	require.Empty(t, hub.DispatchToTopic("orders", &pb.QueueMessage{Topic: "orders"}, remote))
 	require.Empty(t, uncommitted)
 }
@@ -244,8 +251,8 @@ func TestShardDistributionRebalancesQueuedDelivery(t *testing.T) {
 	data, err := proto.Marshal(&storagepb.StoredMessage{Topic: "orders", EnqueuedAtUnixMs: at})
 	require.NoError(t, err)
 	// Shard 36 belongs to replica 1 at 42/22 and replica 2 at 32/32.
-	bucket := utils.ShardStorageBucket(64+36, utils.CalculateBucket(at, time.Second))
-	cmd, err := raft.MarshalStoreBatchCmd([]raft.StoreBatchItem{{ID: 1, Bucket: bucket, TopicHash: utils.TopicHash("orders"), Msg: data}})
+	bucket := utils.CalculateBucket(at, time.Second)
+	cmd, err := raft.MarshalStoreBatchCmd([]raft.StoreBatchItem{{ID: 1, Bucket: bucket, ShardSlot: 64 + 36, TopicHash: utils.TopicHash("orders"), Msg: data}})
 	require.NoError(t, err)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()

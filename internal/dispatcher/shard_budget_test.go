@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/futureq-io/futureq/internal/storage"
 	"github.com/futureq-io/futureq/pkg/raft/metadata"
 	"github.com/futureq-io/futureq/pkg/utils"
 	pb "github.com/futureq-io/protocol/proto/go"
@@ -56,7 +57,7 @@ func putShardBudgetPayload(t *testing.T, d *Dispatcher, topic string, slot, id, 
 	})
 	require.NoError(t, err)
 	bucket := utils.ShardStorageBucket(slot, utils.CalculateBucket(at.UnixMilli(), d.TimeBucket))
-	key := utils.EventKey(bucket, utils.TopicHash(topic), uint64(id))
+	key := bucket.EventKey(utils.TopicHash(topic), uint64(id))
 	require.NoError(t, storeProbeEvent(d.db, key, value))
 	return key
 }
@@ -104,7 +105,7 @@ func TestShardDiscoveryRetriesOversizedPayloadOnRotatingLead(t *testing.T) {
 			base.owner.shardScans[result.job.shardLane].cursor = result.cursor
 			for _, item := range result.chunk.items {
 				admitted = append(admitted, item.Key)
-				base.owner.addKey([24]byte(item.Key))
+				base.owner.addKey([utils.EventKeySize]byte(item.Key))
 			}
 		}
 		require.Equal(t, [][]byte{want}, admitted)
@@ -129,5 +130,101 @@ func TestShardDiscoveryPreloadSharesPayloadBudgetAndRetriesDeferredKey(t *testin
 	results = runShardBudgetPass(d, base)
 	require.Len(t, results, 1)
 	require.Len(t, results[0].future, 1)
-	require.Equal(t, [24]byte(future), results[0].future[0].key)
+	require.Equal(t, [utils.EventKeySize]byte(future), results[0].future[0].key)
+}
+
+func TestShardDiscoveryAtMaxLayoutFindsSparseDueAndFutureKeys(t *testing.T) {
+	d, base := newShardBudgetTest(t, utils.MaxVirtualShards, 2)
+	d.Limits.Examined = 32
+	base.futureSlots = 2
+	now := time.Now()
+	const firstSlot = utils.MaxVirtualShards
+	const lastSlot = 2*utils.MaxVirtualShards - 1
+	due := putShardBudgetPayload(t, d, base.topic, firstSlot+1024, 1, 32, now.Add(-time.Second))
+	future := putShardBudgetPayload(t, d, base.topic, lastSlot, 2, 32, now.Add(30*time.Second))
+	byLane := make(map[int]discoveryResult)
+	for _, result := range runShardBudgetPass(d, base) {
+		byLane[result.job.shardLane] = result
+	}
+	require.Len(t, byLane, 2)
+	require.Len(t, byLane[0].chunk.items, 1)
+	require.Equal(t, due, byLane[0].chunk.items[0].Key)
+	require.Empty(t, byLane[1].chunk.items)
+	require.Len(t, byLane[1].future, 1)
+	require.Equal(t, [utils.EventKeySize]byte(future), byLane[1].future[0].key)
+}
+
+func TestShardDiscoveryResumesSparseSeekWithOneKeyBudget(t *testing.T) {
+	for _, tracked := range []bool{false, true} {
+		t.Run(fmt.Sprintf("tracked=%t", tracked), func(t *testing.T) {
+			d, base := newShardBudgetTest(t, utils.MaxVirtualShards, 1)
+			d.Limits.Examined = 1
+			due := putShardBudgetPayload(t, d, base.topic, 2*utils.MaxVirtualShards-1, 1, 32, time.Now().Add(-time.Second))
+			if tracked {
+				watch := d.watchTopic(utils.TopicHash(base.topic))
+				defer watch.Close()
+				base.shardRevisions = new(storage.TopicRevisionSnapshot)
+				base.revision = watch.Read(base.shardRevisions)
+				base.tracksRevision = true
+			}
+			for range 6 {
+				results := runShardBudgetPass(d, base)
+				require.Len(t, results, 1)
+				result := results[0]
+				base.owner.shardScans[0].cursor = result.cursor
+				if len(result.chunk.items) != 0 {
+					require.Len(t, result.chunk.items, 1)
+					require.Equal(t, due, result.chunk.items[0].Key)
+					return
+				}
+			}
+			t.Fatal("discovery did not reach the last shard within six passes")
+		})
+	}
+}
+
+func TestSingleShardLayoutDiscoversDueAndFutureKeys(t *testing.T) {
+	d, base := newShardBudgetTest(t, 1, 1)
+	d.PreloadMaxMessages = 2
+	now := time.Now()
+	due := putShardBudgetPayload(t, d, base.topic, 1, 1, 32, now.Add(-time.Second))
+	future := putShardBudgetPayload(t, d, base.topic, 1, 2, 32, now.Add(30*time.Second))
+
+	chunk := d.collectTopic(base.topic, now.UnixMilli())
+	require.Len(t, chunk.items, 1)
+	require.Equal(t, due, chunk.items[0].Key)
+
+	preload := &topicPreload{}
+	require.True(t, d.preloadTopic(base.topic, preload, d.hub.InterestView(base.topic), now.UnixMilli()))
+	require.Len(t, preload.items, 1)
+	require.Equal(t, [utils.EventKeySize]byte(future), preload.items[0].key)
+}
+
+func TestShardDiscoveryResumesSeekWhileCurrentShardReceivesWrites(t *testing.T) {
+	d, base := newShardBudgetTest(t, utils.MaxVirtualShards, 1)
+	d.Limits.Examined = 1
+	watch := d.watchTopic(utils.TopicHash(base.topic))
+	defer watch.Close()
+	base.shardRevisions = new(storage.TopicRevisionSnapshot)
+	base.tracksRevision = true
+
+	now := time.Now()
+	const writingSlot = utils.MaxVirtualShards
+	const lastSlot = 2*utils.MaxVirtualShards - 1
+	due := putShardBudgetPayload(t, d, base.topic, lastSlot, 1, 32, now.Add(-time.Second))
+	for pass := range 6 {
+		putShardBudgetPayload(t, d, base.topic, writingSlot, pass+2, 32, now.Add(time.Hour))
+		base.revision = watch.Read(base.shardRevisions)
+
+		results := runShardBudgetPass(d, base)
+		require.Len(t, results, 1)
+		result := results[0]
+		base.owner.shardScans[0].cursor = result.cursor
+		if len(result.chunk.items) != 0 {
+			require.Len(t, result.chunk.items, 1)
+			require.Equal(t, due, result.chunk.items[0].Key)
+			return
+		}
+	}
+	t.Fatal("discovery did not reach the last shard while the first shard received writes")
 }

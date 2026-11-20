@@ -13,6 +13,7 @@ import (
 	"github.com/futureq-io/futureq/internal/dispatcher"
 	raft "github.com/futureq-io/futureq/internal/raft/event"
 	"github.com/futureq-io/futureq/internal/storage"
+	"github.com/futureq-io/futureq/pkg/utils"
 	pb "github.com/futureq-io/protocol/proto/go"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
@@ -50,7 +51,7 @@ func publishedKeys(t *testing.T, db storage.DB) [][]byte {
 	t.Helper()
 	var keys [][]byte
 	require.NoError(t, db.Scan(nil, func(k, _ []byte) error {
-		if len(k) == 24 {
+		if len(k) == utils.EventKeySize {
 			keys = append(keys, append([]byte(nil), k...))
 		}
 		return nil

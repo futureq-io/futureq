@@ -3,6 +3,8 @@ package raft
 import (
 	"encoding/binary"
 	"fmt"
+
+	"github.com/futureq-io/futureq/pkg/utils"
 )
 
 // CommandType identifies the state machine operation.
@@ -36,14 +38,14 @@ const (
 // StoreBatchItem is the minimal per-message metadata carried in a StoreBatchCmd.
 // The serialised StoredMessage value is passed verbatim — no re-serialisation
 // occurs in the state machine. Ordered apply chooses the final monotonic event
-// ID and EventRepository constructs the full 24-byte key.
+// ID and EventRepository constructs the full 25-byte key.
 type StoreBatchItem struct {
 	// ID is a proposed event ID, not a committed reservation. Ordered apply
 	// retains it only when it is above the applied high-water mark; otherwise
 	// it assigns the next ID. All replicas derive identical keys in log order.
-	ID uint64
-	// Bucket is the precomputed storage bucket, including any virtual shard slot.
-	Bucket uint64
+	ID        uint64
+	Bucket    uint64
+	ShardSlot int
 	// TopicHash is xxhash64(topic).
 	TopicHash uint64
 	Indexes   [][]byte
@@ -54,6 +56,8 @@ type StoreBatchItem struct {
 	Receipt []byte
 }
 
+const storeItemHeaderSize = 8 + utils.StorageBucketSize + 8 + 2
+
 // MarshalStoreBatchCmd serialises a list of items into a compact binary command.
 //
 // Wire format:
@@ -62,9 +66,9 @@ type StoreBatchItem struct {
 //	[1..8]   count         (uint64 big-endian)
 //	for each item:
 //	  [n..n+7]   id          (uint64 big-endian)
-//	  [n+8..n+15] bucket     (uint64 big-endian)
-//	  [n+16..n+23] topicHash (uint64 big-endian)
-//	  [n+24..n+25] numIdx    (uint16 big-endian)
+//	  [n+8..n+16] bucket    (17-bit shard slot and 55-bit time bucket)
+//	  [n+17..n+24] topicHash (uint64 big-endian)
+//	  [n+25..n+26] numIdx    (uint16 big-endian)
 //	  for each index:
 //	    [m..m+1]   idxLen    (uint16 big-endian)
 //	    [m+2..]    idxData   (idxLen bytes)
@@ -76,13 +80,16 @@ func MarshalStoreBatchCmd(items []StoreBatchItem) ([]byte, error) {
 	// Pre-calculate total size to do a single allocation.
 	size := 1 + 8 // cmdType + count
 	for i, it := range items {
+		if it.ShardSlot < 0 || it.ShardSlot >= 2*utils.MaxVirtualShards {
+			return nil, fmt.Errorf("raft: item %d has invalid shard slot %d", i, it.ShardSlot)
+		}
 		if len(it.Indexes) > int(^uint16(0)) {
 			return nil, fmt.Errorf("raft: item %d has %d indexes, max %d", i, len(it.Indexes), ^uint16(0))
 		}
 		if uint64(len(it.Msg)) > uint64(^uint32(0)) {
 			return nil, fmt.Errorf("raft: item %d message has %d bytes, max %d", i, len(it.Msg), ^uint32(0))
 		}
-		size += 8 + 8 + 8 + 2 // id + bucket + topicHash + numIdx
+		size += storeItemHeaderSize
 		for j, idx := range it.Indexes {
 			if len(idx) > int(^uint16(0)) {
 				return nil, fmt.Errorf("raft: item %d index %d has %d bytes, max %d", i, j, len(idx), ^uint16(0))
@@ -100,8 +107,9 @@ func MarshalStoreBatchCmd(items []StoreBatchItem) ([]byte, error) {
 	for _, it := range items {
 		binary.BigEndian.PutUint64(out[pos:pos+8], it.ID)
 		pos += 8
-		binary.BigEndian.PutUint64(out[pos:pos+8], it.Bucket)
-		pos += 8
+		bucket := utils.ShardStorageBucket(it.ShardSlot, it.Bucket)
+		copy(out[pos:], bucket[:])
+		pos += len(bucket)
 		binary.BigEndian.PutUint64(out[pos:pos+8], it.TopicHash)
 		pos += 8
 
@@ -140,20 +148,20 @@ func unmarshalStoreBatch(data []byte, commandType CommandType) ([]StoreBatchItem
 
 	count := binary.BigEndian.Uint64(data[1:9])
 	// Each item needs at least its fixed fields and the message length.
-	if count > uint64((len(data)-9)/30) {
+	if count > uint64((len(data)-9)/(storeItemHeaderSize+4)) {
 		return nil, fmt.Errorf("raft: StoreBatchCmd too short for %d items", count)
 	}
 	items := make([]StoreBatchItem, 0, count)
 
 	pos := 9
 	for i := uint64(0); i < count; i++ {
-		if pos+8+8+8+2 > len(data) {
+		if pos+storeItemHeaderSize > len(data) {
 			return nil, fmt.Errorf("raft: StoreBatchCmd truncated at item %d header", i)
 		}
 		id := binary.BigEndian.Uint64(data[pos : pos+8])
 		pos += 8
-		bucket := binary.BigEndian.Uint64(data[pos : pos+8])
-		pos += 8
+		bucket, slot := utils.StorageBucket(data[pos : pos+utils.StorageBucketSize]).Parts()
+		pos += utils.StorageBucketSize
 		topicHash := binary.BigEndian.Uint64(data[pos : pos+8])
 		pos += 8
 
@@ -191,6 +199,7 @@ func unmarshalStoreBatch(data []byte, commandType CommandType) ([]StoreBatchItem
 		items = append(items, StoreBatchItem{
 			ID:        id,
 			Bucket:    bucket,
+			ShardSlot: slot,
 			TopicHash: topicHash,
 			Indexes:   indexes,
 			Msg:       value,
@@ -203,26 +212,26 @@ func unmarshalStoreBatch(data []byte, commandType CommandType) ([]StoreBatchItem
 	return items, nil
 }
 
-// MarshalDeleteBatchCmd serialises a list of 24-byte Pebble keys to delete.
+// MarshalDeleteBatchCmd serialises a list of 25-byte event keys to delete.
 //
 // Wire format:
 //
 //	[0]      CommandType  (1 byte = 1)
 //	[1..8]   count        (uint64 big-endian)
 //	for each key:
-//	  [n..n+23] key       (24 bytes — fixed size)
+//	  [n..n+24] key       (25 bytes — fixed size)
 func MarshalDeleteBatchCmd(keys [][]byte) ([]byte, error) {
-	out := make([]byte, 1+8+len(keys)*24)
+	out := make([]byte, 1+8+len(keys)*utils.EventKeySize)
 	out[0] = byte(DeleteBatchCmd)
 	binary.BigEndian.PutUint64(out[1:9], uint64(len(keys)))
 
 	pos := 9
 	for _, k := range keys {
-		if len(k) != 24 {
-			return nil, fmt.Errorf("raft: DeleteBatchCmd: key must be 24 bytes, got %d", len(k))
+		if len(k) != utils.EventKeySize {
+			return nil, fmt.Errorf("raft: DeleteBatchCmd: key must be %d bytes, got %d", utils.EventKeySize, len(k))
 		}
-		copy(out[pos:pos+24], k)
-		pos += 24
+		copy(out[pos:pos+utils.EventKeySize], k)
+		pos += utils.EventKeySize
 	}
 
 	return out, nil
@@ -239,17 +248,17 @@ func UnmarshalDeleteBatchCmd(data []byte) ([][]byte, error) {
 	}
 	count := binary.BigEndian.Uint64(data[1:9])
 	remaining := len(data) - 9
-	if count > uint64(remaining/24) {
+	if count > uint64(remaining/utils.EventKeySize) {
 		return nil, fmt.Errorf("raft: DeleteBatchCmd too short for %d keys", count)
 	}
-	if uint64(remaining) != count*24 {
-		return nil, fmt.Errorf("raft: DeleteBatchCmd has %d trailing bytes", uint64(remaining)-count*24)
+	if uint64(remaining) != count*utils.EventKeySize {
+		return nil, fmt.Errorf("raft: DeleteBatchCmd has %d trailing bytes", uint64(remaining)-count*utils.EventKeySize)
 	}
 
 	keys := make([][]byte, int(count))
 	for i := range keys {
-		start := 9 + i*24
-		keys[i] = data[start : start+24]
+		start := 9 + i*utils.EventKeySize
+		keys[i] = data[start : start+utils.EventKeySize]
 	}
 	return keys, nil
 }

@@ -1,6 +1,8 @@
 package raft
 
 import (
+	"github.com/futureq-io/futureq/pkg/utils"
+
 	"encoding/binary"
 	"fmt"
 	"strings"
@@ -12,7 +14,7 @@ func MarshalPublishReceipt(epoch uint64, recipients []string) ([]byte, error) {
 	if len(recipients) == 0 {
 		return nil, fmt.Errorf("message has no registered destinations")
 	}
-	if err := validatePrepares([]DeliveryPrepare{{Key: make([]byte, 24), Epoch: epoch, Recipients: recipients}}); err != nil {
+	if err := validatePrepares([]DeliveryPrepare{{Key: make([]byte, utils.EventKeySize), Epoch: epoch, Recipients: recipients}}); err != nil {
 		return nil, err
 	}
 	s := newDeliveryState(epoch, recipients)

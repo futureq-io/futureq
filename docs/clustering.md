@@ -22,8 +22,8 @@ and publish-bound delivery in `internal/raft/event/published_delivery.go`:
 
 | Command             | Payload |
 | ------------------- | ------- |
-| `StoreBatchCmd (0)` | Per item: `u64 id` (proposed event ID; ordered apply advances stale IDs past the applied watermark so keys converge) · `u64 bucket` · `u64 topicHash` · index entries · `u32 len` + pre-serialized `StoredMessage`. One publish batch = one log entry. |
-| `DeleteBatchCmd (1)`| Count + fixed 24-byte message keys — used for ACK-driven deletes and TTL expirations. |
+| `StoreBatchCmd (0)` | Each item carries a proposed `u64 id`, a 9-byte shard slot and time bucket, a `u64 topicHash`, index entries, and a `u32 len` followed by the serialized `StoredMessage`. Ordered apply advances stale IDs past the applied watermark so keys converge. Each publish batch forms one log entry. |
+| `DeleteBatchCmd (1)`| Count and fixed 25-byte message keys for ACK-driven deletes and TTL expirations. |
 | `StoreDeliveryBatchCmd (8)` | Leader/no-ACK publish: encoded store batch followed by a length-prefixed frozen receipt per message; payload and destinations commit atomically. |
 | `SubscriptionCmd (9)` | Protobuf subscription create/remove, worker connect/disconnect, batched session renewal, conditional idle expiry, and bounded retired-recipient cleanup. |
 | `PublishBatchCmd (10)` | Quorum publish: encoded store batch without receipts. Apply selects destinations from subscription state at this log position and writes payload plus receipt atomically. |

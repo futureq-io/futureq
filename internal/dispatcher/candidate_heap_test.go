@@ -21,8 +21,9 @@ func heapTestCandidates(count int, equalDeadlines bool) candidateHeap {
 	for i := range items {
 		// Vary every key word to exercise the complete byte-wise tie breaker.
 		binary.BigEndian.PutUint64(items[i].key[:8], rng.Uint64())
-		binary.BigEndian.PutUint64(items[i].key[8:16], rng.Uint64())
-		binary.BigEndian.PutUint64(items[i].key[16:], uint64(i))
+		items[i].key[8] = byte(rng.Uint64())
+		binary.BigEndian.PutUint64(items[i].key[9:17], rng.Uint64())
+		binary.BigEndian.PutUint64(items[i].key[17:], uint64(i))
 		if !equalDeadlines {
 			items[i].due = rng.Int64N(1000) - 500
 		}
@@ -177,8 +178,8 @@ func BenchmarkCandidateHeap(b *testing.B) {
 			// cycles through the backlog instead of reinserting the same minimum.
 			for i := range items {
 				binary.BigEndian.PutUint64(items[i].key[:8], 1)
-				binary.BigEndian.PutUint64(items[i].key[8:16], uint64(items[i].due+500))
-				binary.BigEndian.PutUint64(items[i].key[16:], uint64(i))
+				binary.BigEndian.PutUint64(items[i].key[9:17], uint64(items[i].due+500))
+				binary.BigEndian.PutUint64(items[i].key[17:], uint64(i))
 			}
 			for _, kind := range candidateHeapTypes {
 				b.Run(fmt.Sprintf("%s/n=%d/ties=%t/pop-push", kind, count, ties), func(b *testing.B) {
@@ -192,9 +193,9 @@ func BenchmarkCandidateHeap(b *testing.B) {
 						item := h.popCandidate(shift)
 						if !ties {
 							item.due += 1000
-							binary.BigEndian.PutUint64(item.key[8:16], uint64(item.due+500))
+							binary.BigEndian.PutUint64(item.key[9:17], uint64(item.due+500))
 						}
-						binary.BigEndian.PutUint64(item.key[16:], nextID)
+						binary.BigEndian.PutUint64(item.key[17:], nextID)
 						nextID++
 						h.pushCandidate(item, shift)
 					}

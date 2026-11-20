@@ -35,7 +35,7 @@ func (s *JanitorSuite) TearDownTest() {
 	}
 }
 
-// makeEventKey constructs a 24-byte event key.
+// makeEventKey constructs a 25-byte event key.
 func makeEventKey(topic string, bucket, eventID uint64) []byte {
 	return utils.EventKey(bucket, utils.TopicHash(topic), eventID)
 }
@@ -126,7 +126,7 @@ func (s *JanitorSuite) TestSweep_SkipsNoTTL() {
 func (s *JanitorSuite) TestSweep_SkipsNonEventKeys() {
 	require := s.Require()
 
-	// A metadata-style key (not 24 bytes) should be silently skipped.
+	// A metadata-style key (not 25 bytes) should be silently skipped.
 	b := s.db.NewBatch()
 	require.NoError(b.Set([]byte("metadata/some-other-key"), []byte("not-proto")))
 	require.NoError(b.Commit(storage.Sync))
@@ -146,7 +146,7 @@ func (s *JanitorSuite) TestSweep_SkipsNonEventKeys() {
 func (s *JanitorSuite) TestSweep_SkipsUnparseableValue() {
 	require := s.Require()
 
-	// Valid 24-byte key but value is not a valid protobuf.
+	// Valid 25-byte key but value is not a valid protobuf.
 	key := makeEventKey("orders", 1, 1)
 	b := s.db.NewBatch()
 	require.NoError(b.Set(key, []byte{0xFF, 0xFE, 0xFD}))

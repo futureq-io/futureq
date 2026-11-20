@@ -7,6 +7,7 @@ import (
 	"time"
 
 	raft "github.com/futureq-io/futureq/internal/raft/event"
+	"github.com/futureq-io/futureq/pkg/utils"
 	"github.com/lni/dragonboat/v4/statemachine"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
@@ -44,13 +45,13 @@ func TestConcurrentDeletionFlushes(t *testing.T) {
 			completed := make(chan byte, 8)
 			d.OnAcknowledged = func(acks []raft.DeliveryAck) {
 				for _, ack := range acks {
-					completed <- ack.Key[23]
+					completed <- ack.Key[utils.EventKeySize-1]
 				}
 			}
-			d.OnDelete = func(key []byte) { completed <- key[23] }
+			d.OnDelete = func(key []byte) { completed <- key[utils.EventKeySize-1] }
 			enqueue := func(id byte) {
-				key := make([]byte, 24)
-				key[23] = id
+				key := make([]byte, utils.EventKeySize)
+				key[utils.EventKeySize-1] = id
 				if kind == "ack" {
 					require.True(t, d.TryMarkAcknowledged(key, "g:a"))
 				} else {

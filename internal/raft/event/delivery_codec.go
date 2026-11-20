@@ -7,6 +7,7 @@ import (
 	"sort"
 	"unicode/utf8"
 
+	"github.com/futureq-io/futureq/pkg/utils"
 	deliverypb "github.com/futureq-io/protocol/proto/go/delivery"
 	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/proto"
@@ -182,7 +183,7 @@ func preflightPrepare(data []byte) error {
 						}
 					} else {
 						keys++
-						if len(value) != 24 || keys > MaxDeliveryPrepareItems {
+						if len(value) != utils.EventKeySize || keys > MaxDeliveryPrepareItems {
 							return fmt.Errorf("invalid delivery prepare keys")
 						}
 					}

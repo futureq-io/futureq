@@ -1,6 +1,7 @@
 package utils
 
 import (
+	"bytes"
 	"encoding/binary"
 	"testing"
 	"time"
@@ -99,21 +100,61 @@ func (s *UtilsSuite) TestEventKey_Length() {
 	require := s.Require()
 
 	key := EventKey(1, 2, 3)
-	require.Len(key, 24, "EventKey must always return a 24-byte key")
+	require.Len(key, 25)
 }
 
 func (s *UtilsSuite) TestEventKey_ByteLayout() {
 	require := s.Require()
 
-	bucket := uint64(0x0102030405060708)
+	bucket := uint64(0x0002030405060708)
 	topicHash := uint64(0x1112131415161718)
 	eventID := uint64(0x2122232425262728)
 
 	key := EventKey(bucket, topicHash, eventID)
 
 	require.Equal(topicHash, binary.BigEndian.Uint64(key[0:8]), "bytes 0-7 should be topicHash")
-	require.Equal(bucket, binary.BigEndian.Uint64(key[8:16]), "bytes 8-15 should be bucket")
-	require.Equal(eventID, binary.BigEndian.Uint64(key[16:24]), "bytes 16-23 should be eventID")
+	require.Zero(key[8], "the high shard byte should be zero for unsharded keys")
+	require.Equal(bucket, binary.BigEndian.Uint64(key[9:17]), "bytes 9-16 should be the time bucket")
+	require.Equal(eventID, binary.BigEndian.Uint64(key[17:25]), "bytes 17-24 should be eventID")
+}
+
+func (s *UtilsSuite) TestEventKey_MaxShardAndTimeBucket() {
+	require := s.Require()
+	const largestSlot = 2*MaxVirtualShards - 1
+	const largestID = ^uint64(0)
+	key := ShardStorageBucket(largestSlot, MaxVirtualTimeBucket).EventKey(largestID, largestID)
+	require.Equal(bytes.Repeat([]byte{0xff}, 25), key)
+	require.Equal(largestSlot, EventShardSlot(key))
+	require.Equal(MaxVirtualShards, SlotShardCount(EventShardSlot(key)))
+	topic, bucket, id, err := ParseEventKey(key)
+	require.NoError(err)
+	require.Equal(largestID, topic)
+	require.Equal(MaxVirtualTimeBucket, bucket)
+	require.Equal(largestID, id)
+
+	lowerSlot := ShardStorageBucket(511, MaxVirtualTimeBucket).EventKey(topic, largestID)
+	higherSlot := ShardStorageBucket(512, 0).EventKey(topic, 0)
+	require.Less(string(lowerSlot), string(higherSlot))
+	require.Equal(511, EventShardSlot(lowerSlot))
+	require.Equal(512, EventShardSlot(higherSlot))
+
+	unsharded := EventKey(MaxVirtualTimeBucket+1, topic, largestID)
+	end := DueUpperBound(topic, MaxVirtualTimeBucket)
+	require.Equal(EventKey(MaxVirtualTimeBucket, topic, largestID), unsharded)
+	require.Less(string(unsharded), string(end))
+	require.Less(string(end), string(lowerSlot))
+}
+
+func (s *UtilsSuite) TestVirtualShardCountAndPublishSlot() {
+	require := s.Require()
+	require.Equal(65536, MaxVirtualShards)
+	require.True(ValidVirtualShardCount(MaxVirtualShards))
+	require.False(ValidVirtualShardCount(MaxVirtualShards + 1))
+	require.False(ValidVirtualShardCount(2 * MaxVirtualShards))
+	bucket, slot := ChooseStorageBucket(MaxVirtualTimeBucket, MaxVirtualShards)
+	require.Equal(MaxVirtualTimeBucket, bucket)
+	require.GreaterOrEqual(slot, MaxVirtualShards)
+	require.Less(slot, 2*MaxVirtualShards)
 }
 
 func (s *UtilsSuite) TestEventKey_LexicographicOrdering() {
@@ -167,9 +208,9 @@ func (s *UtilsSuite) TestDueUpperBound_Structure() {
 	require := s.Require()
 
 	ub := DueUpperBound(42, 17)
-	require.Len(ub, 16)
+	require.Len(ub, 17)
 	require.Equal(uint64(42), binary.BigEndian.Uint64(ub[0:8]))
-	require.Equal(uint64(18), binary.BigEndian.Uint64(ub[8:16]))
+	require.Equal(uint64(18), binary.BigEndian.Uint64(ub[9:17]))
 }
 
 func (s *UtilsSuite) TestDueUpperBound_CoversDueKeys() {
@@ -247,8 +288,8 @@ func (s *UtilsSuite) TestParseEventKey_InvalidLength() {
 		{"empty", []byte{}},
 		{"too short (8)", make([]byte, 8)},
 		{"too short (16)", make([]byte, 16)},
-		{"too short (23)", make([]byte, 23)},
-		{"too long (25)", make([]byte, 25)},
+		{"old event key size", make([]byte, 24)},
+		{"too long (26)", make([]byte, 26)},
 		{"too long (32)", make([]byte, 32)},
 	}
 

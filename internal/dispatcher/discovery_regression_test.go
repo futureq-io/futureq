@@ -31,7 +31,7 @@ func (db *slowLayoutProbeDB) CacheRevision() uint64 {
 func (db *slowLayoutProbeDB) NewIter(opts *storage.IterOptions) (storage.Iterator, error) {
 	if len(opts.LowerBound) >= 8 {
 		hash := binary.BigEndian.Uint64(opts.LowerBound[:8])
-		if bytes.Equal(opts.LowerBound, shardScanBound(hash, 2)) && bytes.Equal(opts.UpperBound, topicScanEnd(hash)) {
+		if bytes.Equal(opts.LowerBound, shardScanBound(hash, 1)) && bytes.Equal(opts.UpperBound, topicScanEnd(hash)) {
 			// With one discovery worker, each probe outlasts the other
 			// topic's refresh interval and changes its observed revision.
 			timer := time.NewTimer(18 * time.Millisecond)
@@ -77,7 +77,7 @@ func TestSlowLayoutRefreshesAllowDueDeliveryOnBothTopics(t *testing.T) {
 		d.hub.Register(topic, topic, "group", streams[topic])
 		value, err := proto.Marshal(&storagepb.StoredMessage{Topic: topic, EnqueuedAtUnixMs: due})
 		require.NoError(t, err)
-		require.NoError(t, storeProbeEvent(d.db, utils.EventKey(bucket, utils.TopicHash(topic), 1), value))
+		require.NoError(t, storeProbeEvent(d.db, bucket.EventKey(utils.TopicHash(topic), 1), value))
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	d.db = &slowLayoutProbeDB{DB: d.db, ctx: ctx}
@@ -101,7 +101,7 @@ func (db *failingLayoutProbeDB) CacheRevision() uint64 {
 }
 
 func (db *failingLayoutProbeDB) NewIter(opts *storage.IterOptions) (storage.Iterator, error) {
-	if bytes.Equal(opts.LowerBound, shardScanBound(db.hash, 2)) && bytes.Equal(opts.UpperBound, topicScanEnd(db.hash)) {
+	if bytes.Equal(opts.LowerBound, shardScanBound(db.hash, 1)) && bytes.Equal(opts.UpperBound, topicScanEnd(db.hash)) {
 		if attempt := db.probes.Add(1); attempt == 2 || attempt == 3 {
 			return nil, errors.New("transient layout probe error")
 		}
@@ -130,7 +130,7 @@ func TestFailedLayoutRefreshesRetryWhileKnownShardsAreIdle(t *testing.T) {
 	put := func(slot int, id uint64, at time.Time) []byte {
 		t.Helper()
 		bucket := utils.ShardStorageBucket(slot, utils.CalculateBucket(at.UnixMilli(), d.TimeBucket))
-		key := utils.EventKey(bucket, db.hash, id)
+		key := bucket.EventKey(db.hash, id)
 		value, err := proto.Marshal(&storagepb.StoredMessage{Topic: topic, EnqueuedAtUnixMs: at.UnixMilli()})
 		require.NoError(t, err)
 		require.NoError(t, storeProbeEvent(db, key, value))
@@ -158,7 +158,7 @@ type countedTopicRevisionDB struct {
 
 func (db *countedTopicRevisionDB) NewIter(opts *storage.IterOptions) (storage.Iterator, error) {
 	db.opens.Add(1)
-	if bytes.Equal(opts.LowerBound, shardScanBound(db.hash, 2)) && bytes.Equal(opts.UpperBound, topicScanEnd(db.hash)) {
+	if bytes.Equal(opts.LowerBound, shardScanBound(db.hash, 1)) && bytes.Equal(opts.UpperBound, topicScanEnd(db.hash)) {
 		db.probes.Add(1)
 	}
 	return db.DB.NewIter(opts)
@@ -186,7 +186,7 @@ func TestFutureOnlyShardIdleHintsSurviveUnrelatedWrites(t *testing.T) {
 	require.NoError(t, err)
 	for shard := range 64 {
 		bucket := utils.ShardStorageBucket(64+shard, utils.CalculateBucket(future, d.TimeBucket))
-		require.NoError(t, storeProbeEvent(db, utils.EventKey(bucket, hash, uint64(shard+1)), futureValue))
+		require.NoError(t, storeProbeEvent(db, bucket.EventKey(hash, uint64(shard+1)), futureValue))
 	}
 	require.Empty(t, d.collectTopic(topic, now).items)
 	require.Positive(t, db.opens.Load())
@@ -197,13 +197,13 @@ func TestFutureOnlyShardIdleHintsSurviveUnrelatedWrites(t *testing.T) {
 		require.Empty(t, d.collectTopic(topic, now+int64(i+1)).items)
 		require.Equal(t, opens, db.opens.Load(), "no iterators needed while the topic's idle hints are valid")
 	}
-	futureKey := utils.EventKey(utils.ShardStorageBucket(127, utils.CalculateBucket(future, d.TimeBucket)), hash, 65)
+	futureKey := utils.ShardStorageBucket(127, utils.CalculateBucket(future, d.TimeBucket)).EventKey(hash, 65)
 	require.NoError(t, storeProbeEvent(db, futureKey, futureValue))
 	require.Empty(t, d.collectTopic(topic, now+4).items)
 	require.EqualValues(t, 2, db.opens.Load()-opens, "only the affected shard may open iterators")
 	dueValue, err := proto.Marshal(&storagepb.StoredMessage{Topic: topic, EnqueuedAtUnixMs: now})
 	require.NoError(t, err)
-	key := utils.EventKey(utils.ShardStorageBucket(127, utils.CalculateBucket(now, d.TimeBucket)), hash, 66)
+	key := utils.ShardStorageBucket(127, utils.CalculateBucket(now, d.TimeBucket)).EventKey(hash, 66)
 	require.NoError(t, storeProbeEvent(db, key, dueValue))
 	items := d.collectTopic(topic, now+5).items
 	require.Len(t, items, 1)
@@ -229,7 +229,7 @@ func TestLayoutPlanUpdatesFromWritesWithoutAnotherProbe(t *testing.T) {
 	put := func(slot int, id uint64, at time.Time) []byte {
 		t.Helper()
 		bucket := utils.ShardStorageBucket(slot, utils.CalculateBucket(at.UnixMilli(), d.TimeBucket))
-		key := utils.EventKey(bucket, db.hash, id)
+		key := bucket.EventKey(db.hash, id)
 		value, err := proto.Marshal(&storagepb.StoredMessage{Topic: topic, EnqueuedAtUnixMs: at.UnixMilli()})
 		require.NoError(t, err)
 		require.NoError(t, storeProbeEvent(db, key, value))

@@ -42,7 +42,7 @@ One binary, two operating modes, selected by `cluster.enabled`:
    universal subscriptions. Reject the whole batch if any topic has no destinations.
 5. Clustered mode: one `StoreDeliveryBatchCmd` commits both payloads and frozen
    receipts through Raft. Standalone: one storage batch commits both with fsync.
-6. The message lands in storage under a 24-byte [time-bucketed key](storage.md) (`topicHash · bucket · eventID`) plus optional secondary indexes.
+6. The message lands in storage under a 25-byte [time-bucketed key](storage.md) (`topicHash · bucket · eventID`) plus optional secondary indexes.
 
 ## Read path
 
