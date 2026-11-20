@@ -159,7 +159,7 @@ func (s *topicRevisionState) record(version uint64, slots writtenSlots) {
 
 func (s *topicRevisionState) recordSlot(version uint64, slot int) {
 	s.shards[slot] = version
-	if slot >= 2 {
+	if slot > 0 {
 		s.writtenLayouts |= utils.SlotShardCount(slot)
 	}
 }

@@ -105,7 +105,7 @@ are separate from application storage under `storage.pebble`.
 | Key                            | Default      | Description |
 | ------------------------------ | ------------ | ----------- |
 | `storage.engine`               | `pebble`     | `pebble` (LSM) or `bolt` (single-file B+-tree). |
-| `storage.virtualShards`         | `256`        | Number of virtual delivery shards for new clustered publishes. Accepts `0` to disable or a power of two from `2` through `65536`. The event leader reads this at startup. See [virtual delivery shards](storage.md#virtual-delivery-shards). |
+| `storage.virtualShards`         | `256`        | Number of virtual delivery shards for new clustered publishes. Accepts powers of two from `1` through `65536`. The event leader reads this at startup. See [virtual delivery shards](storage.md#virtual-delivery-shards). |
 | `storage.pebble.mode`          | `disk`       | `disk` or `memory` (Pebble over an in-memory FS; nothing persists). |
 | `storage.pebble.dataDir`       | `./data`     | Pebble data directory. |
 | `storage.pebble.walEnabled`    | `true`       | Pebble WAL toggle. Automatically disabled in memory mode and in clustered mode (the Raft log is the WAL); may only be set `false` explicitly for clustered disk nodes. |

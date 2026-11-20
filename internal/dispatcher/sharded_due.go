@@ -12,7 +12,7 @@ type shardDueState struct {
 	cursor    scanCursor
 	revision  uint64
 	notBefore uint64
-	peek      bool // the bounded due range was empty; check its next live bucket
+	peek      bool // the bounded due range was empty; check for live keys
 }
 
 // A discovery lane owns this state until its result is returned to the
@@ -91,24 +91,29 @@ func (d *Dispatcher) collectShardedDue(topic string, hash, last uint64, view Int
 				state.revision = slotRevision
 			}
 			lower, upper, end := dueShardBounds(hash, last, slot)
-			empty := state.peek
+			skipEmpty := slot >= 256
 			if !state.peek {
 				examined := work.examined
-				empty = d.collectDueRange(topic, view, &state.cursor, lower, upper, chunk, work)
+				empty := d.collectDueRange(topic, view, &state.cursor, lower, upper, chunk, work)
 				if examined == work.examined {
 					work.examined++ // even a range without keys consumes a work unit
 				}
-				state.peek = tracked && empty
+				state.peek = empty && (tracked || skipEmpty)
 			}
 			if state.peek && !d.dueScanFull(chunk, work) {
 				work.examined++
-				state.notBefore, state.peek = d.nextShardBucket(lower, end, last), false
+				if skipEmpty {
+					state.notBefore, next = d.nextLiveShard(hash, slot, last)
+				} else {
+					state.notBefore = d.nextShardBucket(lower, end, last)
+				}
+				state.peek = false
 			}
 			scan.state[slot] = state
-			// At larger layouts, seek across empty slots in one operation.
-			if slot >= 256 && empty && (!tracked || state.notBefore == noDueBucket) && !d.dueScanFull(chunk, work) {
-				work.examined++
-				next = d.nextLiveShard(hash, next)
+			if skipEmpty && state.peek {
+				// Resume the seek here if the due check used the last work unit.
+				scan.next, idleUntil = slot, 0
+				break
 			}
 		}
 		idleUntil = min(idleUntil, state.notBefore)
@@ -178,7 +183,7 @@ func dueShardOrder(shards *shardScanRange) shardSlotRanges {
 
 func dueShardBounds(hash, last uint64, slot int) (lower, dueEnd, end []byte) {
 	if slot == 0 {
-		return utils.TopicLowerBound(hash), utils.DueUpperBound(hash, last), shardScanBound(hash, 2)
+		return utils.TopicLowerBound(hash), utils.DueUpperBound(hash, last), shardScanBound(hash, 1)
 	}
 	lower = shardScanBound(hash, slot)
 	if slot < 2*utils.MaxVirtualShards-1 {
@@ -193,25 +198,28 @@ func dueShardBounds(hash, last uint64, slot int) (lower, dueEnd, end []byte) {
 	return lower, dueEnd, end
 }
 
-// nextLiveShard skips slots with no keys in this view. New writes wake the lane
-// through its revision, even if they arrive behind the current scan position.
-func (d *Dispatcher) nextLiveShard(hash uint64, slot int) int {
-	const end = 2 * utils.MaxVirtualShards
-	if slot >= end {
-		return end
-	}
+// nextLiveShard finds the current slot's earliest future bucket or skips to
+// the next slot with keys. New writes invalidate hints through their revision.
+func (d *Dispatcher) nextLiveShard(hash uint64, slot int, last uint64) (notBefore uint64, next int) {
 	iter, err := d.discoverySource().NewIter(&storage.IterOptions{LowerBound: shardScanBound(hash, slot), UpperBound: topicScanEnd(hash)})
 	if err != nil {
-		return slot
+		return 0, slot + 1
 	}
 	defer iter.Close() //nolint:errcheck
 	if iter.First() {
-		return max(slot, utils.EventShardSlot(iter.Key()))
+		key := iter.Key()
+		if liveSlot := utils.EventShardSlot(key); liveSlot > slot {
+			return noDueBucket, liveSlot
+		}
+		if _, bucket, _, err := utils.ParseEventKey(key); err == nil && bucket > last {
+			return bucket, slot + 1
+		}
+		return 0, slot + 1
 	}
 	if iter.Error() != nil {
-		return slot
+		return 0, slot + 1
 	}
-	return end
+	return noDueBucket, 2 * utils.MaxVirtualShards
 }
 
 // Empty-shard hints are scoped to the topic revision captured before the

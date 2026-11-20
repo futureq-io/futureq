@@ -31,7 +31,7 @@ func (db *slowLayoutProbeDB) CacheRevision() uint64 {
 func (db *slowLayoutProbeDB) NewIter(opts *storage.IterOptions) (storage.Iterator, error) {
 	if len(opts.LowerBound) >= 8 {
 		hash := binary.BigEndian.Uint64(opts.LowerBound[:8])
-		if bytes.Equal(opts.LowerBound, shardScanBound(hash, 2)) && bytes.Equal(opts.UpperBound, topicScanEnd(hash)) {
+		if bytes.Equal(opts.LowerBound, shardScanBound(hash, 1)) && bytes.Equal(opts.UpperBound, topicScanEnd(hash)) {
 			// With one discovery worker, each probe outlasts the other
 			// topic's refresh interval and changes its observed revision.
 			timer := time.NewTimer(18 * time.Millisecond)
@@ -101,7 +101,7 @@ func (db *failingLayoutProbeDB) CacheRevision() uint64 {
 }
 
 func (db *failingLayoutProbeDB) NewIter(opts *storage.IterOptions) (storage.Iterator, error) {
-	if bytes.Equal(opts.LowerBound, shardScanBound(db.hash, 2)) && bytes.Equal(opts.UpperBound, topicScanEnd(db.hash)) {
+	if bytes.Equal(opts.LowerBound, shardScanBound(db.hash, 1)) && bytes.Equal(opts.UpperBound, topicScanEnd(db.hash)) {
 		if attempt := db.probes.Add(1); attempt == 2 || attempt == 3 {
 			return nil, errors.New("transient layout probe error")
 		}
@@ -158,7 +158,7 @@ type countedTopicRevisionDB struct {
 
 func (db *countedTopicRevisionDB) NewIter(opts *storage.IterOptions) (storage.Iterator, error) {
 	db.opens.Add(1)
-	if bytes.Equal(opts.LowerBound, shardScanBound(db.hash, 2)) && bytes.Equal(opts.UpperBound, topicScanEnd(db.hash)) {
+	if bytes.Equal(opts.LowerBound, shardScanBound(db.hash, 1)) && bytes.Equal(opts.UpperBound, topicScanEnd(db.hash)) {
 		db.probes.Add(1)
 	}
 	return db.DB.NewIter(opts)

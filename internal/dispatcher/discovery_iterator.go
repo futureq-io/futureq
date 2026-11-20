@@ -63,7 +63,7 @@ func (i *discoveryIterator) advance(valid bool) bool {
 			}
 			i.loadedOwnership = true
 		}
-		if slot >= 2 && i.owned.next(slot) == slot {
+		if slot > 0 && i.owned.next(slot) == slot {
 			if bucket < i.earliest {
 				valid = i.seek(slot)
 				continue
@@ -72,7 +72,7 @@ func (i *discoveryIterator) advance(valid bool) bool {
 				return true
 			}
 		}
-		next := i.owned.next(max(2, slot+1))
+		next := i.owned.next(slot + 1)
 		if next < 0 {
 			return false
 		}

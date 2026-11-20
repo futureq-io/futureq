@@ -80,7 +80,7 @@ func MarshalStoreBatchCmd(items []StoreBatchItem) ([]byte, error) {
 	// Pre-calculate total size to do a single allocation.
 	size := 1 + 8 // cmdType + count
 	for i, it := range items {
-		if it.ShardSlot < 0 || it.ShardSlot == 1 || it.ShardSlot >= 2*utils.MaxVirtualShards {
+		if it.ShardSlot < 0 || it.ShardSlot >= 2*utils.MaxVirtualShards {
 			return nil, fmt.Errorf("raft: item %d has invalid shard slot %d", i, it.ShardSlot)
 		}
 		if len(it.Indexes) > int(^uint16(0)) {
@@ -162,9 +162,6 @@ func unmarshalStoreBatch(data []byte, commandType CommandType) ([]StoreBatchItem
 		pos += 8
 		bucket, slot := utils.StorageBucket(data[pos : pos+utils.StorageBucketSize]).Parts()
 		pos += utils.StorageBucketSize
-		if slot == 1 {
-			return nil, fmt.Errorf("raft: item %d has invalid shard slot %d", i, slot)
-		}
 		topicHash := binary.BigEndian.Uint64(data[pos : pos+8])
 		pos += 8
 

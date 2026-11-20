@@ -59,7 +59,7 @@ the desired policy.
 Change `storage.virtualShards` on the nodes and restart them to change the
 layout used by the event leader for new publishes. During a rollout, each
 message's key identifies its own layout. Existing messages drain at their
-original keys, including when the count is reduced or set to zero. Worker or
+original keys, including when the count is reduced to one. Worker or
 replica membership changes recalculate ownership for every layout under the
 existing rebalance fence. A size change requires no data copy or delivery-tag
 rewrite. The option applies to clustered publishes.

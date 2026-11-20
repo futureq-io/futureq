@@ -20,19 +20,19 @@ const (
 )
 
 // StorageBucket holds a 17-bit shard slot followed by a 55-bit time bucket.
-// Slot zero is unsharded. Slot one is reserved.
+// Slot zero is unsharded. Slot one is the single-shard layout.
 type StorageBucket [StorageBucketSize]byte
 
-// ValidVirtualShardCount accepts zero (unsharded writes) or a supported power of two.
+// ValidVirtualShardCount accepts supported positive powers of two.
 func ValidVirtualShardCount(count int) bool {
-	return count == 0 || (count >= 2 && count <= MaxVirtualShards && count&(count-1) == 0)
+	return count >= 1 && count <= MaxVirtualShards && count&(count-1) == 0
 }
 
 // ChooseStorageBucket assigns a shard once, before the producer proposes its
 // Raft command. The encoded bucket carries the slot through replication and
-// replay regardless of the replicas' local shard count.
+// replay regardless of the replicas' local shard count. Count must be valid.
 func ChooseStorageBucket(bucket uint64, count int) (uint64, int) {
-	if count == 0 || bucket > MaxVirtualTimeBucket {
+	if bucket > MaxVirtualTimeBucket {
 		return min(bucket, MaxVirtualTimeBucket), 0
 	}
 	return bucket, count + rand.IntN(count)

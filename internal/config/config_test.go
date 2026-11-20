@@ -18,6 +18,15 @@ func TestConfigSuite(t *testing.T) {
 	suite.Run(t, new(ConfigSuite))
 }
 
+func (s *ConfigSuite) TestVirtualShardCountMinimum() {
+	cfg, err := Load(s.writeConfig("storage:\n  virtualShards: 1\n"))
+	s.Require().NoError(err)
+	s.Equal(1, cfg.Storage.VirtualShards)
+
+	_, err = Load(s.writeConfig("storage:\n  virtualShards: 0\n"))
+	s.Require().ErrorContains(err, "storage.virtualShards must be a power of two from 1")
+}
+
 func (s *ConfigSuite) TestExampleConfigMatchesDefault() {
 	require := s.Require()
 

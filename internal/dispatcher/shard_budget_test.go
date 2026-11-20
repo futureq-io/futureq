@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/futureq-io/futureq/internal/storage"
 	"github.com/futureq-io/futureq/pkg/raft/metadata"
 	"github.com/futureq-io/futureq/pkg/utils"
 	pb "github.com/futureq-io/protocol/proto/go"
@@ -151,4 +152,50 @@ func TestShardDiscoveryAtMaxLayoutFindsSparseDueAndFutureKeys(t *testing.T) {
 	require.Empty(t, byLane[1].chunk.items)
 	require.Len(t, byLane[1].future, 1)
 	require.Equal(t, [utils.EventKeySize]byte(future), byLane[1].future[0].key)
+}
+
+func TestShardDiscoveryResumesSparseSeekWithOneKeyBudget(t *testing.T) {
+	for _, tracked := range []bool{false, true} {
+		t.Run(fmt.Sprintf("tracked=%t", tracked), func(t *testing.T) {
+			d, base := newShardBudgetTest(t, utils.MaxVirtualShards, 1)
+			d.Limits.Examined = 1
+			due := putShardBudgetPayload(t, d, base.topic, 2*utils.MaxVirtualShards-1, 1, 32, time.Now().Add(-time.Second))
+			if tracked {
+				watch := d.watchTopic(utils.TopicHash(base.topic))
+				defer watch.Close()
+				base.shardRevisions = new(storage.TopicRevisionSnapshot)
+				base.revision = watch.Read(base.shardRevisions)
+				base.tracksRevision = true
+			}
+			for range 6 {
+				results := runShardBudgetPass(d, base)
+				require.Len(t, results, 1)
+				result := results[0]
+				base.owner.shardScans[0].cursor = result.cursor
+				if len(result.chunk.items) != 0 {
+					require.Len(t, result.chunk.items, 1)
+					require.Equal(t, due, result.chunk.items[0].Key)
+					return
+				}
+			}
+			t.Fatal("discovery did not reach the last shard within six passes")
+		})
+	}
+}
+
+func TestSingleShardLayoutDiscoversDueAndFutureKeys(t *testing.T) {
+	d, base := newShardBudgetTest(t, 1, 1)
+	d.PreloadMaxMessages = 2
+	now := time.Now()
+	due := putShardBudgetPayload(t, d, base.topic, 1, 1, 32, now.Add(-time.Second))
+	future := putShardBudgetPayload(t, d, base.topic, 1, 2, 32, now.Add(30*time.Second))
+
+	chunk := d.collectTopic(base.topic, now.UnixMilli())
+	require.Len(t, chunk.items, 1)
+	require.Equal(t, due, chunk.items[0].Key)
+
+	preload := &topicPreload{}
+	require.True(t, d.preloadTopic(base.topic, preload, d.hub.InterestView(base.topic), now.UnixMilli()))
+	require.Len(t, preload.items, 1)
+	require.Equal(t, [utils.EventKeySize]byte(future), preload.items[0].key)
 }

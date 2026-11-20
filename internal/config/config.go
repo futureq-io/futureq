@@ -412,7 +412,7 @@ func (c *Config) validateCluster() error {
 
 func (c *Config) validateStorage() error {
 	if !utils.ValidVirtualShardCount(c.Storage.VirtualShards) {
-		return fmt.Errorf("storage.virtualShards must be zero or a power of two from 2 through %d", utils.MaxVirtualShards)
+		return fmt.Errorf("storage.virtualShards must be a power of two from 1 through %d", utils.MaxVirtualShards)
 	}
 	switch c.Storage.Engine {
 	case "pebble":

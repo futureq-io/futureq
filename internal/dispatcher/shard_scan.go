@@ -37,7 +37,7 @@ func splitShardScans(view InterestView, workers int, layouts int) []shardScanSta
 	lanes[0].rangeKeys.epoch = view.Epoch
 	lanes[0].rangeKeys.assignmentEpoch = view.assignmentEpoch
 	used := 1
-	for count := 2; count <= utils.MaxVirtualShards; count *= 2 {
+	for count := 1; count <= utils.MaxVirtualShards; count *= 2 {
 		if layouts&count == 0 {
 			continue
 		}
@@ -75,7 +75,7 @@ func (r *shardScanRange) matches(view InterestView) bool {
 // One positioned key establishes that a layout is present. Skip directly to
 // the next layout boundary, so the probe costs no more seeks than layouts.
 func discoverShardLayouts(source storage.IteratorSource, hash uint64) (int, error) {
-	iter, err := source.NewIter(&storage.IterOptions{LowerBound: shardScanBound(hash, 2), UpperBound: topicScanEnd(hash)})
+	iter, err := source.NewIter(&storage.IterOptions{LowerBound: shardScanBound(hash, 1), UpperBound: topicScanEnd(hash)})
 	if err != nil {
 		return 0, err
 	}
@@ -83,7 +83,7 @@ func discoverShardLayouts(source storage.IteratorSource, hash uint64) (int, erro
 	layouts := 0
 	for valid := iter.First(); valid; {
 		slot := utils.EventShardSlot(iter.Key())
-		if slot < 2 {
+		if slot == 0 {
 			valid = iter.Next()
 			continue
 		}
