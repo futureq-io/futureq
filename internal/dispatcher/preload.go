@@ -8,6 +8,7 @@ import (
 
 	"github.com/futureq-io/futureq/internal/metrics"
 	raft "github.com/futureq-io/futureq/internal/raft/event"
+	"github.com/futureq-io/futureq/internal/storage"
 	"github.com/futureq-io/futureq/pkg/utils"
 	deliverypb "github.com/futureq-io/protocol/proto/go/delivery"
 	"go.uber.org/zap"
@@ -78,6 +79,8 @@ type topicPreload struct {
 	layoutRevision   uint64
 	layoutProbeAt    time.Time
 	revision         uint64
+	revisionWatch    *storage.TopicRevision
+	shardRevisions   *storage.TopicRevisionSnapshot
 	dueBeforeRefresh bool
 }
 
@@ -296,6 +299,9 @@ func (d *Dispatcher) preloadTopic(topic string, p *topicPreload, view InterestVi
 
 func (d *Dispatcher) dropPreload(topic string) {
 	if p := d.preloads[topic]; p != nil {
+		if p.revisionWatch != nil {
+			p.revisionWatch.Close()
+		}
 		if p.valid != nil {
 			p.valid.Store(false)
 		}
@@ -387,5 +393,5 @@ func (d *Dispatcher) releaseReady(topic string, p *topicPreload) {
 	p.items.initCandidates(p.heapShift)
 	p.compact()
 	p.repairGeneration++
-	delete(d.cursors, topic)
+	d.forgetCursor(topic)
 }

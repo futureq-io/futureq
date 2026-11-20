@@ -87,6 +87,7 @@ func (d *Dispatcher) collectTopic(topic string, nowMs int64) deliveryChunk {
 	}
 	cursor := d.cursors[topic]
 	if cursor == nil || cursor.epoch != view.Epoch || cursor.assignmentEpoch != view.assignmentEpoch {
+		d.forgetCursor(topic)
 		cursor = &scanCursor{epoch: view.Epoch, assignmentEpoch: view.assignmentEpoch}
 		d.cursors[topic] = cursor
 	}
@@ -99,6 +100,13 @@ func (d *Dispatcher) collectTopic(topic string, nowMs int64) deliveryChunk {
 		d.collectDueRange(topic, view, cursor, utils.TopicLowerBound(hash), utils.DueUpperBound(hash, last), &chunk, &work)
 	}
 	return chunk
+}
+
+func (d *Dispatcher) forgetCursor(topic string) {
+	if cursor := d.cursors[topic]; cursor != nil && cursor.shards != nil && cursor.shards.watch != nil {
+		cursor.shards.watch.Close()
+	}
+	delete(d.cursors, topic)
 }
 
 type dueScanWork struct {

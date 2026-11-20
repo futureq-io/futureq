@@ -54,12 +54,12 @@ func (h *Hub) topicAssignmentLocked(topic string, sub *TopicSubscription) *topic
 	return a
 }
 
-func (h *Hub) assignedWorker(group localGroup, msg *pb.QueueMessage, key []byte, slot, count int) *ConsumerEntry {
+func (h *Hub) assignedWorker(group localGroup, msg *pb.QueueMessage, key []byte, slot, count int) (*ConsumerEntry, []*ConsumerEntry) {
 	if group.replica.usesReplicaWorkers(count) {
 		if !group.replica.owns(slot, count, key) {
-			return nil
+			return nil, nil
 		}
-		return h.strategy.Select(group.local, msg)
+		return h.strategy.Select(group.local, msg), group.local
 	}
-	return moduloWorker(group.members, group.consumers, key)
+	return moduloWorker(group.members, group.consumers, key), nil
 }

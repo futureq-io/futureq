@@ -20,6 +20,7 @@ import (
 // scans of a topic own disjoint shards and independent cursors.
 type discoveryJob struct {
 	revision              uint64
+	shardRevisions        *storage.TopicRevisionSnapshot
 	repairGeneration      uint64
 	assigned              map[[24]byte]bool // immutable, bounded delivery batch
 	topic                 string
@@ -82,6 +83,7 @@ func (d *Dispatcher) discover(job discoveryJob) discoveryResult {
 		cursors: map[string]*scanCursor{job.topic: &job.cursor}}
 	scanner.shardScan, scanner.scanSource = job.shards, job.source
 	scanner.scanRevision, scanner.tracksScanRevision = job.revision, job.tracksRevision
+	scanner.scanShardRevisions = job.shardRevisions
 	scanner.Limits.Candidates = job.dueSlots
 	if job.shards != nil {
 		scanner.Limits.Examined, scanner.Limits.Bytes = job.examined, job.bytes
@@ -263,6 +265,14 @@ func (d *Dispatcher) runPipeline(parent context.Context) {
 	defer func() {
 		cancel()
 		workers.Wait()
+		for _, p := range d.preloads {
+			if p.revisionWatch != nil {
+				p.revisionWatch.Close()
+			}
+		}
+		for topic := range d.cursors {
+			d.forgetCursor(topic)
+		}
 		d.preloads, d.preloadCount, d.readyCount = nil, 0, 0
 		d.cursors = make(map[string]*scanCursor)
 		d.observePreload()
@@ -322,7 +332,7 @@ func (d *Dispatcher) runPipeline(parent context.Context) {
 			if topic != maintenanceTopic && !live[topic] {
 				delete(nextScan, topic)
 				delete(retryAfter, topic)
-				delete(d.cursors, topic)
+				d.forgetCursor(topic)
 			}
 		}
 		// Start renewal early enough to overlap observed quorum latency with
@@ -356,13 +366,14 @@ func (d *Dispatcher) runPipeline(parent context.Context) {
 		for offset := 0; offset < len(topics) && (len(busy) < d.Limits.Workers || len(scanning) < discoveryWorkers); offset++ {
 			topic := topics[(start+offset)%len(topics)]
 			var p *topicPreload
+			var view InterestView
 			if topic == maintenanceTopic {
 				if maintenanceOwner == nil {
 					maintenanceOwner = &topicPreload{}
 				}
 				p = maintenanceOwner
 			} else {
-				view := d.hub.InterestView(topic)
+				view = d.hub.InterestView(topic)
 				if !view.Active {
 					// The permit may expire after the scheduling check above.
 					// Preserve validated work until renewal; prunePreloads fences
@@ -373,6 +384,10 @@ func (d *Dispatcher) runPipeline(parent context.Context) {
 				if p == nil || p.epoch != view.Epoch || p.assignmentEpoch != view.assignmentEpoch {
 					d.dropPreload(topic)
 					p = &topicPreload{epoch: view.Epoch, assignmentEpoch: view.assignmentEpoch, valid: &atomic.Bool{}, heapShift: candidateHeapShift(d.HeapType), sharded: view.sharded}
+					p.revisionWatch = d.watchTopic(utils.TopicHash(topic))
+					if p.sharded && p.revisionWatch != nil {
+						p.shardRevisions = new(storage.TopicRevisionSnapshot)
+					}
 					p.valid.Store(true)
 					d.preloads[topic] = p
 				}
@@ -416,7 +431,9 @@ func (d *Dispatcher) runPipeline(parent context.Context) {
 			var revision uint64
 			var tracksRevisions bool
 			if topic != maintenanceTopic {
-				revision, tracksRevisions = d.cacheRevision(utils.TopicHash(topic))
+				// No scans for this topic are running, so the next pass
+				// can reuse its revision snapshot.
+				revision, tracksRevisions = d.cacheRevision(p.revisionWatch, p.shardRevisions)
 				if p.revision != revision {
 					p.revision = revision
 					p.futureScanAfter, p.futureScanIdle = time.Time{}, 0
@@ -434,14 +451,19 @@ func (d *Dispatcher) runPipeline(parent context.Context) {
 				continue
 			}
 
-			job := discoveryJob{revision: revision, repairGeneration: p.repairGeneration, assigned: assigned[topic], topic: topic, owner: p,
+			job := discoveryJob{revision: revision, shardRevisions: p.shardRevisions, repairGeneration: p.repairGeneration, assigned: assigned[topic], topic: topic, owner: p,
 				cursor: scanCursor{epoch: p.epoch, assignmentEpoch: p.assignmentEpoch}, futureSlots: futureSlots, dueSlots: dueSlots, tracksRevision: tracksRevisions}
 			var pass []discoveryJob
-			if p.sharded && !p.dueBeforeRefresh && !now.Before(p.layoutProbeAt) && (len(p.shardScans) == 0 || !tracksRevisions || p.layoutRevision != revision) {
+			probeNeeded := len(p.shardScans) == 0 || (job.shardRevisions == nil && (!tracksRevisions || p.layoutRevision != revision))
+			if p.sharded && probeNeeded && !now.Before(p.layoutProbeAt) &&
+				(!p.dueBeforeRefresh || job.knownLanesIdle(utils.CalculateBucket(now.UnixMilli(), d.TimeBucket))) {
 				job.probeLayouts = true
 				job.dueSlots, job.futureSlots = 0, 0
 				pass = []discoveryJob{job}
 			} else if len(p.shardScans) > 0 {
+				if job.shardRevisions != nil {
+					p.planShardScans(view, shardWorkers, p.layouts|job.shardRevisions.WrittenLayouts)
+				}
 				pass = d.shardDiscoveryJobs(job, now)
 			} else if p.sharded {
 				continue // retry the unsuccessful layout probe on a later pass
@@ -554,11 +576,7 @@ func (d *Dispatcher) runPipeline(parent context.Context) {
 						view := d.hub.InterestView(job.topic)
 						if view.Active && view.Epoch == current.epoch && view.assignmentEpoch == current.assignmentEpoch {
 							current.layoutRevision = job.revision
-							if len(current.shardScans) == 0 || current.layouts != result.layouts {
-								current.layouts = result.layouts
-								current.shardScans = splitShardScans(view, shardWorkers, result.layouts)
-								current.nextShardScan = 0
-							}
+							current.planShardScans(view, shardWorkers, result.layouts)
 							pass.admitted = true // schedule the planned scans immediately
 						}
 					}
@@ -579,7 +597,7 @@ func (d *Dispatcher) runPipeline(parent context.Context) {
 					}
 				} else {
 					if job.futureSlots > 0 {
-						revision, _ := d.cacheRevision(utils.TopicHash(job.topic))
+						revision, _ := d.cacheRevision(current.revisionWatch, nil)
 						backoff := job.tracksRevision && d.PreloadScanIdleMaxInterval > 0 && job.revision == revision && result.futureExhausted && len(result.future) == 0
 						d.recordFutureScan(current, result, backoff)
 					}
@@ -589,7 +607,7 @@ func (d *Dispatcher) runPipeline(parent context.Context) {
 						// A scan dispatched before failure can finish while the topic is
 						// backing off. Release its reservation and preserve repair.
 						current.repairGeneration++
-						delete(d.cursors, job.topic)
+						d.forgetCursor(job.topic)
 					}
 					for _, candidate := range result.future {
 						if !assigned[job.topic][candidate.key] {

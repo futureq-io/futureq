@@ -59,12 +59,13 @@ workers with two shard workers can run six scans across three topics. A topic
 holds one discovery slot, and waiting topics participate in the rotation when
 a pass finishes.
 
-Discovery splits layouts found in the topic's stored keys, including layouts
-with queued messages from before a resize. Due scans give each assigned shard
+Discovery probes the topic's stored keys when it first plans scans, including
+keys queued before a resize. Committed writes add newly encountered layouts
+directly to the active plan. Due scans give each assigned shard
 an independent cursor and a frozen endpoint in its due-time range. Empty-range
 probes count toward the scan budget. Future-only ranges can sleep until their
-first due bucket or a write to the same topic. Layout refreshes give due scans
-a turn between probes. Pebble workers in the same pass share a snapshot and
+first due bucket or a write to the same shard. Layout refreshes give ready due
+scans a turn between probes. Pebble workers in the same pass share a snapshot and
 open their own bounded iterators. The workers divide
 the topic's key, byte, and candidate allowances and report into the same heap.
 

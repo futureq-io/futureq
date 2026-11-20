@@ -339,6 +339,6 @@ var (
 
 func (b *boltDB) CacheRevision() uint64 { return b.revision.Load() }
 
-func (b *boltDB) TopicCacheRevision(hash uint64) uint64 { return b.topics.revision(hash) }
+func (b *boltDB) WatchTopic(hash uint64) *TopicRevision { return b.topics.watch(hash) }
 
 var _ CacheRevisioner = (*boltDB)(nil)

@@ -132,6 +132,32 @@ func splitScanBudget(total, index, workers int) int {
 	return share
 }
 
+// Plan from the persisted layouts and add layouts observed in committed writes.
+// Unchanged layouts keep their lane cursors and idle hints.
+func (p *topicPreload) planShardScans(view InterestView, workers, layouts int) {
+	if len(p.shardScans) == 0 || p.layouts != layouts {
+		p.layouts = layouts
+		p.shardScans = splitShardScans(view, workers, layouts)
+		p.nextShardScan = 0
+	}
+}
+
+func (job discoveryJob) laneIdle(lane *shardScanState, dueBucket uint64) bool {
+	return job.tracksRevision && lane.generation == job.repairGeneration &&
+		lane.cursor.shards.idle(dueBucket, job.revision, job.shardRevisions)
+}
+
+// Idle lanes have already had their due turn. A failed layout probe can
+// retry even if those lanes have no reason to wake.
+func (job discoveryJob) knownLanesIdle(dueBucket uint64) bool {
+	for i := range job.owner.shardScans {
+		if !job.laneIdle(&job.owner.shardScans[i], dueBucket) {
+			return false
+		}
+	}
+	return true
+}
+
 // Reserve a topic's original quota across tasks. Rotate the first lane so
 // even when one budget is scarce, each lane eventually receives a share.
 func (d *Dispatcher) shardDiscoveryJobs(base discoveryJob, now time.Time) []discoveryJob {
@@ -153,9 +179,7 @@ func (d *Dispatcher) shardDiscoveryJobs(base discoveryJob, now time.Time) []disc
 	for attempts := 0; attempts < len(lanes) && n < parallel; attempts++ {
 		index := (start + attempts) % len(lanes)
 		lane := &lanes[index]
-		idle := lane.cursor.shards
-		dueReady := base.dueSlots > 0 && !(base.tracksRevision && lane.generation == p.repairGeneration &&
-			idle != nil && idle.idleRev == base.revision && idle.idleUntil > dueBucket)
+		dueReady := base.dueSlots > 0 && !base.laneIdle(lane, dueBucket)
 		futureReady := base.futureSlots > 0 && !now.Before(lane.futureScanAt)
 		if !dueReady && !futureReady {
 			continue

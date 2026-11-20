@@ -7,19 +7,36 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestTopicRevisionsBoundRetentionWithoutTrustingEvictedTokens(t *testing.T) {
+func TestTopicRevisionsRemainStableWhileWatched(t *testing.T) {
 	var revisions topicRevisions
-	quiet := revisions.revision(0)
-	for hash := uint64(1); hash <= retainedTopicRevisions; hash++ {
+	const topics = 4097
+	watches := make([]*TopicRevision, topics)
+	tokens := make([]uint64, topics)
+	for i := range watches {
+		watches[i] = revisions.watch(uint64(i))
+		tokens[i] = watches[i].Read(nil)
+	}
+	for range 3 {
+		for i, watch := range watches {
+			require.Equal(t, tokens[i], watch.Read(nil))
+		}
+	}
+	for hash := uint64(topics); hash < 2*topics; hash++ {
 		var writes eventTopicWrites
 		writes.add(utils.EventKey(1, hash, 1))
 		revisions.commit(writes)
 	}
-	require.Len(t, revisions.versions, 1, "unobserved writes do not fill the cache")
-	require.Equal(t, quiet, revisions.revision(0))
-	for hash := uint64(1); hash <= retainedTopicRevisions; hash++ {
-		revisions.revision(hash)
+	require.Len(t, revisions.active, topics, "unobserved writes do not add retained topics")
+	secondWatch := revisions.watch(0)
+	for i, watch := range watches {
+		require.Equal(t, tokens[i], watch.Read(nil))
+		watch.Close()
 	}
-	require.Len(t, revisions.versions, retainedTopicRevisions)
-	require.NotEqual(t, quiet, revisions.revision(0), "reopening an evicted topic invalidates its old hints")
+	require.Len(t, revisions.active, 1)
+	require.Equal(t, tokens[0], secondWatch.Read(nil))
+	secondWatch.Close()
+	require.Empty(t, revisions.active)
+	reopened := revisions.watch(0)
+	defer reopened.Close()
+	require.NotEqual(t, tokens[0], reopened.Read(nil))
 }

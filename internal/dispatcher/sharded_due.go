@@ -25,33 +25,49 @@ type shardedDueScan struct {
 	layoutRev uint64
 	idleUntil uint64
 	idleRev   uint64
+	watch     *storage.TopicRevision         // synchronous scan only
+	revisions *storage.TopicRevisionSnapshot // synchronous scan only
 }
 
 func (d *Dispatcher) collectShardedDue(topic string, hash, last uint64, view InterestView, cursor *scanCursor, chunk *deliveryChunk, work *dueScanWork) {
-	revision, tracked := d.scanRevision, d.tracksScanRevision
-	if d.scanSource == nil {
-		revision, tracked = d.cacheRevision(hash)
-	}
 	if cursor.shards == nil {
 		cursor.shards = &shardedDueScan{state: make(map[int]shardDueState)}
+		if d.scanSource == nil {
+			cursor.shards.watch = d.watchTopic(hash)
+			if cursor.shards.watch != nil {
+				cursor.shards.revisions = new(storage.TopicRevisionSnapshot)
+			}
+		}
 	}
 	scan := cursor.shards
-	if tracked && scan.idleRev == revision && scan.idleUntil > last {
-		return
+	revision, tracked, shards := d.scanRevision, d.tracksScanRevision, d.scanShardRevisions
+	if d.scanSource == nil {
+		revision, tracked = d.cacheRevision(scan.watch, scan.revisions)
+		shards = scan.revisions
 	}
-	if d.shardScan == nil && (scan.shards == nil || !tracked || scan.layoutRev != revision) {
-		layouts, err := discoverShardLayouts(d.discoverySource(), hash)
-		if err != nil {
-			d.logger.Warn("delivery shard layout probe failed", zap.Error(err))
-			return
+	if d.shardScan == nil {
+		layouts := scan.layouts
+		if scan.shards == nil || (shards == nil && (!tracked || scan.layoutRev != revision)) {
+			var err error
+			layouts, err = discoverShardLayouts(d.discoverySource(), hash)
+			if err != nil {
+				d.logger.Warn("delivery shard layout probe failed", zap.Error(err))
+				return
+			}
+		}
+		if shards != nil {
+			layouts |= shards.WrittenLayouts
 		}
 		if scan.shards == nil || layouts != scan.layouts {
 			scan.shards = dueShardOrder(&splitShardScans(view, 1, layouts)[0].rangeKeys)
-			scan.next = 0
+			scan.next, scan.idleUntil = 0, 0
 		}
 		scan.layouts, scan.layoutRev = layouts, revision
 	} else if scan.shards == nil {
 		scan.shards = dueShardOrder(d.shardScan)
+	}
+	if tracked && scan.idle(last, revision, shards) {
+		return
 	}
 
 	start := scan.next
@@ -60,7 +76,8 @@ func (d *Dispatcher) collectShardedDue(topic string, hash, last uint64, view Int
 		index := (start + offset) % len(scan.shards)
 		slot := scan.shards[index]
 		state := scan.state[slot]
-		if tracked && state.revision == revision && state.notBefore > last {
+		slotRevision := scanSlotRevision(revision, shards, slot)
+		if tracked && state.revision == slotRevision && state.notBefore > last {
 			idleUntil = min(idleUntil, state.notBefore)
 			continue
 		}
@@ -69,9 +86,9 @@ func (d *Dispatcher) collectShardedDue(topic string, hash, last uint64, view Int
 			break
 		}
 		scan.next = (index + 1) % len(scan.shards)
-		if state.revision != revision {
+		if state.revision != slotRevision {
 			state.notBefore, state.peek = 0, false
-			state.revision = revision
+			state.revision = slotRevision
 		}
 		lower, upper, end := dueShardBounds(hash, last, slot)
 		if !state.peek {
@@ -94,9 +111,43 @@ func (d *Dispatcher) collectShardedDue(topic string, hash, last uint64, view Int
 	}
 }
 
-func (d *Dispatcher) cacheRevision(hash uint64) (uint64, bool) {
-	if db, ok := d.db.(storage.TopicCacheRevisioner); ok {
-		return db.TopicCacheRevision(hash), true
+// A lane whose earliest hint is still in the future can stay idle even when
+// writes to other lanes have advanced the topic revision.
+func (scan *shardedDueScan) idle(last, revision uint64, shards *storage.TopicRevisionSnapshot) bool {
+	if scan == nil || scan.idleUntil <= last {
+		return false
+	}
+	if scan.idleRev == revision {
+		return true
+	}
+	if shards == nil {
+		return false
+	}
+	for _, slot := range scan.shards {
+		if scan.state[slot].revision != shards.Shards[slot] {
+			return false
+		}
+	}
+	return true
+}
+
+func scanSlotRevision(revision uint64, shards *storage.TopicRevisionSnapshot, slot int) uint64 {
+	if shards != nil {
+		return shards.Shards[slot]
+	}
+	return revision
+}
+
+func (d *Dispatcher) watchTopic(hash uint64) *storage.TopicRevision {
+	if db, ok := d.db.(storage.TopicRevisioner); ok {
+		return db.WatchTopic(hash)
+	}
+	return nil
+}
+
+func (d *Dispatcher) cacheRevision(watch *storage.TopicRevision, shards *storage.TopicRevisionSnapshot) (uint64, bool) {
+	if watch != nil {
+		return watch.Read(shards), true
 	}
 	if db, ok := d.db.(storage.CacheRevisioner); ok {
 		return db.CacheRevision(), true

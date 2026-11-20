@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -87,18 +89,83 @@ func TestSlowLayoutRefreshesAllowDueDeliveryOnBothTopics(t *testing.T) {
 	}
 }
 
-type countedTopicRevisionDB struct {
+type failingLayoutProbeDB struct {
 	storage.DB
-	opens int
+	hash     uint64
+	probes   atomic.Int32
+	dueScans atomic.Int32
 }
 
-func (db *countedTopicRevisionDB) NewIter(opts *storage.IterOptions) (storage.Iterator, error) {
-	db.opens++
+func (db *failingLayoutProbeDB) CacheRevision() uint64 {
+	return db.DB.(storage.CacheRevisioner).CacheRevision()
+}
+
+func (db *failingLayoutProbeDB) NewIter(opts *storage.IterOptions) (storage.Iterator, error) {
+	if bytes.Equal(opts.LowerBound, shardScanBound(db.hash, 2)) && bytes.Equal(opts.UpperBound, topicScanEnd(db.hash)) {
+		if attempt := db.probes.Add(1); attempt == 2 || attempt == 3 {
+			return nil, errors.New("transient layout probe error")
+		}
+	} else {
+		db.dueScans.Add(1)
+	}
 	return db.DB.NewIter(opts)
 }
 
-func (db *countedTopicRevisionDB) TopicCacheRevision(hash uint64) uint64 {
-	return db.DB.(storage.TopicCacheRevisioner).TopicCacheRevision(hash)
+func TestFailedLayoutRefreshesRetryWhileKnownShardsAreIdle(t *testing.T) {
+	d, _ := newPipelineTest(t)
+	d.DiscoveryWorkers, d.ShardWorkers = 1, 1
+	d.interval = 5 * time.Millisecond
+	d.Limits.WorkTime = time.Second
+	d.PreloadLookahead = 0
+	d.MaintenanceRecipients = nil
+	d.hub.SetLocalReplica(1)
+	d.hub.SetGroupMembership(func(string, string) []metadata.ConsumerMember {
+		return []metadata.ConsumerMember{{ID: "local", NodeID: 1}}
+	})
+	const topic = "orders"
+	stream := make(chan *pb.QueueMessage, 1)
+	d.hub.Register("local", topic, "group", stream)
+	db := &failingLayoutProbeDB{DB: d.db, hash: utils.TopicHash(topic)}
+	d.db = db
+	put := func(slot int, id uint64, at time.Time) []byte {
+		t.Helper()
+		bucket := utils.ShardStorageBucket(slot, utils.CalculateBucket(at.UnixMilli(), d.TimeBucket))
+		key := utils.EventKey(bucket, db.hash, id)
+		value, err := proto.Marshal(&storagepb.StoredMessage{Topic: topic, EnqueuedAtUnixMs: at.UnixMilli()})
+		require.NoError(t, err)
+		require.NoError(t, storeProbeEvent(db, key, value))
+		return key
+	}
+	put(2, 1, time.Now().Add(time.Hour))
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); d.Run(ctx) }()
+	t.Cleanup(func() { cancel(); <-done })
+	require.Eventually(t, func() bool {
+		return db.probes.Load() == 1 && db.dueScans.Load() >= 6
+	}, time.Second, time.Millisecond, "initial due scan through the known layout")
+	target := put(4, 2, time.Now().Add(-time.Second))
+	require.Equal(t, target, receiveReplicaMessage(t, stream).DeliveryTag)
+	require.GreaterOrEqual(t, db.probes.Load(), int32(4), "retry succeeded after two probe errors without another write")
+}
+
+type countedTopicRevisionDB struct {
+	storage.DB
+	hash   uint64
+	opens  atomic.Int32
+	probes atomic.Int32
+}
+
+func (db *countedTopicRevisionDB) NewIter(opts *storage.IterOptions) (storage.Iterator, error) {
+	db.opens.Add(1)
+	if bytes.Equal(opts.LowerBound, shardScanBound(db.hash, 2)) && bytes.Equal(opts.UpperBound, topicScanEnd(db.hash)) {
+		db.probes.Add(1)
+	}
+	return db.DB.NewIter(opts)
+}
+
+func (db *countedTopicRevisionDB) WatchTopic(hash uint64) *storage.TopicRevision {
+	return db.DB.(storage.TopicRevisioner).WatchTopic(hash)
 }
 
 func TestFutureOnlyShardIdleHintsSurviveUnrelatedWrites(t *testing.T) {
@@ -110,10 +177,10 @@ func TestFutureOnlyShardIdleHintsSurviveUnrelatedWrites(t *testing.T) {
 	})
 	const topic = "orders"
 	d.hub.Register("local", topic, "group", make(chan *pb.QueueMessage, 1))
-	db := &countedTopicRevisionDB{DB: d.db}
+	hash := utils.TopicHash(topic)
+	db := &countedTopicRevisionDB{DB: d.db, hash: hash}
 	d.db = db
 	now := time.Now().UnixMilli()
-	hash := utils.TopicHash(topic)
 	future := now + time.Hour.Milliseconds()
 	futureValue, err := proto.Marshal(&storagepb.StoredMessage{Topic: topic, EnqueuedAtUnixMs: future})
 	require.NoError(t, err)
@@ -122,21 +189,72 @@ func TestFutureOnlyShardIdleHintsSurviveUnrelatedWrites(t *testing.T) {
 		require.NoError(t, storeProbeEvent(db, utils.EventKey(bucket, hash, uint64(shard+1)), futureValue))
 	}
 	require.Empty(t, d.collectTopic(topic, now).items)
-	require.Positive(t, db.opens)
-	opens := db.opens
+	require.Positive(t, db.opens.Load())
+	opens := db.opens.Load()
 	for i := range 3 {
 		key := utils.EventKey(0, utils.TopicHash("unrelated"), uint64(i+1))
 		require.NoError(t, storeProbeEvent(db, key, nil))
 		require.Empty(t, d.collectTopic(topic, now+int64(i+1)).items)
-		require.Equal(t, opens, db.opens, "no iterators needed while the topic's idle hints are valid")
+		require.Equal(t, opens, db.opens.Load(), "no iterators needed while the topic's idle hints are valid")
 	}
+	futureKey := utils.EventKey(utils.ShardStorageBucket(127, utils.CalculateBucket(future, d.TimeBucket)), hash, 65)
+	require.NoError(t, storeProbeEvent(db, futureKey, futureValue))
+	require.Empty(t, d.collectTopic(topic, now+4).items)
+	require.EqualValues(t, 2, db.opens.Load()-opens, "only the affected shard may open iterators")
 	dueValue, err := proto.Marshal(&storagepb.StoredMessage{Topic: topic, EnqueuedAtUnixMs: now})
 	require.NoError(t, err)
-	key := utils.EventKey(utils.ShardStorageBucket(127, utils.CalculateBucket(now, d.TimeBucket)), hash, 65)
+	key := utils.EventKey(utils.ShardStorageBucket(127, utils.CalculateBucket(now, d.TimeBucket)), hash, 66)
 	require.NoError(t, storeProbeEvent(db, key, dueValue))
-	items := d.collectTopic(topic, now+4).items
+	items := d.collectTopic(topic, now+5).items
 	require.Len(t, items, 1)
 	require.Equal(t, key, items[0].Key)
+}
+
+func TestLayoutPlanUpdatesFromWritesWithoutAnotherProbe(t *testing.T) {
+	d, _ := newPipelineTest(t)
+	d.DiscoveryWorkers, d.ShardWorkers = 1, 1
+	d.interval = 5 * time.Millisecond
+	d.Limits.WorkTime = time.Second
+	d.PreloadLookahead = 0
+	d.MaintenanceRecipients = nil
+	d.hub.SetLocalReplica(1)
+	d.hub.SetGroupMembership(func(string, string) []metadata.ConsumerMember {
+		return []metadata.ConsumerMember{{ID: "local", NodeID: 1}}
+	})
+	const topic = "orders"
+	stream := make(chan *pb.QueueMessage, 1)
+	d.hub.Register("local", topic, "group", stream)
+	db := &countedTopicRevisionDB{DB: d.db, hash: utils.TopicHash(topic)}
+	d.db = db
+	put := func(slot int, id uint64, at time.Time) []byte {
+		t.Helper()
+		bucket := utils.ShardStorageBucket(slot, utils.CalculateBucket(at.UnixMilli(), d.TimeBucket))
+		key := utils.EventKey(bucket, db.hash, id)
+		value, err := proto.Marshal(&storagepb.StoredMessage{Topic: topic, EnqueuedAtUnixMs: at.UnixMilli()})
+		require.NoError(t, err)
+		require.NoError(t, storeProbeEvent(db, key, value))
+		return key
+	}
+	future := time.Now().Add(time.Hour)
+	put(2, 1, future)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); d.Run(ctx) }()
+	t.Cleanup(func() { cancel(); <-done })
+	require.Eventually(t, func() bool { return db.opens.Load() >= 7 }, time.Second, time.Millisecond)
+	require.EqualValues(t, 1, db.probes.Load())
+	for i := range 10 {
+		before := db.opens.Load()
+		put(2, uint64(i+2), future)
+		require.Eventually(t, func() bool { return db.opens.Load() >= before+2 }, time.Second, time.Millisecond)
+		require.EqualValues(t, 2, db.opens.Load()-before)
+	}
+	// Introduce a four-shard layout while the two-shard layout still has data.
+	newKey := put(4, 12, time.Now().Add(-time.Second))
+	require.Equal(t, newKey, receiveReplicaMessage(t, stream).DeliveryTag)
+	oldKey := put(2, 13, time.Now().Add(-time.Second))
+	require.Equal(t, oldKey, receiveReplicaMessage(t, stream).DeliveryTag)
+	require.EqualValues(t, 1, db.probes.Load())
 }
 
 func TestDiscoveryChecksOneReservationPerGroupAndEachUniversal(t *testing.T) {

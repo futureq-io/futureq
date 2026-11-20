@@ -451,23 +451,22 @@ func (h *Hub) DispatchPrepared(topic string, msg *pb.QueueMessage, deliveryTag [
 			continue
 		}
 		var selected *ConsumerEntry
+		var eligible []*ConsumerEntry
 		if assignment != nil {
 			if group, ok := assignment.groups[gid]; ok {
-				selected = h.assignedWorker(group, msg, deliveryTag, slot, shardCount)
+				selected, eligible = h.assignedWorker(group, msg, deliveryTag, slot, shardCount)
 			}
 		} else if h.groupMembers != nil {
 			members := h.groupMembers(topic, gid)
 			if len(members) == 0 {
 				continue // no committed assignment, or rebalance is pending
 			}
-			selected = h.groupWorker(members, consumers, msg, deliveryTag, slot, shardCount, distribution)
+			selected, eligible = h.groupWorker(members, consumers, msg, deliveryTag, slot, shardCount, distribution)
 		} else {
 			selected = h.strategy.Select(consumers, msg)
+			eligible = consumers
 		}
-		if selected == nil {
-			continue
-		}
-		if h.trySend(selected, msg, deliveryTag) {
+		if selected != nil && h.trySendGroup(selected, eligible, msg, deliveryTag) {
 			sentTo = append(sentTo, gid)
 		}
 	}
@@ -477,7 +476,7 @@ func (h *Hub) DispatchPrepared(topic string, msg *pb.QueueMessage, deliveryTag [
 		if manifest != nil && !manifest.Needs(metadata.DeliveryRecipient("", c.ID)) {
 			continue
 		}
-		if h.trySend(c, msg, deliveryTag) {
+		if h.trySend(c, msg, deliveryTag) == sendAccepted {
 			sentTo = append(sentTo, "")
 		}
 	}
@@ -485,17 +484,18 @@ func (h *Hub) DispatchPrepared(topic string, msg *pb.QueueMessage, deliveryTag [
 	return sentTo
 }
 
-func (h *Hub) groupWorker(members []metadata.ConsumerMember, consumers []*ConsumerEntry, msg *pb.QueueMessage, key []byte, slot, count int, distribution metadata.ShardDistribution) *ConsumerEntry {
+func (h *Hub) groupWorker(members []metadata.ConsumerMember, consumers []*ConsumerEntry, msg *pb.QueueMessage, key []byte, slot, count int, distribution metadata.ShardDistribution) (*ConsumerEntry, []*ConsumerEntry) {
 	if count > 0 || distribution == metadata.ShardDistributionReplicaCount {
 		replica := describeReplica(members, h.localReplica, distribution)
 		if replica.usesReplicaWorkers(count) {
 			if !replica.owns(slot, count, key) {
-				return nil
+				return nil, nil
 			}
-			return h.strategy.Select(replica.localWorkers(members, consumers), msg)
+			eligible := replica.localWorkers(members, consumers)
+			return h.strategy.Select(eligible, msg), eligible
 		}
 	}
-	return moduloWorker(members, consumers, key)
+	return moduloWorker(members, consumers, key), nil
 }
 
 func moduloWorker(members []metadata.ConsumerMember, consumers []*ConsumerEntry, key []byte) *ConsumerEntry {
@@ -519,28 +519,80 @@ func deliveryOrdinal(tag []byte) uint64 {
 	return h.Sum64()
 }
 
-// trySend attempts to deliver a message to a single consumer. Returns true on
-// success. Tracks the delivery tag as in-flight for the consumer.
-func (h *Hub) trySend(c *ConsumerEntry, msg *pb.QueueMessage, deliveryTag []byte) bool {
+type sendOutcome uint8
+
+const (
+	sendAccepted sendOutcome = iota
+	sendAlreadyInFlight
+	sendQueueFull
+	sendWorkerAtLimit
+)
+
+func (h *Hub) trySendGroup(selected *ConsumerEntry, eligible []*ConsumerEntry, msg *pb.QueueMessage, deliveryTag []byte) bool {
+	reservation := groupDeliveryKey{topic: selected.Topic, group: selected.Group, key: string(deliveryTag)}
 	h.inFlightMu.Lock()
-	defer h.inFlightMu.Unlock()
-	reservation := groupDeliveryKey{topic: c.Topic, group: c.Group, key: string(deliveryTag)}
-	if c.Group != "" {
-		if _, exists := h.groupInFlight[reservation]; exists {
-			return false
+	outcome := h.trySendGroupLocked(selected, eligible, msg, deliveryTag, reservation)
+	h.inFlightMu.Unlock()
+	h.reportSendRejection(selected, outcome)
+	return outcome == sendAccepted
+}
+
+func (h *Hub) trySendGroupLocked(selected *ConsumerEntry, eligible []*ConsumerEntry, msg *pb.QueueMessage, deliveryTag []byte, reservation groupDeliveryKey) sendOutcome {
+	if _, exists := h.groupInFlight[reservation]; exists {
+		return sendAlreadyInFlight
+	}
+	outcome := h.enqueueLocked(selected, msg, deliveryTag, reservation)
+	if outcome == sendAccepted || outcome == sendAlreadyInFlight || len(eligible) <= 1 {
+		return outcome
+	}
+	// The strategy gets the first attempt. Walk the remaining eligible
+	// workers once while holding the reservation lock.
+	start := 0
+	for i, worker := range eligible {
+		if worker == selected {
+			start = i + 1
+			break
 		}
 	}
-	if h.deliveryRecords[c.ID] == nil {
-		h.deliveryRecords[c.ID] = make(map[string]deliveryRecord)
+	for offset := range len(eligible) {
+		worker := eligible[(start+offset)%len(eligible)]
+		if worker == selected {
+			continue
+		}
+		switch result := h.enqueueLocked(worker, msg, deliveryTag, reservation); result {
+		case sendAccepted, sendAlreadyInFlight:
+			return result
+		case sendQueueFull:
+			outcome = sendQueueFull
+		}
 	}
+	return outcome
+}
+
+// trySend delivers to an independent universal recipient.
+func (h *Hub) trySend(c *ConsumerEntry, msg *pb.QueueMessage, deliveryTag []byte) sendOutcome {
+	reservation := groupDeliveryKey{key: string(deliveryTag)}
+	h.inFlightMu.Lock()
+	outcome := h.enqueueLocked(c, msg, deliveryTag, reservation)
+	h.inFlightMu.Unlock()
+	h.reportSendRejection(c, outcome)
+	return outcome
+}
+
+// enqueueLocked publishes the delivery and installs its reservation while
+// the caller holds inFlightMu. A group checks that reservation before trying workers.
+func (h *Hub) enqueueLocked(c *ConsumerEntry, msg *pb.QueueMessage, deliveryTag []byte, reservation groupDeliveryKey) sendOutcome {
+	records := h.deliveryRecords[c.ID]
 	// A fast sender with stalled ACKs must not turn a bounded channel into an
 	// unbounded retry map. Expiry or ACK releases one of these fixed slots.
-	if len(h.deliveryRecords[c.ID]) >= max(1024, cap(c.Ch)) {
-		metrics.DeliveryRejectedTotal.WithLabelValues("in_flight_limit").Inc()
-		return false
+	if len(records) >= max(1024, cap(c.Ch)) {
+		return sendWorkerAtLimit
 	}
-	if _, exists := h.deliveryRecords[c.ID][string(deliveryTag)]; exists {
-		return false
+	if _, exists := records[reservation.key]; exists {
+		return sendAlreadyInFlight
+	}
+	if capacity := cap(c.Ch); c.Ch == nil || (capacity > 0 && len(c.Ch) == capacity) {
+		return sendQueueFull
 	}
 	// Separate pointers let the sender reject an old queued attempt after a
 	// timeout, even if the same key has since been delivered to this stream again.
@@ -555,20 +607,35 @@ func (h *Hub) trySend(c *ConsumerEntry, msg *pb.QueueMessage, deliveryTag []byte
 	case c.Ch <- queued:
 		metrics.DeliverySenderEnqueueLatenessMs.WithLabelValues(msg.Topic).Observe(float64(queuedAt.UnixNano())/1e6 - float64(msg.EnqueuedAtUnixMs+msg.DelayMs))
 		h.inFlightByConsumer[c.ID] = append(h.inFlightByConsumer[c.ID], deliveryTag)
-		h.deliveryRecords[c.ID][string(deliveryTag)] = deliveryRecord{message: queued, topic: c.Topic, group: c.Group, expires: time.Now().Add(h.inFlightTimeout), epoch: h.permitEpoch}
-		if c.Group != "" {
+		if records == nil {
+			records = make(map[string]deliveryRecord)
+			h.deliveryRecords[c.ID] = records
+		}
+		records[reservation.key] = deliveryRecord{message: queued, topic: c.Topic, group: c.Group, expires: time.Now().Add(h.inFlightTimeout), epoch: h.permitEpoch}
+		if reservation.group != "" {
 			h.groupInFlight[reservation] = c.ID
 		}
 		metrics.MessagesInFlight.WithLabelValues(c.Topic, c.Group).Inc()
-		return true
+		return sendAccepted
 	default:
+		return sendQueueFull
+	}
+}
+
+func (h *Hub) reportSendRejection(c *ConsumerEntry, outcome sendOutcome) {
+	switch outcome {
+	case sendWorkerAtLimit:
+		metrics.DeliveryRejectedTotal.WithLabelValues("in_flight_limit").Inc()
+	case sendQueueFull:
 		metrics.DeliveryRejectedTotal.WithLabelValues("full_queue").Inc()
+		if c.Group != "" {
+			h.logger.Warn("consumer group saturated, skipping", zap.String("topic", c.Topic), zap.String("group", c.Group))
+			return
+		}
 		h.logger.Warn("consumer channel full, skipping",
 			zap.String("consumer_id", c.ID),
 			zap.String("topic", c.Topic),
-			zap.String("group", c.Group),
 		)
-		return false
 	}
 }
 

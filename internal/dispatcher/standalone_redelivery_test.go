@@ -162,10 +162,12 @@ func TestStandaloneFullQueueDoesNotReserveGroup(t *testing.T) {
 	d, _ := newPipelineTest(t)
 	first, second := make(chan *pb.QueueMessage, 1), make(chan *pb.QueueMessage, 1)
 	first <- &pb.QueueMessage{}
+	second <- &pb.QueueMessage{}
 	d.hub.Register("first", "orders", "workers", first)
 	d.hub.Register("second", "orders", "workers", second)
 	require.Empty(t, d.hub.DispatchToTopic("orders", &pb.QueueMessage{}, []byte("key")))
 	require.Empty(t, d.hub.groupInFlight)
+	<-second
 	require.NotEmpty(t, d.hub.DispatchToTopic("orders", &pb.QueueMessage{}, []byte("key")))
 	require.Len(t, second, 1)
 }

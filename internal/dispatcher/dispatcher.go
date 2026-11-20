@@ -35,6 +35,7 @@ type Dispatcher struct {
 	shardScan          *shardScanRange     // immutable range assigned to an isolated discovery worker
 	scanSource         storage.IteratorSource
 	scanRevision       uint64
+	scanShardRevisions *storage.TopicRevisionSnapshot
 	tracksScanRevision bool
 	db                 storage.DB
 	hub                *Hub

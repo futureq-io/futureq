@@ -1,6 +1,8 @@
 package dispatcher
 
 import (
+	"bytes"
+	"fmt"
 	"testing"
 	"time"
 
@@ -9,6 +11,7 @@ import (
 	pb "github.com/futureq-io/protocol/proto/go"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 )
 
 func TestShardAssignmentCacheTracksCommittedAndLocalMembership(t *testing.T) {
@@ -54,4 +57,60 @@ func TestShardAssignmentCacheTracksCommittedAndLocalMembership(t *testing.T) {
 	hub.Unregister("joining")
 	require.Empty(t, hub.DispatchToTopic("orders", &pb.QueueMessage{Topic: "orders"}, key(4)))
 	require.Equal(t, 3, builds)
+}
+
+func TestAssignedGroupFallsBackWhenSelectedWorkerQueueIsFull(t *testing.T) {
+	d, _ := newPipelineTest(t)
+	h := d.hub
+	const topic, group = "orders", "workers"
+	full, healthy := make(chan *pb.QueueMessage, 1), make(chan *pb.QueueMessage, 1)
+	h.Register("a-full", topic, group, full)
+	h.Register("b-healthy", topic, group, healthy)
+	members := []metadata.ConsumerMember{{ID: "a-full", NodeID: 1}, {ID: "b-healthy", NodeID: 1}}
+	h.SetLocalReplica(1)
+	h.SetGroupMembership(func(string, string) []metadata.ConsumerMember { return members })
+	h.SetDeliveryFence(func() (uint64, bool) { return 9, true }, time.Second)
+	h.SetDeliveryView(func(string) metadata.TopicDeliveryView {
+		return metadata.TopicDeliveryView{Active: true, Epoch: 9, Groups: map[string][]metadata.ConsumerMember{group: members}}
+	})
+	h.GrantDeliveryPermit(9, time.Now())
+	full <- &pb.QueueMessage{}
+	msg := &pb.QueueMessage{Topic: topic}
+	bucket := utils.ShardStorageBucket(2, 1)
+	for i := range 10 {
+		key := utils.EventKey(bucket, utils.TopicHash(topic), uint64(i+1))
+		require.Equal(t, []string{group}, h.DispatchPrepared(topic, msg, key, nil))
+		require.Equal(t, key, receiveReplicaMessage(t, healthy).DeliveryTag)
+		require.Empty(t, h.DispatchPrepared(topic, msg, key, nil), "the group's reservation prevents a duplicate")
+		require.Empty(t, healthy)
+		require.True(t, h.RemoveInFlightForConsumer("b-healthy", key))
+	}
+	require.Len(t, full, 1)
+}
+
+func TestSaturatedGroupReportsOneWarningAndCanFallBack(t *testing.T) {
+	const topic, group = "orders", "workers"
+	var logs bytes.Buffer
+	core := zapcore.NewCore(zapcore.NewJSONEncoder(zap.NewProductionEncoderConfig()), zapcore.AddSync(&logs), zap.WarnLevel)
+	h := NewHub(NewRoundRobinStrategy(), zap.New(core), make(chan struct{}, 1))
+	var lastQueue chan *pb.QueueMessage
+	for i := range 1000 {
+		queue := make(chan *pb.QueueMessage, 1)
+		queue <- &pb.QueueMessage{}
+		h.Register(fmt.Sprintf("worker-%04d", i), topic, group, queue)
+		lastQueue = queue
+	}
+	key := utils.EventKey(0, utils.TopicHash(topic), 1)
+	msg := &pb.QueueMessage{Topic: topic}
+	require.Empty(t, h.DispatchPrepared(topic, msg, key, nil))
+	require.Empty(t, h.groupInFlight)
+	require.Empty(t, h.deliveryRecords, "full queues never reserve a delivery")
+	require.Equal(t, 1, bytes.Count(logs.Bytes(), []byte(`"level":"warn"`)))
+
+	<-lastQueue
+	require.Equal(t, []string{group}, h.DispatchPrepared(topic, msg, key, nil))
+	require.Equal(t, key, receiveReplicaMessage(t, lastQueue).DeliveryTag)
+	require.Len(t, h.groupInFlight, 1)
+	require.Empty(t, h.DispatchPrepared(topic, msg, key, nil))
+	require.Equal(t, 1, bytes.Count(logs.Bytes(), []byte(`"level":"warn"`)), "fallback success and an existing reservation are quiet")
 }

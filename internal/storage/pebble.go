@@ -269,6 +269,6 @@ var (
 
 func (p *Pebble) CacheRevision() uint64 { return p.revision.Load() }
 
-func (p *Pebble) TopicCacheRevision(hash uint64) uint64 { return p.topics.revision(hash) }
+func (p *Pebble) WatchTopic(hash uint64) *TopicRevision { return p.topics.watch(hash) }
 
 var _ CacheRevisioner = (*Pebble)(nil)
