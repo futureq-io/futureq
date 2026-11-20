@@ -6,6 +6,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/futureq-io/futureq/internal/config"
 	"github.com/futureq-io/futureq/internal/metrics"
 	raft "github.com/futureq-io/futureq/internal/raft/event"
 	"github.com/futureq-io/futureq/internal/storage"
@@ -60,6 +61,7 @@ type candidateHeap []preloadCandidate
 
 type topicPreload struct {
 	heapShift        uint         // 0/1: typed binary; 2/3: typed 4-ary/8-ary
+	adaptiveHeap     bool         // only the scheduler's retained heap adapts
 	readyCount       int          // scheduler-owned due credits; future entries are charged separately
 	repairGeneration uint64       // fences cursor resets against older scan results
 	valid            *atomic.Bool // optional generation fence, set by the production owner
@@ -127,7 +129,7 @@ func (d *Dispatcher) collectScheduledTopic(topic string, nowMs int64) deliveryCh
 	p := d.preloads[topic]
 	if p == nil || p.epoch != view.Epoch {
 		d.dropPreload(topic)
-		p = &topicPreload{epoch: view.Epoch, heapShift: candidateHeapShift(d.HeapType)}
+		p = &topicPreload{epoch: view.Epoch, heapShift: candidateHeapShift(d.HeapType), adaptiveHeap: d.HeapType == config.HeapAuto}
 		d.preloads[topic] = p
 	}
 	if !p.scanNext {
@@ -193,6 +195,9 @@ func (d *Dispatcher) collectPreloaded(topic string, p *topicPreload, view Intere
 		if chunk.oldestDueMs == 0 || candidate.due < chunk.oldestDueMs {
 			chunk.oldestDueMs = candidate.due
 		}
+	}
+	if examined > 0 {
+		p.rebuildAfterDrain(false)
 	}
 	p.compact()
 	return chunk
@@ -286,7 +291,7 @@ func (d *Dispatcher) preloadTopic(topic string, p *topicPreload, view InterestVi
 				candidate.payload = payload
 				candidate.due = msg.EnqueuedAtUnixMs + msg.DelayMs
 				if candidate.due > nowMs && candidate.due <= horizon && !d.isExpired(msg, nowMs) {
-					p.items.pushCandidate(candidate, p.heapShift)
+					p.pushCandidate(candidate)
 					p.addKey(candidate.key)
 					d.preloadCount++
 					loaded++
@@ -396,7 +401,7 @@ func (d *Dispatcher) releaseReady(topic string, p *topicPreload) {
 	}
 	clear(p.items[len(kept):])
 	p.items = kept
-	p.items.initCandidates(p.heapShift)
+	p.rebuildAfterDrain(true)
 	p.compact()
 	p.repairGeneration++
 	d.forgetCursor(topic)

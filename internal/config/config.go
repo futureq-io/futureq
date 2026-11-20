@@ -25,13 +25,14 @@ const (
 	NoAck  AckLevel = "noAck"
 )
 
-// HeapType selects the node-local delivery candidate heap at startup.
+// HeapType selects a fixed or adaptive delivery candidate heap policy.
 type HeapType string
 
 const (
 	HeapBinary HeapType = "binary"
 	Heap4Ary   HeapType = "4ary"
 	Heap8Ary   HeapType = "8ary"
+	HeapAuto   HeapType = "auto"
 )
 
 type Subscriptions struct {
@@ -474,9 +475,9 @@ func (c *Config) validatePublishAndDelivery() error {
 
 	d := c.Delivery
 	switch d.HeapType {
-	case HeapBinary, Heap4Ary, Heap8Ary:
+	case HeapBinary, Heap4Ary, Heap8Ary, HeapAuto:
 	default:
-		return fmt.Errorf("delivery.heapType must be binary, 4ary, or 8ary")
+		return fmt.Errorf("delivery.heapType must be binary, 4ary, 8ary, or auto")
 	}
 	if d.ReadPermit < 100*time.Millisecond || d.ReadPermit > 30*time.Second || d.ReadPermit%time.Millisecond != 0 {
 		return fmt.Errorf("delivery.readPermit must be whole milliseconds from 100ms to 30s")

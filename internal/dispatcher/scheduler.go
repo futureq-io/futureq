@@ -8,6 +8,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/futureq-io/futureq/internal/config"
 	"github.com/futureq-io/futureq/internal/metrics"
 	raft "github.com/futureq-io/futureq/internal/raft/event"
 	"github.com/futureq-io/futureq/internal/storage"
@@ -104,7 +105,9 @@ func (d *Dispatcher) discover(job discoveryJob) discoveryResult {
 			job.payloadAdmission.release()
 		}
 	}
-	p := &topicPreload{epoch: job.owner.epoch, after: job.futureAfter, heapShift: job.owner.heapShift}
+	// Workers build independent heaps from the startup policy. Reading the
+	// owner's arity here would race with scheduler-side changes in auto mode.
+	p := &topicPreload{epoch: job.owner.epoch, after: job.futureAfter, heapShift: candidateHeapShift(d.HeapType)}
 	// Future scans keep their own key and time allowances. They share the
 	// topic pass's remaining payload allowance with due discovery.
 	exhausted := false
@@ -127,7 +130,7 @@ func (d *Dispatcher) admitCandidate(p *topicPreload, c preloadCandidate) bool {
 		return false
 	}
 	p.addKey(c.key)
-	p.items.pushCandidate(c, p.heapShift)
+	p.pushCandidate(c)
 	if c.ready {
 		p.readyCount++
 		d.readyCount++
@@ -389,7 +392,7 @@ func (d *Dispatcher) runPipeline(parent context.Context) {
 				p = d.preloads[topic]
 				if p == nil || p.epoch != view.Epoch || p.assignmentEpoch != view.assignmentEpoch {
 					d.dropPreload(topic)
-					p = &topicPreload{epoch: view.Epoch, assignmentEpoch: view.assignmentEpoch, valid: &atomic.Bool{}, heapShift: candidateHeapShift(d.HeapType), sharded: view.sharded}
+					p = &topicPreload{epoch: view.Epoch, assignmentEpoch: view.assignmentEpoch, valid: &atomic.Bool{}, heapShift: candidateHeapShift(d.HeapType), adaptiveHeap: d.HeapType == config.HeapAuto, sharded: view.sharded}
 					p.revisionWatch = d.watchTopic(utils.TopicHash(topic))
 					if p.sharded && p.revisionWatch != nil {
 						p.shardRevisions = new(storage.TopicRevisionSnapshot)

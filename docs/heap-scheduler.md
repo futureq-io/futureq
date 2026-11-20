@@ -73,21 +73,34 @@ all lanes report into the same heap.
 
 ## Comparing heaps
 
-`delivery.heapType` selects the candidate heap when the broker starts:
+`delivery.heapType` selects the heap policy when the broker starts.
 
 | Value | Implementation |
 | --- | --- |
 | `binary` (default) | Typed binary heap without interface boxing |
 | `4ary` | Typed heap with four children per node |
 | `8ary` | Typed heap with eight children per node |
+| `auto` | Starts binary and switches each topic's retained heap between binary and four children per node |
 
 All variants retain the same full-message candidate layout, exact due-time/key
 ordering, count limits, topic ownership and generation fencing. The selection
-also applies to discovery workers' temporary heaps and rebuilds after retry
-eviction. Typed variants use hole-based sifting and clear popped payload slots.
-Heap choice does not enable speculative preloading; configure lookahead and
-capacity separately. Changing the selector requires a restart and rebuilds the
-local cache from authoritative storage.
+applies to the scheduler's retained heaps. In fixed modes discovery workers use
+the configured arity. In auto mode workers build their independent temporary
+heaps as binary. All variants use hole-based sifting and clear popped payload
+slots. Configure speculative lookahead and capacity separately.
+
+Auto mode widens a topic's heap when it reaches **2,048 retained candidates**
+and returns to binary after it drops to **1,024 or fewer**. The count includes
+both due and future candidates in memory. The gap avoids repeated switches
+around a single cutoff. The scheduler rebuilds the existing array in place
+before using the new arity. The growth check runs per insertion, so a large
+discovery batch cannot make the upgrade rebuild more than 2,048 entries.
+Watch `futureq_delivery_heap_switches_total{heap_type="4ary"}` and
+`{heap_type="binary"}` to see how often topics change arity.
+
+The thresholds are a starting policy based on heap benchmarks. Binary has a
+short child scan for small heaps, and a four-child heap reduces tree depth
+for larger ones. The eight-child heap remains available as a fixed choice.
 
 The former `typed-binary` selector is now named `binary`; update configurations
 using that old value. The interface-based `container/heap` implementation has

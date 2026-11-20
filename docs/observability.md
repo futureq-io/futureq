@@ -42,6 +42,7 @@ lateness histograms use milliseconds.
 | `delivery_ownership_filtered_total` | counter | — | Event-key observations rejected for having no local owner, in live or speculative preload storage scans. |
 | `delivery_candidates_total` | counter | source (`scan\|preload`) | Due candidates selected for preparation, including retries. Excludes future loads and maintenance. `source="preload"` counts cached candidate hits, not successful deliveries. |
 | `delivery_preload_capacity` | gauge | — | Configured maximum future-message entries on this node. Due work has a separate bounded allowance. Zero when preloading is disabled or the scheduler stops. |
+| `delivery_heap_switches_total` | counter | heap_type | Number of adaptive heap switches on this node, labelled by the new arity (`binary` or `4ary`). |
 | `delivery_preload_loaded_total` | counter | — | New full-message entries loaded into reserved future discovery/cache slots; known-key scans do not increment it. A stale result can be rejected before heap admission. Reloading after invalidation counts again. |
 | `delivery_preload_scanned_keys_total` | counter | — | Speculative preload event-key observations; a subset of `delivery_scanned_keys_total`, not additional work to sum with it. |
 | `messages_expired_total`     | counter   | topic, source (`dispatcher\|janitor`) | Accepted TTL deletion requests on this node, attributed to the source that queued each request. Repeated scans and failed flush retries are deduplicated while a deletion is pending. Not committed deletes or globally unique messages. |

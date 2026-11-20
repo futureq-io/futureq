@@ -126,7 +126,7 @@ are separate from application storage under `storage.pebble`.
 | Key                                 | Default | Description |
 | ----------------------------------- | ------- | ----------- |
 | `delivery.timeBucket`               | `1ms`   | Granularity of the key scheme's time buckets. `0` = raw-millisecond buckets (maximum precision). Otherwise must be ≥1ms. |
-| `delivery.heapType`                 | `binary` | Candidate heap for due and future messages: `binary` (typed binary), `4ary`, or `8ary`. Applied at startup; restart to change. All choices order by exact due time, then message key. |
+| `delivery.heapType`                 | `binary` | Candidate heap policy for due and future messages. Choose `binary`, `4ary`, `8ary`, or `auto` to adapt to each topic's cached queue depth. The policy is set at startup. All choices order by exact due time, then message key. |
 | `delivery.shardDistribution`        | `consumerCount` | Per-group cluster delivery policy. `consumerCount` weights replicas by their consumer counts. `replicaCount` gives equal weight to replicas with at least one consumer in the group. Update the setting on all cluster nodes and restart them. The metadata leader activates its configured policy through a fenced rebalance. |
 | `delivery.discoveryWorkers`          | `2`     | Concurrent topic discovery passes per node, `1..16`. |
 | `delivery.shardWorkers`              | `1`     | Maximum concurrent shard scans within one sharded topic pass. Must be positive. Maximum total concurrency is `discoveryWorkers × shardWorkers`, subject to available shard ranges and the scan budget. A clustered node warns at startup when the configured product exceeds `GOMAXPROCS`. |
@@ -148,8 +148,9 @@ are separate from application storage under `storage.pebble`.
 
 All four intervals and the in-flight timeout must be greater than zero.
 
-To compare delivery heaps, change only `delivery.heapType` between runs, or set
-`FUTUREQ_DELIVERY_HEAPTYPE=8ary`. The heap is local to each broker and does not
+To enable automatic selection, set `delivery.heapType: auto` or
+`FUTUREQ_DELIVERY_HEAPTYPE=auto`. See [heap selection](heap-scheduler.md#comparing-heaps)
+for switching thresholds. The heap is local to each broker and does not
 change stored messages or the wire protocol. Both due-only delivery and future
 preloading use the selected heap. See [heap comparisons](heap-scheduler.md#comparing-heaps)
 for a repeatable microbenchmark; broker load tests are still needed to assess

@@ -4,20 +4,54 @@ import (
 	"bytes"
 
 	"github.com/futureq-io/futureq/internal/config"
+	"github.com/futureq-io/futureq/internal/metrics"
 )
 
-// candidateHeapShift is captured when a topic is created, including worker-local
-// discovery heaps. Binary heaps use the same typed operations as wider heaps.
+const (
+	binaryHeapShift = 1
+	quadHeapShift   = 2
+
+	// Separate thresholds avoid rebuilding when a topic hovers near a cutoff.
+	adaptiveHeapGrowAt   = 2048
+	adaptiveHeapShrinkAt = 1024
+)
+
+// candidateHeapShift returns the initial arity, also used for worker-local
+// discovery heaps. Only the scheduler's retained heaps adapt.
 func candidateHeapShift(kind config.HeapType) uint {
 	switch kind {
-	case "", config.HeapBinary:
-		return 1
+	case "", config.HeapBinary, config.HeapAuto:
+		return binaryHeapShift
 	case config.Heap4Ary:
-		return 2
+		return quadHeapShift
 	case config.Heap8Ary:
 		return 3
 	default:
 		panic("invalid delivery heap type: " + string(kind)) // configuration is validated before startup
+	}
+}
+
+func (p *topicPreload) pushCandidate(candidate preloadCandidate) {
+	p.items.pushCandidate(candidate, p.heapShift)
+	// Check after each push so even a large discovery result cannot make the
+	// upgrade rebuild more than adaptiveHeapGrowAt entries.
+	if p.adaptiveHeap && p.heapShift == binaryHeapShift && len(p.items) == adaptiveHeapGrowAt {
+		p.heapShift = quadHeapShift
+		p.items.initCandidates(p.heapShift)
+		metrics.DeliveryHeapSwitchesTotal.WithLabelValues("4ary").Inc()
+	}
+}
+
+// rebuildAfterDrain also handles filtering, which requires a rebuild even
+// when the arity stays the same. Ordinary pops already maintain heap order.
+func (p *topicPreload) rebuildAfterDrain(needsRebuild bool) {
+	if p.adaptiveHeap && p.heapShift == quadHeapShift && len(p.items) <= adaptiveHeapShrinkAt {
+		p.heapShift = binaryHeapShift
+		needsRebuild = true
+		metrics.DeliveryHeapSwitchesTotal.WithLabelValues("binary").Inc()
+	}
+	if needsRebuild {
+		p.items.initCandidates(p.heapShift)
 	}
 }
 
@@ -84,9 +118,8 @@ func (h candidateHeap) siftCandidateDown(parent int, candidate preloadCandidate,
 	h[parent] = candidate
 }
 
-// Filtering ready candidates changes the array's shape. Rebuild using the same
-// arity before the scheduler reads its head again; copying during compaction
-// alone preserves the heap shape and needs no rebuild.
+// Rebuild in place after filtering ready candidates or changing the arity.
+// Copying during compaction alone preserves heap order.
 func (h *candidateHeap) initCandidates(shift uint) {
 	shift = max(1, shift)
 	if len(*h) < 2 {

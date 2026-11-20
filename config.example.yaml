@@ -86,7 +86,7 @@ publish:
 delivery:
   # consumerCount weights by workers. replicaCount gives each serving replica equal weight.
   shardDistribution: consumerCount
-  heapType: binary # binary, 4ary, or 8ary; restart to change
+  heapType: binary # binary, 4ary, 8ary, or auto
   subscriptions:
     allowAutoAck: false # reject auto-ack streams unless explicitly allowed
     # No workers connected for this duration: discard the subscription/backlog.
