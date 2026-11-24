@@ -16,13 +16,16 @@ func validateSubscription(request *pb.SubscriptionRequest) error {
 	if request == nil {
 		return status.Error(codes.InvalidArgument, "subscription is required")
 	}
+	if err := raft.ValidateTopicName(request.Topic); err != nil {
+		return status.Error(codes.InvalidArgument, err.Error())
+	}
 	if _, err := raft.SubscriptionKey(request.Topic, request.GroupId, request.SubscriberId); err != nil {
 		return status.Error(codes.InvalidArgument, err.Error())
 	}
 	return nil
 }
 func subscriptionError(err error) error {
-	if errors.Is(err, subscriptions.ErrNotFound) {
+	if errors.Is(err, subscriptions.ErrNotFound) || errors.Is(err, raft.ErrTopicNotFound) {
 		return status.Error(codes.NotFound, err.Error())
 	}
 	return status.Errorf(codes.Unavailable, "subscription operation failed: %v", err)

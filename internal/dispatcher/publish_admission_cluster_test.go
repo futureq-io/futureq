@@ -26,6 +26,7 @@ func TestQuorumAdmissionOfflineRecipientSurvivesReplicaRestart(t *testing.T) {
 	service.Propose = func(ctx context.Context, cmd []byte) (statemachine.Result, error) {
 		return node.nh.SyncPropose(ctx, node.nh.GetNoOPSession(replicaTestShard), cmd)
 	}
+	require.NoError(t, service.CreateTopic(ctx, "orders", nil))
 	group, err := service.Create(ctx, "orders", "workers", "")
 	require.NoError(t, err)
 	universal, err := service.Create(ctx, "orders", "", "audit")

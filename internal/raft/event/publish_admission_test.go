@@ -83,6 +83,9 @@ func TestQuorumAdmissionSeesOrderedSubscriptionsInSameApplyBatch(t *testing.T) {
 			require.NoError(t, sm.SaveSnapshot(frozen, &snapshot, nil))
 			recovered, other := newDeliveryTestSM(t)
 			require.NoError(t, recovered.RecoverFromSnapshot(&snapshot, nil))
+			exists, err := TopicExists(other, "orders")
+			require.NoError(t, err)
+			require.True(t, exists, "snapshot retains the topic catalog")
 			state, err := ReadDeliveryState(other, utils.EventKey(1, utils.TopicHash("orders"), 1))
 			require.NoError(t, err)
 			require.Equal(t, []string{"g:s:a"}, state.Recipients, "snapshot retains original destinations")
@@ -98,6 +101,7 @@ func TestQuorumAdmissionRejectsWholeBatchWithoutRevertingOtherEntries(t *testing
 	result := applyAdmissionSequence(t, sm, createA, admissionCommand(t, 10, "orders", "missing"), createB, admissionCommand(t, 20, "orders", "missing"))
 	var rejection *PublishRejectedError
 	require.ErrorAs(t, CheckPublishResult(result[1].Result, 2), &rejection)
+	require.Equal(t, PublishTopicNotFound, rejection.Reason)
 	require.Equal(t, "missing", rejection.Topic)
 	require.NoError(t, CheckPublishResult(result[3].Result, 2))
 	for i, topic := range []string{"orders", "missing"} {
@@ -118,7 +122,7 @@ func TestQuorumAdmissionCapacityRejectionDoesNotHaltStateMachine(t *testing.T) {
 	for i := 0; i <= MaxDeliveryRecipients; i++ {
 		mutations = append(mutations, &deliverypb.SubscriptionMutation{Topic: "orders", GroupId: fmt.Sprint(i), Recipient: fmt.Sprintf("g:s:%04d", i)})
 		if len(mutations) == 256 || i == MaxDeliveryRecipients {
-			cmd, err := MarshalSubscriptionCommand(&deliverypb.SubscriptionCommand{Operation: SubscriptionCreate, NowMs: 1000, Mutations: mutations})
+			cmd, err := MarshalSubscriptionCommand(&deliverypb.SubscriptionCommand{Operation: TopicCreate, Topic: "orders", NowMs: 1000, Mutations: mutations})
 			require.NoError(t, err)
 			applyAdmissionSequence(t, sm, cmd)
 			mutations = nil

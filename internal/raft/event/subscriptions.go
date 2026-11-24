@@ -23,6 +23,7 @@ const (
 	SubscriptionRenew
 	SubscriptionExpire
 	SubscriptionCleanup
+	TopicCreate
 )
 
 var SubscriptionPrefix = []byte("metadata/subscriptions/")
@@ -90,12 +91,25 @@ func ReadSubscriptionRecipients(db storage.DB, topic string) ([]string, error) {
 	return names, err
 }
 func MarshalSubscriptionCommand(command *deliverypb.SubscriptionCommand) ([]byte, error) {
-	if command.Operation < SubscriptionCreate || command.Operation > SubscriptionCleanup || command.NowMs <= 0 || len(command.Mutations) > 256 || len(command.Keys) > 256 || command.LeaseMs < 0 || command.IdleTimeoutMs < 0 {
+	if command.Operation < SubscriptionCreate || command.Operation > TopicCreate || command.NowMs <= 0 || len(command.Mutations) > MaxInitialSubscriptions || len(command.Keys) > 256 || command.LeaseMs < 0 || command.IdleTimeoutMs < 0 {
 		return nil, fmt.Errorf("invalid subscription command")
 	}
+	if command.Operation == TopicCreate {
+		if err := ValidateTopicName(command.Topic); err != nil {
+			return nil, err
+		}
+	} else if command.Topic != "" {
+		return nil, fmt.Errorf("topic is only allowed on a topic creation command")
+	}
 	for _, mutation := range command.Mutations {
+		if mutation == nil {
+			return nil, fmt.Errorf("subscription mutation is required")
+		}
 		if _, err := SubscriptionKey(mutation.Topic, mutation.GroupId, mutation.SubscriberId); err != nil {
 			return nil, err
+		}
+		if command.Operation == TopicCreate && mutation.Topic != command.Topic {
+			return nil, fmt.Errorf("initial subscription belongs to a different topic")
 		}
 		if mutation.Recipient != "" && (!strings.HasPrefix(mutation.Recipient, subscriptionRecipientPrefix) || len(mutation.Recipient) > 128) {
 			return nil, fmt.Errorf("invalid subscription generation")
@@ -164,14 +178,28 @@ func (b *DeliveryBatch) ApplySubscription(data []byte) (statemachine.Result, [][
 	if command.Operation == SubscriptionCleanup {
 		return b.cleanSubscriptions(command.Keys)
 	}
+	if command.Operation == TopicCreate {
+		if err := b.createTopic(command.Topic); err != nil {
+			return statemachine.Result{}, nil, err
+		}
+	}
 	var result statemachine.Result
 	for _, mutation := range command.Mutations {
+		if command.Operation == SubscriptionCreate {
+			exists, err := b.topicExists(mutation.Topic)
+			if err != nil {
+				return result, nil, err
+			}
+			if !exists {
+				continue
+			}
+		}
 		key, _ := SubscriptionKey(mutation.Topic, mutation.GroupId, mutation.SubscriberId)
 		record, err := b.subscriptionRead(key)
 		if err != nil {
 			return result, nil, err
 		}
-		if command.Operation == SubscriptionCreate {
+		if command.Operation == SubscriptionCreate || command.Operation == TopicCreate {
 			if record == nil || !record.Active {
 				if mutation.Recipient == "" {
 					return result, nil, fmt.Errorf("missing generation")

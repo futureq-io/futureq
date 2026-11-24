@@ -96,8 +96,9 @@ cause duplicate deliveries, as permitted by at-least-once delivery.
 
 Fan-out retention means an incomplete named group can retain a payload until it
 ACKs, reconnects and ACKs, or the message expires/is explicitly deleted. Publishing
-to a topic with no registered destinations fails with `FailedPrecondition`;
-offline groups and universal subscriptions are valid destinations. Subscriptions
+to an undeclared topic fails with `NotFound`. A declared topic with no registered
+destinations fails with `FailedPrecondition`. Offline groups and universal
+subscriptions are valid destinations. Subscriptions
 survive broker restarts until explicit unsubscribe or configured expiry. Quorum
 publishes select destinations during ordered Raft apply, without an admission
 quorum read. Leader and no-ACK publishes first refresh the event-shard registry
@@ -125,6 +126,19 @@ cp config.example.yaml config.yaml   # adjust as needed
 ```
 
 A standalone node (`cluster.enabled: false`) writes directly to Pebble — perfect for local development.
+
+### Provision a topic
+
+Declare `email.send` and a durable `mailers` group before starting producers or
+connecting workers. Jobs can then be published even while all workers are offline.
+
+The example uses `topic.proto` from a protocol checkout at `../futureq-proto`.
+
+```bash
+grpcurl -plaintext -import-path ../futureq-proto/proto -proto topic.proto \
+  -d '{"name":"email.send","initial_subscriptions":[{"group_id":"mailers"}]}' \
+  localhost:8443 futureq.FutureQTopic/CreateTopic
+```
 
 ### Run a 3-node cluster
 
@@ -171,6 +185,7 @@ On first start the node contacts each seed until one accepts its `JoinCluster` r
 ### Docker
 
 ```bash
+go mod vendor
 docker build -t futureq .
 docker run -p 8443:8443 -p 9090:9090 -p 50005:50005 \
   -v $(pwd)/config.yaml:/app/config.yaml \

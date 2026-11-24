@@ -95,5 +95,5 @@ func TestDurableGroupKeyIsolation(t *testing.T) {
 	require.ErrorIs(t, err, storage.ErrNotFound)
 }
 func testSubscriptionCommand(topic, group, recipient string) ([]byte, error) {
-	return MarshalSubscriptionCommand(&deliverypb.SubscriptionCommand{Operation: SubscriptionCreate, NowMs: 1000, Mutations: []*deliverypb.SubscriptionMutation{{Topic: topic, GroupId: group, Recipient: recipient}}})
+	return MarshalSubscriptionCommand(&deliverypb.SubscriptionCommand{Operation: TopicCreate, Topic: topic, NowMs: 1000, Mutations: []*deliverypb.SubscriptionMutation{{Topic: topic, GroupId: group, Recipient: recipient}}})
 }

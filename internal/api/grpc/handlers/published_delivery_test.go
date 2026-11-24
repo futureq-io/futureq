@@ -35,6 +35,7 @@ func openPublishTest(t *testing.T, engine string) (*app.App, *dispatcher.Hub, *P
 	a, err := app.Init(cfg, zap.NewNop())
 	require.NoError(t, err)
 	require.NoError(t, a.WithRepositories())
+	require.NoError(t, a.Subscriptions.CreateTopic(context.Background(), "orders", nil))
 	hub := dispatcher.NewHub(dispatcher.NewRoundRobinStrategy(), zap.NewNop(), make(chan struct{}, 1))
 	producer := NewProducerHandler(zap.NewNop())
 	reopen := func() {
@@ -65,7 +66,7 @@ func TestPublishingRejectsUnregisteredTopicsAtomically(t *testing.T) {
 	ack, err := producer.processBatch(context.Background(), &pb.PublishBatch{Messages: []*pb.PublishMessage{
 		{Topic: "orders", Payload: []byte("valid")}, {Topic: "unregistered", Payload: []byte("unroutable")},
 	}})
-	require.Equal(t, codes.FailedPrecondition, status.Code(err))
+	require.Equal(t, codes.NotFound, status.Code(err))
 	require.False(t, ack.Success)
 	require.Empty(t, publishedKeys(t, app.A.DB), "the whole batch must be rejected")
 }

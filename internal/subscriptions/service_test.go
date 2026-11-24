@@ -26,7 +26,9 @@ func newTestService(t *testing.T, engine string, timeout time.Duration) *Service
 	}
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, db.Close()) })
-	return New(db, timeout, zap.NewNop())
+	service := New(db, timeout, zap.NewNop())
+	require.NoError(t, service.CreateTopic(context.Background(), "orders", nil))
+	return service
 }
 func putReceipt(t *testing.T, s *Service, id uint64, recipients ...string) []byte {
 	t.Helper()

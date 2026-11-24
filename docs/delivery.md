@@ -59,7 +59,8 @@ replay, overwrite and snapshot replacement before old data can validate.
 
 ## Hub & consumer groups
 
-A durable subscription is created with `CreateSubscription`, independently of
+Declare durable subscriptions with `CreateTopic` during provisioning or add them
+to an existing topic with `CreateSubscription`. They exist independently of
 worker connections. Set exactly one of:
 
 | Identity | Behavior |
@@ -72,8 +73,8 @@ or recreate interest. The server confirms binding in the stream's initial
 metadata. Consumer groups and universal subscribers use the same durable
 lifecycle in standalone and Raft mode. Destinations are frozen at publication,
 including offline subscriptions, and never expanded by retry or reconnect. A
-batch containing a topic without subscriptions is rejected atomically with
-`FailedPrecondition`.
+batch containing a declared topic without subscriptions is rejected atomically
+with `FailedPrecondition`. An undeclared topic returns `NotFound`.
 
 `Unsubscribe` immediately deactivates the subscription in the event shard;
 bounded background cleanup discards its pending deliveries and preserves other
