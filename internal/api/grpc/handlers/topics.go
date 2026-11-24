@@ -44,14 +44,11 @@ func (h *TopicHandler) GetTopic(ctx context.Context, request *pb.GetTopicRequest
 	if err := raft.ValidateTopicName(name); err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
-	if err := topicReadBarrier(ctx); err != nil {
+	result, err := readTopicCatalog(ctx, raft.TopicCatalogQuery{Name: name})
+	if err != nil {
 		return nil, err
 	}
-	exists, err := raft.TopicExists(app.A.DB, name)
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, "read topic: %v", err)
-	}
-	if !exists {
+	if !result.Exists {
 		return nil, status.Errorf(codes.NotFound, "topic %q does not exist", name)
 	}
 	return &pb.Topic{Name: name}, nil
@@ -70,30 +67,36 @@ func (h *TopicHandler) ListTopics(ctx context.Context, request *pb.ListTopicsReq
 			return nil, status.Errorf(codes.InvalidArgument, "invalid page token: %v", err)
 		}
 	}
-	if err := topicReadBarrier(ctx); err != nil {
+	result, err := readTopicCatalog(ctx, raft.TopicCatalogQuery{After: request.GetPageToken(), Limit: int(size)})
+	if err != nil {
 		return nil, err
 	}
-	names, next, err := raft.ListTopics(app.A.DB, request.GetPageToken(), int(size))
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, "list topics: %v", err)
-	}
-	topics := make([]*pb.Topic, 0, len(names))
-	for _, name := range names {
+	topics := make([]*pb.Topic, 0, len(result.Names))
+	for _, name := range result.Names {
 		topics = append(topics, &pb.Topic{Name: name})
 	}
-	return &pb.ListTopicsResponse{Topics: topics, NextPageToken: next}, nil
+	return &pb.ListTopicsResponse{Topics: topics, NextPageToken: result.Next}, nil
 }
 
-func topicReadBarrier(ctx context.Context) error {
+func readTopicCatalog(ctx context.Context, query raft.TopicCatalogQuery) (raft.TopicCatalogResult, error) {
 	a := app.A
 	if a.NodeHost == nil {
-		return nil
+		result, err := query.Read(a.DB)
+		if err != nil {
+			return result, status.Errorf(codes.Internal, "read topic catalog: %v", err)
+		}
+		return result, nil
 	}
 	cfg := a.Config()
 	ctx, cancel := context.WithTimeout(ctx, cfg.Publish.ProposalTimeout)
 	defer cancel()
-	if _, err := a.NodeHost.SyncRead(ctx, cfg.Cluster.ShardID, nil); err != nil {
-		return status.Errorf(codes.Unavailable, "topic registry unavailable: %v", err)
+	value, err := a.NodeHost.SyncRead(ctx, cfg.Cluster.ShardID, query)
+	if err != nil {
+		return raft.TopicCatalogResult{}, status.Errorf(codes.Unavailable, "topic registry unavailable: %v", err)
 	}
-	return nil
+	result, ok := value.(raft.TopicCatalogResult)
+	if !ok {
+		return raft.TopicCatalogResult{}, status.Error(codes.Internal, "unexpected topic catalog result")
+	}
+	return result, nil
 }

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sync"
 
 	"github.com/futureq-io/futureq/internal/repository"
 	"github.com/futureq-io/futureq/internal/storage"
@@ -29,6 +30,9 @@ type EventStateMachine struct {
 	lastApplied     uint64
 	lastPersistedID uint64
 	logger          *zap.Logger
+	// Dragonboat allows Lookup to run concurrently with snapshot recovery.
+	catalogMu       sync.RWMutex
+	recoveryPending bool
 	// OnDeleteKeys is called after a DeleteBatchCmd is applied, with copies
 	// of each deleted key. Used to remove entries from the dispatcher's in-flight
 	// map. Safe to be nil.
@@ -234,7 +238,18 @@ func (s *EventStateMachine) Sync() error {
 }
 
 func (s *EventStateMachine) Lookup(query interface{}) (interface{}, error) {
-	return nil, nil
+	catalog, ok := query.(TopicCatalogQuery)
+	if !ok {
+		return nil, nil
+	}
+	if !s.catalogMu.TryRLock() {
+		return nil, errTopicCatalogUnavailable
+	}
+	defer s.catalogMu.RUnlock()
+	if s.recoveryPending {
+		return nil, errTopicCatalogUnavailable
+	}
+	return catalog.Read(s.db)
 }
 
 type eventSnapshot struct {
@@ -309,6 +324,12 @@ func writeSnapshotBytes(w io.Writer, data []byte) error {
 }
 
 func (s *EventStateMachine) RecoverFromSnapshot(r io.Reader, stopc <-chan struct{}) error {
+	s.catalogMu.Lock()
+	defer s.catalogMu.Unlock()
+	// If recovery fails after clearing the database, catalog reads must still
+	// fail until a complete snapshot has been restored.
+	s.recoveryPending = true
+
 	if err := s.clearDB(stopc); err != nil {
 		return err
 	}
@@ -376,6 +397,7 @@ func (s *EventStateMachine) RecoverFromSnapshot(r io.Reader, stopc <-chan struct
 	s.lastApplied = index
 	s.lastPersistedID = lastID
 	s.repo.ObserveID(lastID)
+	s.recoveryPending = false
 
 	return nil
 }

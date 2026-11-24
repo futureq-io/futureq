@@ -18,6 +18,32 @@ const (
 
 var ErrTopicNotFound = errors.New("topic does not exist")
 
+var errTopicCatalogUnavailable = errors.New("topic catalog unavailable while snapshot recovery is incomplete")
+
+// TopicCatalogQuery looks up Name, or lists a page after After when Name is empty.
+type TopicCatalogQuery struct {
+	Name  string
+	After string
+	Limit int
+}
+
+type TopicCatalogResult struct {
+	Exists bool
+	Names  []string
+	Next   string
+}
+
+// Read queries a consistent catalog view. Clustered callers use Lookup, which
+// guards this read against snapshot replacement.
+func (q TopicCatalogQuery) Read(db storage.DB) (TopicCatalogResult, error) {
+	if q.Name != "" {
+		exists, err := TopicExists(db, q.Name)
+		return TopicCatalogResult{Exists: exists}, err
+	}
+	names, next, err := ListTopics(db, q.After, q.Limit)
+	return TopicCatalogResult{Names: names, Next: next}, err
+}
+
 func ValidateTopicName(name string) error {
 	if len(name) == 0 || len(name) > 255 || !utf8.ValidString(name) || strings.IndexFunc(name, unicode.IsControl) >= 0 {
 		return fmt.Errorf("topic name must be valid UTF-8, contain 1 to 255 bytes, and contain no control characters")
