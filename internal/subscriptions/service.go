@@ -329,23 +329,23 @@ func (s *Service) Run(ctx context.Context) {
 	}
 	defer workers.Wait()
 
-	ticker := time.NewTicker(time.Second)
-	defer ticker.Stop()
-	lastRenew := time.Now()
+	timer := time.NewTimer(heartbeatInterval)
+	defer timer.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case now := <-ticker.C:
+		case <-timer.C:
+			started := time.Now()
 			callCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
-			if now.Sub(lastRenew) >= heartbeatInterval {
-				if err := s.renew(callCtx); err != nil {
-					s.Logger.Warn("subscription renewal failed", zap.Error(err))
-				} else {
-					lastRenew = now
-				}
-			}
+			err := s.renew(callCtx)
 			cancel()
+			if err != nil {
+				s.Logger.Warn("subscription renewal failed", zap.Error(err))
+				timer.Reset(time.Second)
+			} else {
+				timer.Reset(time.Until(started.Add(heartbeatInterval)))
+			}
 		}
 	}
 }
