@@ -1,0 +1,76 @@
+name: Publish Docker image
+
+on:
+  push:
+    tags:
+      - "**"
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test tagged source
+    if: github.event.created == true && github.event.deleted == false
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Run tests
+        run: make test
+
+  publish:
+    name: Publish to Docker Hub
+    needs: test
+    runs-on: ubuntu-latest
+    env:
+      IMAGE: ${{ vars.DOCKERHUB_IMAGE }}
+      DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v6
+
+      - name: Check Docker Hub configuration
+        env:
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          test -n "$IMAGE" || { echo "Set the DOCKERHUB_IMAGE repository variable (for example, yourname/futureq)."; exit 1; }
+          test -n "$DOCKERHUB_USERNAME" || { echo "Set the DOCKERHUB_USERNAME repository variable."; exit 1; }
+          test -n "$DOCKERHUB_TOKEN" || { echo "Set the DOCKERHUB_TOKEN repository secret."; exit 1; }
+
+      - name: Generate image metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.IMAGE }}
+          flavor: latest=false
+          tags: type=ref,event=tag
+
+      - name: Set up QEMU for multi-platform runtime layers
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Sign in to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ env.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
