@@ -50,6 +50,7 @@ type PublishRejectionReason byte
 const (
 	PublishNoDestinations PublishRejectionReason = iota + 1
 	PublishTooManyDestinations
+	PublishTopicNotFound
 )
 
 // PublishRejectedError is a business rejection, not an Update failure. Raft
@@ -60,10 +61,14 @@ type PublishRejectedError struct {
 }
 
 func (e *PublishRejectedError) Error() string {
-	if e.Reason == PublishTooManyDestinations {
+	switch e.Reason {
+	case PublishTopicNotFound:
+		return fmt.Sprintf("topic %q does not exist", e.Topic)
+	case PublishTooManyDestinations:
 		return fmt.Sprintf("topic %q exceeds %d destinations", e.Topic, MaxDeliveryRecipients)
+	default:
+		return fmt.Sprintf("topic %q has no registered destinations", e.Topic)
 	}
-	return fmt.Sprintf("topic %q has no registered destinations", e.Topic)
 }
 func rejectPublish(reason PublishRejectionReason, topic string) statemachine.Result {
 	return statemachine.Result{Data: append([]byte{byte(reason)}, topic...)}
@@ -77,7 +82,7 @@ func CheckPublishResult(result statemachine.Result, expected int) error {
 	}
 	if result.Value == 0 && len(result.Data) > 1 {
 		reason := PublishRejectionReason(result.Data[0])
-		if reason == PublishNoDestinations || reason == PublishTooManyDestinations {
+		if reason == PublishNoDestinations || reason == PublishTooManyDestinations || reason == PublishTopicNotFound {
 			return &PublishRejectedError{Reason: reason, Topic: string(result.Data[1:])}
 		}
 	}
@@ -134,6 +139,13 @@ func (b *DeliveryBatch) bindPublishRecipients(items []StoreBatchItem) (statemach
 		}
 		receipt, exists := receipts[message.Topic]
 		if !exists {
+			registered, err := b.topicExists(message.Topic)
+			if err != nil {
+				return statemachine.Result{}, false, err
+			}
+			if !registered {
+				return rejectPublish(PublishTopicNotFound, message.Topic), false, nil
+			}
 			names, err := b.subscriptionRecipients(message.Topic)
 			if err != nil {
 				return statemachine.Result{}, false, err

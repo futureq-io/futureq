@@ -30,6 +30,7 @@ func TestRaftDurableUniversalSubscriptionRestartAndRemoval(t *testing.T) {
 		return service
 	}
 	service := serviceFor(c.nodes[1])
+	require.NoError(t, service.CreateTopic(ctx, "orders", nil))
 	group, err := service.Create(ctx, "orders", "workers", "")
 	require.NoError(t, err)
 	universal, err := service.Create(ctx, "orders", "", "audit")

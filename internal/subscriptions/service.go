@@ -85,11 +85,29 @@ func (s *Service) Create(ctx context.Context, topic, group, subscriber string) (
 	if err != nil {
 		return nil, err
 	}
+	if result.Value == 0 {
+		return nil, fmt.Errorf("%w: %q", raft.ErrTopicNotFound, topic)
+	}
 	record := new(deliverypb.SubscriptionRecord)
 	if err := proto.Unmarshal(result.Data, record); err != nil {
 		return nil, err
 	}
 	return record, nil
+}
+
+// CreateTopic declares a topic and its initial destinations in one mutation.
+func (s *Service) CreateTopic(ctx context.Context, topic string, initial []*deliverypb.SubscriptionMutation) error {
+	mutations := make([]*deliverypb.SubscriptionMutation, 0, len(initial))
+	for _, subscription := range initial {
+		mutation := Mutation(subscription.GetTopic(), subscription.GetGroupId(), subscription.GetSubscriberId())
+		mutation.Recipient = "g:s:" + uuid.NewString()
+		mutations = append(mutations, mutation)
+	}
+	_, err := s.apply(ctx, &deliverypb.SubscriptionCommand{
+		Operation: raft.TopicCreate, Topic: topic, NowMs: time.Now().UnixMilli(),
+		Mutations: mutations,
+	})
+	return err
 }
 func (s *Service) Unsubscribe(ctx context.Context, topic, group, subscriber string) error {
 	_, err := s.command(ctx, raft.SubscriptionRemove, Mutation(topic, group, subscriber))

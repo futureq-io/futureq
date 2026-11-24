@@ -98,8 +98,8 @@ func (ph *ProducerHandler) processBatch(ctx context.Context, batch *pb.PublishBa
 		return &pb.PublishBatchAck{}, nil
 	}
 	for _, message := range batch.Messages {
-		if message == nil || message.Topic == "" {
-			return &pb.PublishBatchAck{Success: false}, status.Error(codes.InvalidArgument, "publish topic must not be empty")
+		if err := raft.ValidateTopicName(message.GetTopic()); err != nil {
+			return &pb.PublishBatchAck{Success: false}, status.Error(codes.InvalidArgument, err.Error())
 		}
 	}
 
@@ -326,16 +326,23 @@ func (ph *ProducerHandler) processRaftBatch(
 	if proposeErr != nil {
 		var rejection *raft.PublishRejectedError
 		if errors.As(proposeErr, &rejection) {
-			code := codes.FailedPrecondition
-			if rejection.Reason == raft.PublishTooManyDestinations {
-				code = codes.ResourceExhausted
-			}
-			return status.Error(code, rejection.Error())
+			return publishRejectionStatus(rejection)
 		}
 		return fmt.Errorf("failed to do raft proposal: %w", proposeErr)
 	}
 
 	return nil
+}
+
+func publishRejectionStatus(rejection *raft.PublishRejectedError) error {
+	code := codes.FailedPrecondition
+	switch rejection.Reason {
+	case raft.PublishTopicNotFound:
+		code = codes.NotFound
+	case raft.PublishTooManyDestinations:
+		code = codes.ResourceExhausted
+	}
+	return status.Error(code, rejection.Error())
 }
 
 // waitForLeaderAck waits for local persistence or successful application, which
@@ -403,12 +410,19 @@ func (ph *ProducerHandler) publishReceipts(ctx context.Context, batch *pb.Publis
 		if _, ok := result[msg.Topic]; ok {
 			continue
 		}
+		exists, err := raft.TopicExists(a.DB, msg.Topic)
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "read topic: %v", err)
+		}
+		if !exists {
+			return nil, publishRejectionStatus(&raft.PublishRejectedError{Reason: raft.PublishTopicNotFound, Topic: msg.Topic})
+		}
 		names, err := raft.ReadSubscriptionRecipients(a.DB, msg.Topic)
 		if err != nil {
 			return nil, status.Errorf(codes.Internal, "read durable subscriptions: %v", err)
 		}
 		if len(names) == 0 {
-			return nil, status.Errorf(codes.FailedPrecondition, "topic %q has no registered destinations", msg.Topic)
+			return nil, publishRejectionStatus(&raft.PublishRejectedError{Reason: raft.PublishNoDestinations, Topic: msg.Topic})
 		}
 		data, err := raft.MarshalPublishReceipt(0, names)
 		if err != nil {

@@ -118,6 +118,7 @@ func openRaftAdmissionTest(t *testing.T) (*app.App, *ProducerHandler, *observedA
 	// admission scans must move into apply for quorum, and remain for early ACKs.
 	observed := &admissionReadDB{DB: a.DB}
 	a.DB = observed
+	require.NoError(t, a.Subscriptions.CreateTopic(context.Background(), "orders", nil))
 	return a, NewProducerHandler(zap.NewNop()), sm, observed
 }
 
@@ -186,11 +187,17 @@ func TestRaftPublishAdmissionReadCountsAndAllAckModes(t *testing.T) {
 		require.NoError(t, err)
 		require.ElementsMatch(t, []string{group.Recipient, universal.Recipient}, state.Recipients)
 	}
+	require.NoError(t, a.Subscriptions.CreateTopic(ctx, "empty", nil))
 	for _, mode := range []pb.AckLevel{pb.AckLevel_ACK_LEVEL_QUORUM, pb.AckLevel_ACK_LEVEL_LEADER, pb.AckLevel_ACK_LEVEL_NO_ACK} {
 		reads := sm.reads.Load()
-		ack, err := producer.processBatch(ctx, &pb.PublishBatch{AckLevel: mode, Messages: []*pb.PublishMessage{{Topic: "orders"}, {Topic: "missing"}}})
-		require.Equal(t, codes.FailedPrecondition, status.Code(err))
-		require.False(t, ack.Success)
+		for _, rejection := range []struct {
+			topic string
+			code  codes.Code
+		}{{"missing", codes.NotFound}, {"empty", codes.FailedPrecondition}} {
+			ack, err := producer.processBatch(ctx, &pb.PublishBatch{AckLevel: mode, Messages: []*pb.PublishMessage{{Topic: "orders"}, {Topic: rejection.topic}}})
+			require.Equal(t, rejection.code, status.Code(err))
+			require.False(t, ack.Success)
+		}
 		if mode == pb.AckLevel_ACK_LEVEL_QUORUM {
 			require.Equal(t, reads, sm.reads.Load())
 		}

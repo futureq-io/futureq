@@ -1,11 +1,14 @@
 # gRPC API
 
-FutureQ speaks gRPC; protobuf definitions live in [futureq-io/protocol](https://github.com/futureq-io/protocol). The server registers three services: `futureq.FutureQProducer`, `futureq.FutureQConsumer`, and `futureq.FutureQCluster`.
+FutureQ speaks gRPC. The server registers `futureq.FutureQTopic`, `futureq.FutureQProducer`, `futureq.FutureQConsumer`, and `futureq.FutureQCluster`. [Protobuf definitions](https://github.com/futureq-io/protocol)
 
 ## Services overview
 
 | RPC              | Service  | Type            | Description |
 | ---------------- | -------- | --------------- | ----------- |
+| `CreateTopic` | Topic | unary | Declare a topic with optional initial subscriptions |
+| `GetTopic` | Topic | unary | Look up a declared topic by name |
+| `ListTopics` | Topic | unary | List declared topics in name order |
 | `PublishStream`  | Producer | bidi streaming  | Publish batches of delayed messages; receive per-batch acks |
 | `CreateSubscription` | Consumer | unary | Create durable interest, independently of worker connections |
 | `Unsubscribe` | Consumer | unary | Remove interest and discard its pending deliveries |
@@ -16,12 +19,38 @@ FutureQ speaks gRPC; protobuf definitions live in [futureq-io/protocol](https://
 | `JoinMetadata`   | Cluster  | unary           | Add a non-voting observer to the metadata group (SDKs/brokers) |
 | `LeaveMetadata`  | Cluster  | unary           | Remove a metadata observer |
 
+## Topic provisioning
+
+Call `CreateTopic` before publishing or creating subscriptions. A topic name
+must be valid UTF-8, 1–255 bytes long, and free of control characters.
+
+You can declare a topic and up to 256 initial subscriptions in one atomic RPC.
+Every initial subscription sets exactly one of `group_id` and `subscriber_id`.
+Repeating the request adds any missing subscriptions and keeps the generations
+of active subscriptions. This example provisions an email topic with a group
+that can queue jobs before its workers start.
+
+```json
+{
+  "name": "email.send",
+  "initial_subscriptions": [
+    { "group_id": "mailers" }
+  ]
+}
+```
+
+`GetTopic` returns `NotFound` for an undeclared name. `ListTopics` includes
+topics without subscriptions. Use the returned `next_page_token` as the next
+request's `page_token` until it is empty. The default page size is 100 and the
+maximum is 256.
+
 ## PublishStream
 
 `/futureq.FutureQProducer/PublishStream` — bidi stream of `PublishBatch` → `PublishBatchAck`.
 
 - Each `PublishBatch` carries `messages` (topic, payload, delay_ms, ttl_ms, optional indexes) and an `ack_level`.
-- Exactly one `PublishBatchAck{success, error_message}` is sent per received batch — **batch-level** semantics: the batch fails atomically (no partial write) on negative delays/TTLs, a too-weak ack level, or non-leader contact in Raft mode. On failure the RPC-level gRPC status also carries the error.
+- Each accepted batch receives one `PublishBatchAck`. A rejected batch writes no
+  messages and closes the stream with a gRPC error.
 - An empty batch returns a default (unsuccessful) ack and performs no write.
 - Client half-close (EOF) ends the stream cleanly.
 - Ack levels: `QUORUM` (default; returns after quorum commit and successful admission during apply), `LEADER` (returns after the leader durably persists the entry with frozen destinations — see [ack levels](clustering.md#publish-ack-levels)), `NO_ACK` (submission only, with preselected destinations). The broker's `publish.minAckLevel` floors what clients may request.
@@ -30,8 +59,8 @@ FutureQ speaks gRPC; protobuf definitions live in [futureq-io/protocol](https://
   payload. Every active durable group or universal subscription is included,
   even with zero connected workers. Later subscriptions receive only future
   publications.
-- If any topic in a batch has no subscriptions, the whole batch fails with
-  `FailedPrecondition`. Call `CreateSubscription` before publishing.
+- If any topic in a batch is undeclared, the whole batch fails with `NotFound`.
+  A declared topic with no durable destinations fails with `FailedPrecondition`.
 - Quorum admission uses subscription state at the publish entry in Raft order;
   it needs no separate admission read. Leader and no-ACK modes select destinations
   before proposal using a fresh registry read. An unroutable batch writes no
@@ -43,12 +72,14 @@ FutureQ speaks gRPC; protobuf definitions live in [futureq-io/protocol](https://
 Both RPCs take `SubscriptionRequest{topic, group_id, subscriber_id}`. Set exactly
 one of `group_id` and `subscriber_id`; invalid identities return `InvalidArgument`.
 
-`CreateSubscription` is idempotent while that identity exists. It returns a
+`CreateSubscription` requires a declared topic and returns `NotFound` if the
+topic is missing. It is idempotent while that identity exists and returns a
 `SubscriptionResponse` including its generation and creates durable interest
 without a worker connection. `group_id` identifies competing workers;
 `subscriber_id` identifies an independent universal subscriber across reconnects.
 
-`Unsubscribe` is idempotent and deactivates interest. Bounded background cleanup
+`Unsubscribe` is idempotent and deactivates interest. The topic stays registered
+when its last subscription is removed or expires. Bounded background cleanup
 discards only its pending deliveries. Other subscriptions remain unaffected;
 worker sends can overlap until removal is observed. Recreating the name creates
 a fresh generation with no old backlog. Neither consumer disconnects nor stream

@@ -113,7 +113,7 @@ func TestPublishBoundRaftFollowerReconnectAndRestart(t *testing.T) {
 	defer cancel()
 	node := c.nodes[1]
 	for _, group := range []string{"a", "b"} {
-		cmd, err := raft.MarshalSubscriptionCommand(&deliverypb.SubscriptionCommand{Operation: raft.SubscriptionCreate, NowMs: time.Now().UnixMilli(), Mutations: []*deliverypb.SubscriptionMutation{{Topic: "orders", GroupId: group, Recipient: "g:s:" + group}}})
+		cmd, err := raft.MarshalSubscriptionCommand(&deliverypb.SubscriptionCommand{Operation: raft.TopicCreate, Topic: "orders", NowMs: time.Now().UnixMilli(), Mutations: []*deliverypb.SubscriptionMutation{{Topic: "orders", GroupId: group, Recipient: "g:s:" + group}}})
 		require.NoError(t, err)
 		_, err = node.nh.SyncPropose(ctx, node.nh.GetNoOPSession(replicaTestShard), cmd)
 		require.NoError(t, err)

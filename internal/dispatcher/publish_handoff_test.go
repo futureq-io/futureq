@@ -29,7 +29,7 @@ func TestPublishHandoffPreservesReservedMessagesAndCachedPayload(t *testing.T) {
 			}
 			if mode == "quorum" {
 				command, err := raft.MarshalSubscriptionCommand(&deliverypb.SubscriptionCommand{
-					Operation: raft.SubscriptionCreate, NowMs: time.Now().UnixMilli(),
+					Operation: raft.TopicCreate, Topic: "orders", NowMs: time.Now().UnixMilli(),
 					Mutations: []*deliverypb.SubscriptionMutation{{Topic: "orders", GroupId: "workers", Recipient: "g:s:workers"}},
 				})
 				require.NoError(t, err)

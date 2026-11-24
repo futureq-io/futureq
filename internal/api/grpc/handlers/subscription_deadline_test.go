@@ -20,6 +20,7 @@ func TestRaftSubscriptionRPCsWithoutClientDeadline(t *testing.T) {
 	listener := bufconn.Listen(1 << 20)
 	server := grpc.NewServer()
 	pb.RegisterFutureQConsumerServer(server, NewConsumerHandler(zap.NewNop(), nil, nil))
+	pb.RegisterFutureQTopicServer(server, &TopicHandler{})
 	go server.Serve(listener) //nolint:errcheck
 	t.Cleanup(func() { server.Stop(); _ = listener.Close() })
 	conn, err := grpc.NewClient("passthrough:///subscription-deadlines",
@@ -32,6 +33,18 @@ func TestRaftSubscriptionRPCsWithoutClientDeadline(t *testing.T) {
 	t.Cleanup(cancel)
 	_, hasDeadline := ctx.Deadline()
 	require.False(t, hasDeadline)
+	topics := pb.NewFutureQTopicClient(conn)
+	for _, name := range []string{"create", "remove"} {
+		topic, err := topics.CreateTopic(ctx, &pb.CreateTopicRequest{Name: name})
+		require.NoError(t, err)
+		require.Equal(t, name, topic.GetName())
+	}
+	topic, err := topics.GetTopic(ctx, &pb.GetTopicRequest{Name: "create"})
+	require.NoError(t, err)
+	require.Equal(t, "create", topic.GetName())
+	page, err := topics.ListTopics(ctx, &pb.ListTopicsRequest{})
+	require.NoError(t, err)
+	require.Len(t, page.GetTopics(), 3)
 	for _, identity := range []struct {
 		name, group, subscriber string
 	}{{"group", "workers", ""}, {"universal", "", "audit"}} {

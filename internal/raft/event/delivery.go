@@ -142,6 +142,7 @@ func MarshalAckDeliveryBatchCmd(acks []DeliveryAck) ([]byte, error) {
 // Call Flush before committing the storage batch to persist final receipts.
 type DeliveryBatch struct {
 	subscriptions map[string]*deliverypb.SubscriptionRecord
+	createdTopics map[string]struct{}
 	db            storage.DB
 	batch         storage.Batch
 	states        map[string]*DeliveryState
