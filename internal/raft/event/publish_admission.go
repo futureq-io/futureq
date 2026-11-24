@@ -89,6 +89,48 @@ func CheckPublishResult(result statemachine.Result, expected int) error {
 	return fmt.Errorf("unexpected publish admission result")
 }
 
+// PublishRecipientsQuery selects durable recipients for standalone and early-ACK
+// publishes. The Raft lookup holds the recovery guard for the entire batch.
+type PublishRecipientsQuery []string
+
+type PublishRecipientsResult struct {
+	Recipients map[string][]string
+	Err        error
+}
+
+func (q PublishRecipientsQuery) readForLookup(db storage.DB) (any, error) {
+	// Keep admission results separate from failures of the Raft read itself.
+	return q.Read(db), nil
+}
+
+func (q PublishRecipientsQuery) Read(db storage.DB) PublishRecipientsResult {
+	result := make(map[string][]string)
+	for _, topic := range q {
+		if _, seen := result[topic]; seen {
+			continue
+		}
+		exists, err := TopicExists(db, topic)
+		if err != nil {
+			return PublishRecipientsResult{Err: fmt.Errorf("read topic: %w", err)}
+		}
+		if !exists {
+			return PublishRecipientsResult{Err: &PublishRejectedError{Reason: PublishTopicNotFound, Topic: topic}}
+		}
+		names, err := ReadSubscriptionRecipients(db, topic)
+		if err != nil {
+			return PublishRecipientsResult{Err: fmt.Errorf("read durable subscriptions: %w", err)}
+		}
+		if len(names) == 0 {
+			return PublishRecipientsResult{Err: &PublishRejectedError{Reason: PublishNoDestinations, Topic: topic}}
+		}
+		if len(names) > MaxDeliveryRecipients {
+			return PublishRecipientsResult{Err: &PublishRejectedError{Reason: PublishTooManyDestinations, Topic: topic}}
+		}
+		result[topic] = names
+	}
+	return PublishRecipientsResult{Recipients: result}
+}
+
 // subscriptionRecipients merges the persisted topic range with mutations from
 // earlier entries in this Update. A DB-only scan would miss create/remove or
 // unsubscribe/recreate commands that have not reached the storage commit yet.

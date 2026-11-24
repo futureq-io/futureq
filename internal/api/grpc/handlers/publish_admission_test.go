@@ -3,6 +3,7 @@ package handlers
 import (
 	"bytes"
 	"context"
+	"errors"
 	"net"
 	"path/filepath"
 	"sync"
@@ -40,15 +41,19 @@ func (db *admissionReadDB) Scan(opts *storage.IterOptions, yield func([]byte, []
 
 type observedAdmissionSM struct {
 	statemachine.IOnDiskStateMachine
-	reads    atomic.Int64
-	mu       sync.Mutex
-	commands [][]byte
-	block    <-chan struct{}
-	entered  chan struct{}
+	reads                atomic.Int64
+	admissionUnavailable atomic.Bool
+	mu                   sync.Mutex
+	commands             [][]byte
+	block                <-chan struct{}
+	entered              chan struct{}
 }
 
 func (sm *observedAdmissionSM) Lookup(query interface{}) (interface{}, error) {
 	sm.reads.Add(1)
+	if _, ok := query.(raft.PublishRecipientsQuery); ok && sm.admissionUnavailable.Load() {
+		return nil, errors.New("snapshot recovery in progress")
+	}
 	return sm.IOnDiskStateMachine.Lookup(query)
 }
 func (sm *observedAdmissionSM) Update(entries []statemachine.Entry) ([]statemachine.Entry, error) {
@@ -115,7 +120,7 @@ func openRaftAdmissionTest(t *testing.T) (*app.App, *ProducerHandler, *observedA
 	t.Cleanup(func() { nh.Close(); require.NoError(t, a.DB.Close()); app.A = previous })
 	require.Eventually(t, func() bool { id, _, valid, err := nh.GetLeaderID(1); return err == nil && valid && id == 1 }, 5*time.Second, 10*time.Millisecond)
 	// The application facade is observed separately from state-machine storage:
-	// admission scans must move into apply for quorum, and remain for early ACKs.
+	// quorum admission scans during apply, and early ACKs scan during lookup.
 	observed := &admissionReadDB{DB: a.DB}
 	a.DB = observed
 	require.NoError(t, a.Subscriptions.CreateTopic(context.Background(), "orders", nil))
@@ -170,7 +175,7 @@ func TestRaftPublishAdmissionReadCountsAndAllAckModes(t *testing.T) {
 				expected = 0
 			}
 			require.Equal(t, expected, sm.reads.Load()-reads, "admission SyncRead calls")
-			require.Equal(t, expected, db.scans.Load()-scans, "handler-side subscription scans")
+			require.Equal(t, int64(0), db.scans.Load()-scans, "admission must not scan outside the state machine")
 		})
 	}
 	require.Eventually(t, func() bool { return len(publishedKeys(t, a.DB)) == 3 }, time.Second, time.Millisecond)
@@ -210,6 +215,37 @@ func TestRaftPublishAdmissionReadCountsAndAllAckModes(t *testing.T) {
 	require.Equal(t, codes.InvalidArgument, status.Code(err))
 	require.False(t, ack.Success)
 }
+
+func TestRaftEarlyAckRejectsUnavailableAdmissionBeforeProposal(t *testing.T) {
+	a, producer, sm, _ := openRaftAdmissionTest(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_, err := a.Subscriptions.Create(ctx, "orders", "workers", "")
+	require.NoError(t, err)
+
+	modes := []pb.AckLevel{pb.AckLevel_ACK_LEVEL_LEADER, pb.AckLevel_ACK_LEVEL_NO_ACK}
+	sm.admissionUnavailable.Store(true)
+	for _, mode := range modes {
+		ack, err := producer.processBatch(ctx, &pb.PublishBatch{
+			AckLevel: mode, Messages: []*pb.PublishMessage{{Topic: "orders"}},
+		})
+		require.Equal(t, codes.Unavailable, status.Code(err), mode.String())
+		require.False(t, ack.GetSuccess())
+	}
+	require.Empty(t, sm.publishedCommands())
+	require.Empty(t, publishedKeys(t, a.DB))
+
+	sm.admissionUnavailable.Store(false)
+	for _, mode := range modes {
+		ack, err := producer.processBatch(ctx, &pb.PublishBatch{
+			AckLevel: mode, Messages: []*pb.PublishMessage{{Topic: "orders"}},
+		})
+		require.NoError(t, err, mode.String())
+		require.True(t, ack.GetSuccess())
+	}
+	require.Eventually(t, func() bool { return len(publishedKeys(t, a.DB)) == len(modes) }, time.Second, time.Millisecond)
+}
+
 func TestRaftEarlyAcksStillReturnBeforeApply(t *testing.T) {
 	a, producer, sm, _ := openRaftAdmissionTest(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

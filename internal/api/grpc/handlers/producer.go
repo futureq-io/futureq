@@ -398,37 +398,40 @@ func (ph *ProducerHandler) processStandaloneBatch(batch *pb.PublishBatch, nowMs 
 // Only the early-ACK Raft path performs this admission quorum read.
 func (ph *ProducerHandler) publishReceipts(ctx context.Context, batch *pb.PublishBatch) (map[string][]byte, error) {
 	a := app.A
-	if a.NodeHost != nil {
+	query := make(raft.PublishRecipientsQuery, len(batch.Messages))
+	for i, msg := range batch.Messages {
+		query[i] = msg.Topic
+	}
+	var admission raft.PublishRecipientsResult
+	if a.NodeHost == nil {
+		admission = query.Read(a.DB)
+	} else {
 		callCtx, cancel := context.WithTimeout(ctx, a.Config().Publish.ProposalTimeout)
 		defer cancel()
-		if _, err := a.NodeHost.SyncRead(callCtx, a.Config().Cluster.ShardID, nil); err != nil {
+		value, err := a.NodeHost.SyncRead(callCtx, a.Config().Cluster.ShardID, query)
+		if err != nil {
 			return nil, status.Errorf(codes.Unavailable, "subscription registry unavailable: %v", err)
 		}
+		var ok bool
+		admission, ok = value.(raft.PublishRecipientsResult)
+		if !ok {
+			return nil, status.Error(codes.Internal, "unexpected publish admission result")
+		}
 	}
-	result := make(map[string][]byte)
-	for _, msg := range batch.Messages {
-		if _, ok := result[msg.Topic]; ok {
-			continue
+	if admission.Err != nil {
+		var rejection *raft.PublishRejectedError
+		if errors.As(admission.Err, &rejection) {
+			return nil, publishRejectionStatus(rejection)
 		}
-		exists, err := raft.TopicExists(a.DB, msg.Topic)
-		if err != nil {
-			return nil, status.Errorf(codes.Internal, "read topic: %v", err)
-		}
-		if !exists {
-			return nil, publishRejectionStatus(&raft.PublishRejectedError{Reason: raft.PublishTopicNotFound, Topic: msg.Topic})
-		}
-		names, err := raft.ReadSubscriptionRecipients(a.DB, msg.Topic)
-		if err != nil {
-			return nil, status.Errorf(codes.Internal, "read durable subscriptions: %v", err)
-		}
-		if len(names) == 0 {
-			return nil, publishRejectionStatus(&raft.PublishRejectedError{Reason: raft.PublishNoDestinations, Topic: msg.Topic})
-		}
+		return nil, status.Error(codes.Internal, admission.Err.Error())
+	}
+	result := make(map[string][]byte, len(admission.Recipients))
+	for topic, names := range admission.Recipients {
 		data, err := raft.MarshalPublishReceipt(0, names)
 		if err != nil {
 			return nil, status.Errorf(codes.ResourceExhausted, "publish destinations: %v", err)
 		}
-		result[msg.Topic] = data
+		result[topic] = data
 	}
 	return result, nil
 }

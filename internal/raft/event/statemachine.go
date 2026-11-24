@@ -237,8 +237,12 @@ func (s *EventStateMachine) Sync() error {
 	return s.db.Flush()
 }
 
+type recoveryGuardedRead interface {
+	readForLookup(storage.DB) (any, error)
+}
+
 func (s *EventStateMachine) Lookup(query interface{}) (interface{}, error) {
-	catalog, ok := query.(TopicCatalogQuery)
+	read, ok := query.(recoveryGuardedRead)
 	if !ok {
 		return nil, nil
 	}
@@ -249,7 +253,7 @@ func (s *EventStateMachine) Lookup(query interface{}) (interface{}, error) {
 	if s.recoveryPending {
 		return nil, errTopicCatalogUnavailable
 	}
-	return catalog.Read(s.db)
+	return read.readForLookup(s.db)
 }
 
 type eventSnapshot struct {

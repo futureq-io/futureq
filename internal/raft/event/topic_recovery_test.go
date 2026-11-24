@@ -30,6 +30,7 @@ func TestTopicCatalogRejectsReadsUntilSnapshotRecoveryCompletes(t *testing.T) {
 	sm, _ := newDeliveryTestSM(t)
 	cmd, err := MarshalSubscriptionCommand(&deliverypb.SubscriptionCommand{
 		Operation: TopicCreate, Topic: "orders", NowMs: 1000,
+		Mutations: []*deliverypb.SubscriptionMutation{{Topic: "orders", GroupId: "workers", Recipient: "g:s:workers"}},
 	})
 	require.NoError(t, err)
 	applyAdmissionSequence(t, sm, cmd)
@@ -41,6 +42,7 @@ func TestTopicCatalogRejectsReadsUntilSnapshotRecoveryCompletes(t *testing.T) {
 
 	get := TopicCatalogQuery{Name: "orders"}
 	list := TopicCatalogQuery{Limit: 10}
+	publish := PublishRecipientsQuery{"orders"}
 	checkCatalog := func() {
 		t.Helper()
 		result, err := sm.Lookup(get)
@@ -49,10 +51,13 @@ func TestTopicCatalogRejectsReadsUntilSnapshotRecoveryCompletes(t *testing.T) {
 		result, err = sm.Lookup(list)
 		require.NoError(t, err)
 		require.Equal(t, TopicCatalogResult{Names: []string{"orders"}}, result)
+		result, err = sm.Lookup(publish)
+		require.NoError(t, err)
+		require.Equal(t, PublishRecipientsResult{Recipients: map[string][]string{"orders": {"g:s:workers"}}}, result)
 	}
 	checkUnavailable := func() {
 		t.Helper()
-		for _, query := range []TopicCatalogQuery{get, list} {
+		for _, query := range []any{get, list, publish} {
 			_, err := sm.Lookup(query)
 			require.ErrorIs(t, err, errTopicCatalogUnavailable)
 		}

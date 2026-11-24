@@ -33,6 +33,10 @@ type TopicCatalogResult struct {
 	Next   string
 }
 
+func (q TopicCatalogQuery) readForLookup(db storage.DB) (any, error) {
+	return q.Read(db)
+}
+
 // Read queries a consistent catalog view. Clustered callers use Lookup, which
 // guards this read against snapshot replacement.
 func (q TopicCatalogQuery) Read(db storage.DB) (TopicCatalogResult, error) {
