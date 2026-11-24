@@ -114,10 +114,6 @@ bounded ownership permits and actual-send fencing.
 - Go 1.27.1+
 - (Optional) Docker
 
-This branch uses the matching protocol branch in a sibling checkout at
-`../futureq-proto`. Run `go mod vendor` before a Docker build to include that
-protocol in the build context.
-
 ### Build & run a standalone node
 
 ```bash
@@ -135,6 +131,8 @@ A standalone node (`cluster.enabled: false`) writes directly to Pebble — perfe
 
 Declare `email.send` and a durable `mailers` group before starting producers or
 connecting workers. Jobs can then be published even while all workers are offline.
+
+The example uses `topic.proto` from a protocol checkout at `../futureq-proto`.
 
 ```bash
 grpcurl -plaintext -import-path ../futureq-proto/proto -proto topic.proto \
@@ -187,6 +185,7 @@ On first start the node contacts each seed until one accepts its `JoinCluster` r
 ### Docker
 
 ```bash
+go mod vendor
 docker build -t futureq .
 docker run -p 8443:8443 -p 9090:9090 -p 50005:50005 \
   -v $(pwd)/config.yaml:/app/config.yaml \
