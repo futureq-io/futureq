@@ -7,9 +7,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/futureq-io/futureq/internal/metrics"
 	raft "github.com/futureq-io/futureq/internal/raft/event"
 	"github.com/futureq-io/futureq/internal/storage"
 	pb "github.com/futureq-io/protocol/proto/go"
+	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/require"
 )
 
@@ -71,4 +73,32 @@ func TestPublishedDispatchReadsCurrentReceiptOnce(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestPublishedDispatchReportsReceiptReadFailureAndContinues(t *testing.T) {
+	d, _ := newPreloadTest(t, "pebble")
+	d.PrepareBatch = nil
+	d.PublishedReceipts = true
+	messages := make(chan *pb.QueueMessage, 3)
+	d.hub.Register("local", "orders", "workers", messages)
+	now := time.Now().UnixMilli()
+	corruptKey := putPipelineEvent(t, d, "orders", 1, now-1000)
+	putPipelineEvent(t, d, "orders", 2, now-1000) // Missing receipt is ordinary.
+	healthyKey := putPipelineEvent(t, d, "orders", 3, now-1000)
+	receipt, err := raft.MarshalPublishReceipt(d.hub.InterestView("orders").Epoch, []string{"g:workers"})
+	require.NoError(t, err)
+	batch := d.db.NewBatch()
+	require.NoError(t, batch.Set(raft.DeliveryStateKey(corruptKey), []byte("corrupt receipt")))
+	require.NoError(t, batch.Set(raft.DeliveryStateKey(healthyKey), receipt))
+	require.NoError(t, batch.Commit(storage.NoSync))
+	require.NoError(t, batch.Close())
+
+	counter := metrics.DeliveryRejectedTotal.WithLabelValues("receipt_read")
+	var before, after dto.Metric
+	require.NoError(t, counter.Write(&before))
+	require.Equal(t, 1, d.dispatchTopic("orders", now))
+	require.NoError(t, counter.Write(&after))
+	require.Equal(t, before.GetCounter().GetValue()+1, after.GetCounter().GetValue())
+	require.Len(t, messages, 1)
+	require.Equal(t, healthyKey, (<-messages).DeliveryTag)
 }

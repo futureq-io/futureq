@@ -480,7 +480,11 @@ func (d *Dispatcher) deliverChunk(chunk deliveryChunk, states map[string]*raft.D
 			if d.PublishedReceipts {
 				receiptReadTime += time.Since(readStarted)
 			}
-			if err != nil || current == nil || (!current.PublishBound && (d.PublishedReceipts || current.Epoch != item.Epoch)) {
+			if err != nil {
+				metrics.DeliveryRejectedTotal.WithLabelValues("receipt_read").Inc()
+				continue
+			}
+			if current == nil || (!current.PublishBound && (d.PublishedReceipts || current.Epoch != item.Epoch)) {
 				continue
 			}
 			manifest = current

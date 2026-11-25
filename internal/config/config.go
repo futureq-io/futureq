@@ -188,6 +188,19 @@ type Publish struct {
 	ProposalTimeout time.Duration `mapstructure:"proposalTimeout" yaml:"proposalTimeout"`
 }
 
+type ReceiptCache struct {
+	MaxBytes   Size `mapstructure:"maxBytes" yaml:"maxBytes"`
+	MaxEntries int  `mapstructure:"maxEntries" yaml:"maxEntries"`
+}
+
+// Bytes returns the decoded receipt budget. A zero budget disables the cache.
+func (c ReceiptCache) Bytes() (int64, error) {
+	if c.MaxBytes == "0B" {
+		return 0, nil
+	}
+	return c.MaxBytes.Bytes()
+}
+
 type Delivery struct {
 	ShardDistribution metadata.ShardDistribution `mapstructure:"shardDistribution" yaml:"shardDistribution"`
 
@@ -205,6 +218,7 @@ type Delivery struct {
 	ReadPermit                 time.Duration `mapstructure:"readPermit" yaml:"readPermit"`
 	DeleteBatchInterval        time.Duration `mapstructure:"deleteBatchInterval" yaml:"deleteBatchInterval"`
 	DeleteWorkers              int           `mapstructure:"deleteWorkers" yaml:"deleteWorkers"`
+	ReceiptCache               ReceiptCache  `mapstructure:"receiptCache" yaml:"receiptCache"`
 	AckQueueCapacity           int           `mapstructure:"ackQueueCapacity" yaml:"ackQueueCapacity"`
 	ConsumerRemovalWorkers     int           `mapstructure:"consumerRemovalWorkers" yaml:"consumerRemovalWorkers"`
 	TTLSweepInterval           time.Duration `mapstructure:"ttlSweepInterval" yaml:"ttlSweepInterval"`
@@ -510,6 +524,14 @@ func (c *Config) validatePublishAndDelivery() error {
 	}
 	if d.AckQueueCapacity < 1 || d.AckQueueCapacity > 1048576 {
 		return fmt.Errorf("delivery.ackQueueCapacity must be 1..1048576")
+	}
+	if _, err := d.ReceiptCache.Bytes(); err != nil {
+		return fmt.Errorf("delivery.receiptCache.maxBytes: %w", err)
+	}
+	const maxReceiptCacheEntries = 1 << 24
+	entries := d.ReceiptCache.MaxEntries
+	if entries < 1 || entries > maxReceiptCacheEntries || entries&(entries-1) != 0 {
+		return fmt.Errorf("delivery.receiptCache.maxEntries must be a power of two from 1 through %d", maxReceiptCacheEntries)
 	}
 	if d.PrepareBatchSize < 1 || d.PrepareBatchSize > 256 || d.ScanMaxKeys < d.PrepareBatchSize || d.ScanMaxKeys > 65536 {
 		return fmt.Errorf("delivery.prepareBatchSize must be 1..256 and scanMaxKeys must be between batch size and 65536")

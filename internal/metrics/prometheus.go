@@ -191,6 +191,23 @@ var (
 		Help: "Receipt lookups during successful Raft apply, by source: cache or pebble. Excludes reads served by the current batch.",
 	}, []string{"source"})
 
+	DeliveryApplyReceiptCacheRetainedBytes = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "futureq_delivery_apply_receipt_cache_retained_bytes",
+		Help: "Estimated bytes of retained receipts in the Raft apply cache, excluding its slot table.",
+	})
+	DeliveryApplyReceiptCacheEntries = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "futureq_delivery_apply_receipt_cache_entries",
+		Help: "Number of receipts retained in the Raft apply cache.",
+	})
+	DeliveryApplyReceiptCacheEvictionsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "futureq_delivery_apply_receipt_cache_evictions_total",
+		Help: "Receipts evicted from the Raft apply cache by slot collision or byte limit.",
+	}, []string{"reason"})
+	DeliveryApplyReceiptCacheBudgetRejectionsTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "futureq_delivery_apply_receipt_cache_budget_rejections_total",
+		Help: "Receipt cache admissions rejected because one receipt exceeded the entire byte budget.",
+	})
+
 	// ─── Payload Cache ─────────────────────────────────────────────────────────────
 	DeliveryWorkerOutcomesTotal      = promauto.NewCounterVec(prometheus.CounterOpts{Name: "futureq_delivery_worker_outcomes_total", Help: "Bounded delivery job outcomes; failures and unavailable recipients recover through cyclic scans."}, []string{"outcome"})
 	DeliveryRepairScansTotal         = promauto.NewCounter(prometheus.CounterOpts{Name: "futureq_delivery_repair_scans_total", Help: "Bounded cyclic due discovery passes, including initial discovery, retry and late-arrival repair."})
