@@ -147,7 +147,7 @@ func startRun(cmd *cobra.Command, _ []string) {
 		dispatchInterval, inFlightTimeout,
 		wakeCh, logger,
 	)
-	disp.PrepareBatch = ledger.PublishedBatch
+	disp.PublishedReceipts = true
 	disp.HeapType = cfg.Delivery.HeapType
 	logger.Info("delivery heap selected", zap.String("heapType", string(disp.HeapType)))
 	disp.TimeBucket = cfg.Delivery.TimeBucket

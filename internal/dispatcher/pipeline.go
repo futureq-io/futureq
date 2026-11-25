@@ -391,6 +391,9 @@ func (d *Dispatcher) prepareChunk(ctx context.Context, chunk deliveryChunk) (map
 	if chunk.maintenance && d.ReconcileBatch != nil {
 		return d.ReconcileBatch(ctx, chunk.items)
 	}
+	if d.PublishedReceipts && !chunk.maintenance {
+		return nil, nil // validate the receipt immediately before enqueueing
+	}
 	if d.PrepareBatch != nil {
 		return d.PrepareBatch(ctx, chunk.items)
 	}
@@ -417,6 +420,14 @@ func (d *Dispatcher) deliverChunk(chunk deliveryChunk, states map[string]*raft.D
 	defer func() {
 		metrics.DispatchPassDurationMs.Observe(float64(time.Since(chunk.started).Microseconds()) / 1000)
 	}()
+	preparedReceipts := d.PrepareBatch != nil || d.PrepareDelivery != nil
+	usesReceipts := d.PublishedReceipts || preparedReceipts
+	var receiptReadTime time.Duration
+	if d.PublishedReceipts {
+		defer func() {
+			metrics.DeliveryPrepareDurationMs.WithLabelValues("batch").Observe(float64(receiptReadTime.Microseconds()) / 1000)
+		}()
+	}
 	delivered := 0
 	for _, item := range chunk.items {
 		if chunk.generation != nil && !chunk.generation.Load() {
@@ -430,14 +441,14 @@ func (d *Dispatcher) deliverChunk(chunk deliveryChunk, states map[string]*raft.D
 			break
 		}
 		manifest := states[string(item.Key)]
-		if (d.PrepareBatch != nil || d.PrepareDelivery != nil) && manifest == nil {
+		if !d.PublishedReceipts && preparedReceipts && manifest == nil {
 			continue
 		}
 		payload := chunk.payloads[string(item.Key)]
 		msg := payload.message
 		// Receipt-backed delivery can reuse immutable payload bytes. Adapters
 		// without a delivery ledger still need a Get to check existence.
-		if msg != nil && (d.PrepareBatch != nil || d.PrepareDelivery != nil) {
+		if msg != nil && usesReceipts {
 			metrics.DeliveryPayloadCacheTotal.WithLabelValues("cache").Inc()
 		} else {
 			metrics.DeliveryPayloadCacheTotal.WithLabelValues("fallback").Inc()
@@ -457,9 +468,19 @@ func (d *Dispatcher) deliverChunk(chunk deliveryChunk, states map[string]*raft.D
 		}
 		// Receipt existence and ACK bits remain authoritative after preparation. A
 		// snapshot can replace receipts while retaining the same event key.
-		if d.PrepareBatch != nil || d.PrepareDelivery != nil {
+		if usesReceipts {
+			var readStarted time.Time
+			if d.PublishedReceipts {
+				if receiptReadTime >= d.Limits.ValidationTimeout {
+					break
+				}
+				readStarted = time.Now()
+			}
 			current, err := raft.ReadDeliveryState(d.db, item.Key)
-			if err != nil || current == nil || (!current.PublishBound && current.Epoch != item.Epoch) {
+			if d.PublishedReceipts {
+				receiptReadTime += time.Since(readStarted)
+			}
+			if err != nil || current == nil || (!current.PublishBound && (d.PublishedReceipts || current.Epoch != item.Epoch)) {
 				continue
 			}
 			manifest = current

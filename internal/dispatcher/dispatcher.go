@@ -49,6 +49,7 @@ type Dispatcher struct {
 	inFlight           sync.Map // key: string(pebbleKey) → *inFlightEntry
 	// Installed before Run. Cluster reads also refresh the bounded metadata permit.
 	ReadBarrier                func() error
+	PublishedReceipts          bool                                              // read the committed receipt just before enqueueing
 	PrepareDelivery            func(string, []byte) (*raft.DeliveryState, error) // legacy single-key hook
 	PrepareBatch               func(context.Context, []raft.DeliveryPrepare) (map[string]*raft.DeliveryState, error)
 	ReconcileBatch             func(context.Context, []raft.DeliveryPrepare) (map[string]*raft.DeliveryState, error)

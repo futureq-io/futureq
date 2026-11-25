@@ -186,6 +186,11 @@ var (
 		Help: "Total failed batched delete flushes.",
 	})
 
+	DeliveryApplyReceiptLookupsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "futureq_delivery_apply_receipt_lookups_total",
+		Help: "Receipt lookups during successful Raft apply, by source: cache or pebble. Excludes reads served by the current batch.",
+	}, []string{"source"})
+
 	// ─── Payload Cache ─────────────────────────────────────────────────────────────
 	DeliveryWorkerOutcomesTotal      = promauto.NewCounterVec(prometheus.CounterOpts{Name: "futureq_delivery_worker_outcomes_total", Help: "Bounded delivery job outcomes; failures and unavailable recipients recover through cyclic scans."}, []string{"outcome"})
 	DeliveryRepairScansTotal         = promauto.NewCounter(prometheus.CounterOpts{Name: "futureq_delivery_repair_scans_total", Help: "Bounded cyclic due discovery passes, including initial discovery, retry and late-arrival repair."})

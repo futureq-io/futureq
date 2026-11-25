@@ -29,6 +29,7 @@ type EventStateMachine struct {
 	repo            *repository.EventRepository
 	lastApplied     uint64
 	lastPersistedID uint64
+	receipts        receiptCache
 	logger          *zap.Logger
 	// Dragonboat allows Lookup to run concurrently with snapshot recovery.
 	catalogMu       sync.RWMutex
@@ -183,6 +184,7 @@ func (s *EventStateMachine) applyEntry(batch storage.Batch, delivery *DeliveryBa
 func (s *EventStateMachine) Update(entries []statemachine.Entry) ([]statemachine.Entry, error) {
 	batch := s.db.NewBatch()
 	delivery := NewDeliveryBatch(s.db, batch)
+	delivery.receipts = &s.receipts
 
 	defer batch.Close() //nolint:errcheck
 
@@ -222,6 +224,7 @@ func (s *EventStateMachine) Update(entries []statemachine.Entry) ([]statemachine
 	if err := batch.Commit(storage.NoSync); err != nil {
 		return nil, err
 	}
+	s.receipts.commit(delivery)
 	s.lastApplied = lastApplied
 	s.lastPersistedID = lastID
 	s.repo.ObserveID(lastID)
@@ -333,6 +336,7 @@ func (s *EventStateMachine) RecoverFromSnapshot(r io.Reader, stopc <-chan struct
 	// If recovery fails after clearing the database, catalog reads must still
 	// fail until a complete snapshot has been restored.
 	s.recoveryPending = true
+	s.receipts = receiptCache{}
 
 	if err := s.clearDB(stopc); err != nil {
 		return err
