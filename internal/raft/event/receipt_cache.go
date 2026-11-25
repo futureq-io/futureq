@@ -64,8 +64,16 @@ func (c *receiptCache) get(key string) *DeliveryState {
 func (c *receiptCache) commit(batch *DeliveryBatch) {
 	if c.maxBytes > 0 {
 		bytesBefore, entriesBefore := c.bytes, c.entries
+		// Free space from committed deletes before other changes can evict live receipts.
 		for key, state := range batch.states {
-			c.store(key, state)
+			if state == nil {
+				c.store(key, nil)
+			}
+		}
+		for key, state := range batch.states {
+			if state != nil {
+				c.store(key, state)
+			}
 		}
 		if c.bytes != bytesBefore || c.entries != entriesBefore {
 			c.observeSize()

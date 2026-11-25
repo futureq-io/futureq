@@ -212,6 +212,8 @@ func (d *Dispatcher) runPipeline(parent context.Context) {
 						if states == nil {
 							callCtx, stop := context.WithTimeout(ctx, d.Limits.ValidationTimeout)
 							states, err = d.prepareChunk(callCtx, job.chunk)
+							validationDeadline, _ := callCtx.Deadline()
+							job.chunk.validationTime = d.Limits.ValidationTimeout - time.Until(validationDeadline)
 							stop()
 						}
 						result.err = err

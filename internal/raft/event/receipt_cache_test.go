@@ -223,3 +223,23 @@ func TestReceiptCacheAdmitsNewSlotsWhenBudgetIsFull(t *testing.T) {
 	require.Equal(t, 1, cache.entries)
 	require.LessOrEqual(t, cache.bytes, cache.maxBytes)
 }
+
+func TestReceiptCacheCommitFreesDeletedSlotsBeforeAdmission(t *testing.T) {
+	oldest := string(utils.EventKey(1, 2, 1))
+	acknowledged := string(utils.EventKey(1, 2, 2))
+	published := string(utils.EventKey(1, 2, 3))
+	state := newDeliveryState(1, []string{"g:a"})
+
+	// Map iteration order varies. The outcome must be the same for either order.
+	for range 64 {
+		cache := newReceiptCache(256, 8)
+		cache.store(oldest, state)
+		cache.store(acknowledged, state)
+		cache.commit(&DeliveryBatch{states: map[string]*DeliveryState{published: state, acknowledged: nil}})
+
+		require.Same(t, state, cache.get(oldest))
+		require.Nil(t, cache.get(acknowledged))
+		require.Same(t, state, cache.get(published))
+		require.Equal(t, 2, cache.entries)
+	}
+}

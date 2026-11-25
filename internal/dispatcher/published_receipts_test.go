@@ -94,11 +94,78 @@ func TestPublishedDispatchReportsReceiptReadFailureAndContinues(t *testing.T) {
 	require.NoError(t, batch.Close())
 
 	counter := metrics.DeliveryRejectedTotal.WithLabelValues("receipt_read")
-	var before, after dto.Metric
+	var before, after, hitsBefore, hitsAfter dto.Metric
 	require.NoError(t, counter.Write(&before))
+	require.NoError(t, metrics.DeliveryManifestHitsTotal.Write(&hitsBefore))
 	require.Equal(t, 1, d.dispatchTopic("orders", now))
 	require.NoError(t, counter.Write(&after))
+	require.NoError(t, metrics.DeliveryManifestHitsTotal.Write(&hitsAfter))
 	require.Equal(t, before.GetCounter().GetValue()+1, after.GetCounter().GetValue())
+	require.Equal(t, hitsBefore.GetCounter().GetValue()+1, hitsAfter.GetCounter().GetValue())
 	require.Len(t, messages, 1)
 	require.Equal(t, healthyKey, (<-messages).DeliveryTag)
+}
+
+type slowPublishedReadDB struct {
+	storage.DB
+	key   []byte
+	delay time.Duration
+}
+
+func (db slowPublishedReadDB) Get(key []byte) ([]byte, io.Closer, error) {
+	if bytes.Equal(key, db.key) {
+		time.Sleep(db.delay)
+	}
+	return db.DB.Get(key)
+}
+
+func TestPublishedReceiptUsesRemainingValidationBudget(t *testing.T) {
+	for _, slowRead := range []string{"preparation_payload", "delivery_payload", "receipt"} {
+		t.Run(slowRead, func(t *testing.T) {
+			d, _ := newPreloadTest(t, "pebble")
+			d.PrepareBatch = nil
+			d.PublishedReceipts = true
+			d.Limits.ValidationTimeout = 20 * time.Millisecond
+			messages := make(chan *pb.QueueMessage, 1)
+			d.hub.Register("local", "orders", "workers", messages)
+			now := time.Now().UnixMilli()
+			key := putPipelineEvent(t, d, "orders", 1, now-1000)
+			receiptKey := raft.DeliveryStateKey(key)
+			receipt, err := raft.MarshalPublishReceipt(d.hub.InterestView("orders").Epoch, []string{"g:workers"})
+			require.NoError(t, err)
+			batch := d.db.NewBatch()
+			require.NoError(t, batch.Set(receiptKey, receipt))
+			require.NoError(t, batch.Commit(storage.NoSync))
+			require.NoError(t, batch.Close())
+			chunk := d.collectScheduledTopic("orders", now)
+			require.Len(t, chunk.items, 1)
+
+			delayKey := key
+			if slowRead == "receipt" {
+				delayKey = receiptKey
+			} else {
+				delete(chunk.payloads, string(key))
+			}
+			observed := &publishedReceiptReadDB{DB: slowPublishedReadDB{DB: d.db, key: delayKey, delay: 40 * time.Millisecond}}
+			d.db = observed
+			switch slowRead {
+			case "preparation_payload":
+				started := time.Now()
+				ctx, cancel := context.WithTimeout(context.Background(), d.Limits.ValidationTimeout)
+				defer cancel()
+				_, err := d.prepareChunk(ctx, chunk)
+				require.ErrorIs(t, err, context.DeadlineExceeded)
+				chunk.validationTime = time.Since(started)
+			default:
+				chunk.validationTime = 19 * time.Millisecond
+			}
+			require.Zero(t, d.deliverChunk(chunk, nil))
+			require.Empty(t, messages)
+			if slowRead == "receipt" {
+				require.Equal(t, 1, observed.reads, "the lookup started within budget")
+			} else {
+				require.Zero(t, observed.reads, "expired payload validation must prevent a receipt lookup")
+			}
+		})
+	}
 }

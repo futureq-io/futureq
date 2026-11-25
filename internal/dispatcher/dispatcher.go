@@ -144,6 +144,8 @@ func (d *Dispatcher) dispatchTopic(topic string, nowMs int64) int {
 	ctx, cancel := context.WithTimeout(context.Background(), d.Limits.ValidationTimeout)
 	defer cancel()
 	states, err := d.prepareChunk(ctx, chunk)
+	validationDeadline, _ := ctx.Deadline()
+	chunk.validationTime = d.Limits.ValidationTimeout - time.Until(validationDeadline)
 	if err != nil {
 		d.logger.Warn("failed to prepare delivery batch", zap.Error(err))
 		return 0
