@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/lni/dragonboat/v4/raftio"
+	"github.com/futureq-io/stormoar/v4/raftio"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 )

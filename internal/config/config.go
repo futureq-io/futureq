@@ -12,7 +12,7 @@ import (
 
 	"github.com/futureq-io/futureq/pkg/raft/metadata"
 	"github.com/futureq-io/futureq/pkg/utils"
-	raftconfig "github.com/lni/dragonboat/v4/config"
+	raftconfig "github.com/futureq-io/stormoar/v4/config"
 	"github.com/spf13/viper"
 	"gopkg.in/yaml.v2"
 )

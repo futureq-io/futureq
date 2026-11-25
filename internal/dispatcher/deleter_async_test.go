@@ -8,7 +8,7 @@ import (
 
 	raft "github.com/futureq-io/futureq/internal/raft/event"
 	"github.com/futureq-io/futureq/pkg/utils"
-	"github.com/lni/dragonboat/v4/statemachine"
+	"github.com/futureq-io/stormoar/v4/statemachine"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 )

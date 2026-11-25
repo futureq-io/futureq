@@ -11,7 +11,7 @@ import (
 
 	raft "github.com/futureq-io/futureq/internal/raft/event"
 	deliverypb "github.com/futureq-io/protocol/proto/go/delivery"
-	"github.com/lni/dragonboat/v4/statemachine"
+	"github.com/futureq-io/stormoar/v4/statemachine"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/proto"
 )

@@ -11,7 +11,7 @@ import (
 	"github.com/futureq-io/futureq/internal/repository"
 	"github.com/futureq-io/futureq/internal/storage"
 	"github.com/futureq-io/futureq/pkg/utils"
-	"github.com/lni/dragonboat/v4/statemachine"
+	"github.com/futureq-io/stormoar/v4/statemachine"
 	"go.uber.org/zap"
 )
 
