@@ -14,7 +14,7 @@ import (
 	"github.com/futureq-io/futureq/internal/storage"
 	"github.com/futureq-io/futureq/pkg/utils"
 	storagepb "github.com/futureq-io/protocol/proto/go/storage"
-	"github.com/lni/dragonboat/v4/statemachine"
+	"github.com/futureq-io/stormoar/v4/statemachine"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 	"go.uber.org/zap"

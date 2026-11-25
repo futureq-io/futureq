@@ -9,7 +9,7 @@ import (
 	"github.com/futureq-io/futureq/pkg/utils"
 	deliverypb "github.com/futureq-io/protocol/proto/go/delivery"
 	storagepb "github.com/futureq-io/protocol/proto/go/storage"
-	"github.com/lni/dragonboat/v4/statemachine"
+	"github.com/futureq-io/stormoar/v4/statemachine"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/proto"
 )

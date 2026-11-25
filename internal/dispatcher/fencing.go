@@ -7,7 +7,7 @@ import (
 
 	"github.com/futureq-io/futureq/pkg/raft/metadata"
 	pb "github.com/futureq-io/protocol/proto/go"
-	"github.com/lni/dragonboat/v4"
+	"github.com/futureq-io/stormoar/v4"
 )
 
 // ConsumerReadPermit is the default delivery permit and legacy fencing floor.

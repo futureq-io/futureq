@@ -1,10 +1,10 @@
 package leaderpersist
 
 import (
-	"github.com/lni/dragonboat/v4/config"
-	"github.com/lni/dragonboat/v4/plugin/tan"
-	"github.com/lni/dragonboat/v4/raftio"
-	pb "github.com/lni/dragonboat/v4/raftpb"
+	"github.com/futureq-io/stormoar/v4/config"
+	"github.com/futureq-io/stormoar/v4/plugin/tan"
+	"github.com/futureq-io/stormoar/v4/raftio"
+	pb "github.com/futureq-io/stormoar/v4/raftpb"
 )
 
 // NewFactory returns a config.LogDBFactory compatible decorator. tracker

@@ -11,9 +11,9 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/lni/dragonboat/v4"
-	raftconfig "github.com/lni/dragonboat/v4/config"
-	"github.com/lni/dragonboat/v4/statemachine"
+	"github.com/futureq-io/stormoar/v4"
+	raftconfig "github.com/futureq-io/stormoar/v4/config"
+	"github.com/futureq-io/stormoar/v4/statemachine"
 	"go.uber.org/zap"
 
 	"github.com/futureq-io/futureq/internal/config"

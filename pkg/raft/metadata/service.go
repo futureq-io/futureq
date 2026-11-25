@@ -6,8 +6,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/lni/dragonboat/v4"
-	"github.com/lni/dragonboat/v4/raftio"
+	"github.com/futureq-io/stormoar/v4"
+	"github.com/futureq-io/stormoar/v4/raftio"
 	"go.uber.org/zap"
 )
 

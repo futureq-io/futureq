@@ -21,7 +21,7 @@ import (
 	"github.com/futureq-io/futureq/internal/metrics"
 	"github.com/futureq-io/futureq/pkg/log"
 	pb "github.com/futureq-io/protocol/proto/go"
-	"github.com/lni/dragonboat/v4/statemachine"
+	"github.com/futureq-io/stormoar/v4/statemachine"
 )
 
 var joinSeeds []string

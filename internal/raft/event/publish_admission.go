@@ -8,7 +8,7 @@ import (
 
 	"github.com/futureq-io/futureq/internal/storage"
 	deliverypb "github.com/futureq-io/protocol/proto/go/delivery"
-	"github.com/lni/dragonboat/v4/statemachine"
+	"github.com/futureq-io/stormoar/v4/statemachine"
 	"google.golang.org/protobuf/proto"
 )
 
