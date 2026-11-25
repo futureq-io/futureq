@@ -40,15 +40,16 @@ type scanCursor struct {
 	shards          *shardedDueScan
 }
 type deliveryChunk struct {
-	unfit       bool // at least one recipient command cannot fit even an empty batch
-	topic       string
-	items       []raft.DeliveryPrepare
-	scanStarted int64
-	maintenance bool
-	started     time.Time
-	oldestDueMs int64
-	payloads    map[string]cachedPayload
-	generation  *atomic.Bool
+	unfit          bool // at least one recipient command cannot fit even an empty batch
+	topic          string
+	items          []raft.DeliveryPrepare
+	scanStarted    int64
+	maintenance    bool
+	started        time.Time
+	oldestDueMs    int64
+	payloads       map[string]cachedPayload
+	generation     *atomic.Bool
+	validationTime time.Duration // preparation time charged to published receipt validation
 }
 
 const maintenanceTopic = "\x00delivery-maintenance"
@@ -385,6 +386,9 @@ func (d *Dispatcher) prepareChunk(ctx context.Context, chunk deliveryChunk) (map
 		}
 		chunk.items = items
 	}
+	if d.PublishedReceipts && !chunk.maintenance {
+		return nil, ctx.Err() // validate the receipt immediately before enqueueing
+	}
 	if len(chunk.items) == 0 {
 		return nil, nil
 	}
@@ -417,8 +421,20 @@ func (d *Dispatcher) deliverChunk(chunk deliveryChunk, states map[string]*raft.D
 	defer func() {
 		metrics.DispatchPassDurationMs.Observe(float64(time.Since(chunk.started).Microseconds()) / 1000)
 	}()
+	preparedReceipts := d.PrepareBatch != nil || d.PrepareDelivery != nil
+	usesReceipts := d.PublishedReceipts || preparedReceipts
+	validationTime := chunk.validationTime
+	var receiptReadTime time.Duration
+	if d.PublishedReceipts {
+		defer func() {
+			metrics.DeliveryPrepareDurationMs.WithLabelValues("batch").Observe(float64(receiptReadTime.Microseconds()) / 1000)
+		}()
+	}
 	delivered := 0
 	for _, item := range chunk.items {
+		if d.PublishedReceipts && validationTime >= d.Limits.ValidationTimeout {
+			break
+		}
 		if chunk.generation != nil && !chunk.generation.Load() {
 			break
 		}
@@ -430,19 +446,21 @@ func (d *Dispatcher) deliverChunk(chunk deliveryChunk, states map[string]*raft.D
 			break
 		}
 		manifest := states[string(item.Key)]
-		if (d.PrepareBatch != nil || d.PrepareDelivery != nil) && manifest == nil {
+		if !d.PublishedReceipts && preparedReceipts && manifest == nil {
 			continue
 		}
 		payload := chunk.payloads[string(item.Key)]
 		msg := payload.message
 		// Receipt-backed delivery can reuse immutable payload bytes. Adapters
 		// without a delivery ledger still need a Get to check existence.
-		if msg != nil && (d.PrepareBatch != nil || d.PrepareDelivery != nil) {
+		if msg != nil && usesReceipts {
 			metrics.DeliveryPayloadCacheTotal.WithLabelValues("cache").Inc()
 		} else {
 			metrics.DeliveryPayloadCacheTotal.WithLabelValues("fallback").Inc()
 			metrics.DeliveryPayloadReadsTotal.Inc()
+			started := time.Now()
 			refreshed, err := d.readPayload(item.Key, "delivery")
+			validationTime += time.Since(started)
 			if errors.Is(err, storage.ErrNotFound) {
 				continue
 			}
@@ -457,10 +475,31 @@ func (d *Dispatcher) deliverChunk(chunk deliveryChunk, states map[string]*raft.D
 		}
 		// Receipt existence and ACK bits remain authoritative after preparation. A
 		// snapshot can replace receipts while retaining the same event key.
-		if d.PrepareBatch != nil || d.PrepareDelivery != nil {
+		if usesReceipts {
+			var readStarted time.Time
+			if d.PublishedReceipts {
+				if validationTime >= d.Limits.ValidationTimeout {
+					break
+				}
+				readStarted = time.Now()
+			}
 			current, err := raft.ReadDeliveryState(d.db, item.Key)
-			if err != nil || current == nil || (!current.PublishBound && current.Epoch != item.Epoch) {
+			if d.PublishedReceipts {
+				elapsed := time.Since(readStarted)
+				validationTime += elapsed
+				receiptReadTime += elapsed
+			}
+			if err != nil {
+				metrics.DeliveryRejectedTotal.WithLabelValues("receipt_read").Inc()
 				continue
+			}
+			if current == nil || (!current.PublishBound && (d.PublishedReceipts || current.Epoch != item.Epoch)) {
+				continue
+			}
+			if d.PublishedReceipts {
+				// The budget gates new reads. Finish delivery checks for a receipt
+				// already read so a slow oldest message cannot stall the topic.
+				metrics.DeliveryManifestHitsTotal.Inc()
 			}
 			manifest = current
 		}

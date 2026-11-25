@@ -8,6 +8,7 @@ import (
 	"io"
 	"sync"
 
+	"github.com/futureq-io/futureq/internal/config"
 	"github.com/futureq-io/futureq/internal/repository"
 	"github.com/futureq-io/futureq/internal/storage"
 	"github.com/futureq-io/futureq/pkg/utils"
@@ -29,6 +30,7 @@ type EventStateMachine struct {
 	repo            *repository.EventRepository
 	lastApplied     uint64
 	lastPersistedID uint64
+	receipts        receiptCache
 	logger          *zap.Logger
 	// Dragonboat allows Lookup to run concurrently with snapshot recovery.
 	catalogMu       sync.RWMutex
@@ -42,6 +44,13 @@ type EventStateMachine struct {
 // NewEventStateMachineFactory returns the factory function that Dragonboat
 // passes (clusterID, nodeID) to when it instantiates a new replica.
 func NewEventStateMachineFactory(db storage.DB, repo *repository.EventRepository, onDeleteKeys func(keys [][]byte), logger *zap.Logger) func(uint64, uint64) statemachine.IOnDiskStateMachine {
+	limits := config.DefaultDelivery().ReceiptCache
+	maxBytes, _ := limits.Bytes()
+	return NewEventStateMachineFactoryWithReceiptCache(db, repo, onDeleteKeys, logger, maxBytes, limits.MaxEntries)
+}
+
+// NewEventStateMachineFactoryWithReceiptCache uses validated per-replica cache limits.
+func NewEventStateMachineFactoryWithReceiptCache(db storage.DB, repo *repository.EventRepository, onDeleteKeys func(keys [][]byte), logger *zap.Logger, maxBytes int64, maxEntries int) func(uint64, uint64) statemachine.IOnDiskStateMachine {
 	return func(clusterID uint64, nodeID uint64) statemachine.IOnDiskStateMachine {
 		return &EventStateMachine{
 			clusterID:    clusterID,
@@ -49,6 +58,7 @@ func NewEventStateMachineFactory(db storage.DB, repo *repository.EventRepository
 			db:           db,
 			repo:         repo,
 			logger:       logger.Named("event_sm"),
+			receipts:     newReceiptCache(maxBytes, maxEntries),
 			OnDeleteKeys: onDeleteKeys,
 		}
 	}
@@ -183,6 +193,7 @@ func (s *EventStateMachine) applyEntry(batch storage.Batch, delivery *DeliveryBa
 func (s *EventStateMachine) Update(entries []statemachine.Entry) ([]statemachine.Entry, error) {
 	batch := s.db.NewBatch()
 	delivery := NewDeliveryBatch(s.db, batch)
+	delivery.receipts = &s.receipts
 
 	defer batch.Close() //nolint:errcheck
 
@@ -222,6 +233,7 @@ func (s *EventStateMachine) Update(entries []statemachine.Entry) ([]statemachine
 	if err := batch.Commit(storage.NoSync); err != nil {
 		return nil, err
 	}
+	s.receipts.commit(delivery)
 	s.lastApplied = lastApplied
 	s.lastPersistedID = lastID
 	s.repo.ObserveID(lastID)
@@ -333,6 +345,7 @@ func (s *EventStateMachine) RecoverFromSnapshot(r io.Reader, stopc <-chan struct
 	// If recovery fails after clearing the database, catalog reads must still
 	// fail until a complete snapshot has been restored.
 	s.recoveryPending = true
+	s.receipts.reset()
 
 	if err := s.clearDB(stopc); err != nil {
 		return err

@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"sort"
@@ -148,6 +149,9 @@ type DeliveryBatch struct {
 	states        map[string]*DeliveryState
 	present       map[string]bool
 	dirty         map[string]bool
+	receipts      *receiptCache
+	receiptHits   int
+	receiptMisses int
 }
 
 func NewDeliveryBatch(db storage.DB, batch storage.Batch) *DeliveryBatch {
@@ -172,6 +176,17 @@ func (b *DeliveryBatch) Delete(key []byte) error {
 func (b *DeliveryBatch) load(key []byte) (*DeliveryState, error) {
 	if state, ok := b.states[string(key)]; ok {
 		return state, nil
+	}
+	if b.receipts != nil {
+		if committed := b.receipts.get(string(key)); committed != nil {
+			b.receiptHits++
+			state := *committed
+			// The roster is immutable. ACKs mutate the bitmap in the batch copy.
+			state.Acknowledged = bytes.Clone(state.Acknowledged)
+			b.states[string(key)] = &state
+			return &state, nil
+		}
+		b.receiptMisses++
 	}
 	state, err := ReadDeliveryState(b.db, key)
 	if err == nil {

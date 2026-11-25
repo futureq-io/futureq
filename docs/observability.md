@@ -42,6 +42,11 @@ lateness histograms use milliseconds.
 | `delivery_ownership_filtered_total` | counter | — | Event-key observations rejected for having no local owner, in live or speculative preload storage scans. |
 | `delivery_candidates_total` | counter | source (`scan\|preload`) | Due candidates selected for preparation, including retries. Excludes future loads and maintenance. `source="preload"` counts cached candidate hits, not successful deliveries. |
 | `delivery_preload_capacity` | gauge | — | Configured maximum future-message entries on this node. Due work has a separate bounded allowance. Zero when preloading is disabled or the scheduler stops. |
+| `delivery_apply_receipt_lookups_total` | counter | source (`cache`, `pebble`) | Receipt lookups during successful Raft apply, excluding lookups satisfied by the current batch. |
+| `delivery_apply_receipt_cache_entries` | gauge | — | Receipts retained in the Raft apply cache. |
+| `delivery_apply_receipt_cache_retained_bytes` | gauge | — | Estimated bytes of retained receipts, excluding the slot table. |
+| `delivery_apply_receipt_cache_evictions_total` | counter | reason (`slot_collision`, `byte_limit`) | A slot replacement evicted a different receipt, or a receipt was evicted to enforce the byte budget. |
+| `delivery_apply_receipt_cache_budget_rejections_total` | counter | — | Receipts individually larger than the entire byte budget. |
 | `delivery_preload_loaded_total` | counter | — | New full-message entries loaded into reserved future discovery/cache slots; known-key scans do not increment it. A stale result can be rejected before heap admission. Reloading after invalidation counts again. |
 | `delivery_preload_scanned_keys_total` | counter | — | Speculative preload event-key observations; a subset of `delivery_scanned_keys_total`, not additional work to sum with it. |
 | `messages_expired_total`     | counter   | topic, source (`dispatcher\|janitor`) | Accepted TTL deletion requests on this node, attributed to the source that queued each request. Repeated scans and failed flush retries are deduplicated while a deletion is pending. Not committed deletes or globally unique messages. |
@@ -69,6 +74,10 @@ current recipient command cannot fit even an empty preparation batch. Selection
 logs the byte limit and topic; the scheduler backs off before rediscovery. An
 unfit command is not a successful preparation or send, and its payload stays in
 storage.
+
+`delivery_rejected_total{reason="receipt_read"}` counts storage and decoding
+errors during the final receipt read. The scheduler continues processing
+other candidates in the batch.
 
 [Scheduler design and resource bounds](heap-scheduler.md) describes immutable payload
 ownership, current-receipt reads, retry recovery and count-based sizing.

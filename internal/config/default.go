@@ -57,6 +57,7 @@ var defaultConfig = Config{
 		DeleteBatchInterval:        500 * time.Millisecond,
 		DeleteWorkers:              16,
 		AckQueueCapacity:           8192,
+		ReceiptCache:               ReceiptCache{MaxBytes: "64MiB", MaxEntries: 1 << 19},
 		TTLSweepInterval:           time.Minute,
 		PrepareBatchSize:           64,
 		PrepareBatchBytes:          "256KiB",

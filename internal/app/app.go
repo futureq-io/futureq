@@ -133,6 +133,11 @@ func Init(cfg *config.Config, logger *zap.Logger) (*App, error) {
 // Wire this to Dispatcher.RemoveInFlightBatch in start.go.
 func (a *App) StartRaft(join bool, onDeleteKeys func(keys [][]byte)) error {
 	cfg := a.cfg
+	receiptCache := cfg.Delivery.ReceiptCache
+	receiptCacheBytes, err := receiptCache.Bytes()
+	if err != nil {
+		return fmt.Errorf("delivery.receiptCache.maxBytes: %w", err)
+	}
 
 	// Create the metadata service first — it needs to be registered as the
 	// event listener before NodeHost is created.
@@ -254,7 +259,9 @@ func (a *App) StartRaft(join bool, onDeleteKeys func(keys [][]byte)) error {
 
 	// Pass the fully-initialised EventRepository so the state machine uses the
 	// same monotonic ID counter and key schema as the standalone write path.
-	eventFactory := raft.NewEventStateMachineFactory(a.DB, a.Repositories.Events, onDeleteKeys, a.Logger)
+	eventFactory := raft.NewEventStateMachineFactoryWithReceiptCache(
+		a.DB, a.Repositories.Events, onDeleteKeys, a.Logger, receiptCacheBytes, receiptCache.MaxEntries,
+	)
 	if err := nh.StartOnDiskReplica(members, join, eventFactory, eventRC); err != nil {
 		if errors.Is(err, dragonboat.ErrShardNotBootstrapped) {
 			a.Logger.Warn("event raft bootstrap failed (shard not bootstrapped); wiping raft data dir to allow clean retry",

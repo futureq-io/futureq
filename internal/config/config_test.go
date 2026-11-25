@@ -179,3 +179,33 @@ func (s *ConfigSuite) writeConfig(document string) string {
 	s.Require().NoError(os.WriteFile(path, []byte(document), 0600))
 	return path
 }
+
+func (s *ConfigSuite) TestReceiptCacheConfiguration() {
+	cfg, err := Load("")
+	s.Require().NoError(err)
+	s.Equal(ReceiptCache{MaxBytes: "64MiB", MaxEntries: 524288}, cfg.Delivery.ReceiptCache)
+
+	path := s.writeConfig("delivery:\n  receiptCache:\n    maxBytes: 128MiB\n    maxEntries: 1048576\n")
+	cfg, err = Load(path)
+	s.Require().NoError(err)
+	s.Equal(ReceiptCache{MaxBytes: "128MiB", MaxEntries: 1048576}, cfg.Delivery.ReceiptCache)
+
+	for _, test := range []struct{ yaml, key string }{
+		{"maxBytes: -1MiB", "maxBytes"},
+		{"maxEntries: 0", "maxEntries"},
+		{"maxEntries: 3", "maxEntries"},
+		{"maxEntries: 33554432", "maxEntries"},
+	} {
+		_, err = Load(s.writeConfig("delivery:\n  receiptCache:\n    " + test.yaml + "\n"))
+		s.Require().ErrorContains(err, "delivery.receiptCache."+test.key)
+	}
+
+	s.T().Setenv("FUTUREQ_DELIVERY_RECEIPTCACHE_MAXBYTES", "0B")
+	s.T().Setenv("FUTUREQ_DELIVERY_RECEIPTCACHE_MAXENTRIES", "2")
+	cfg, err = Load(path)
+	s.Require().NoError(err)
+	s.Equal(ReceiptCache{MaxBytes: "0B", MaxEntries: 2}, cfg.Delivery.ReceiptCache)
+	budget, err := cfg.Delivery.ReceiptCache.Bytes()
+	s.Require().NoError(err)
+	s.Zero(budget)
+}
