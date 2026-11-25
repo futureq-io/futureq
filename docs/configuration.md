@@ -145,7 +145,7 @@ are separate from application storage under `storage.pebble`.
 | `delivery.subscriptions.disconnectWorkers` | `1` | Concurrent session disconnect batches (1..16), at most 256 sessions per batch. |
 | `delivery.consumerRemovalWorkers` | `1` | Concurrent Raft consumer membership removals (1..16), targeting unique disconnected stream IDs. |
 | `delivery.deliveryWorkers`          | `2` | Delivery-worker concurrency (1..16), with at most one job per topic. Workers validate payloads, read receipts, check permissions, and queue sends. |
-| `delivery.validationTimeout`        | `250ms` | Cooperative deadline for payload validation and receipt reads, greater than zero and at most 1s. Excludes final authorization, sender queueing, and gRPC sending. |
+| `delivery.validationTimeout`        | `250ms` | Cooperative budget for payload validation and starting receipt reads, greater than zero and at most 1s. A successful receipt read already in progress can finish after the budget expires and proceed through delivery checks. Excludes final authorization, sender queueing, and gRPC sending. |
 | `delivery.ttlsweepInterval`         | `60s`   | How often the TTL janitor sweeps the whole database for expired messages. |
 
 All four intervals and the in-flight timeout must be greater than zero.

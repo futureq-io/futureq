@@ -130,15 +130,17 @@ func TestPublishedReceiptUsesRemainingValidationBudget(t *testing.T) {
 			d.hub.Register("local", "orders", "workers", messages)
 			now := time.Now().UnixMilli()
 			key := putPipelineEvent(t, d, "orders", 1, now-1000)
+			next := putPipelineEvent(t, d, "orders", 2, now-999)
 			receiptKey := raft.DeliveryStateKey(key)
 			receipt, err := raft.MarshalPublishReceipt(d.hub.InterestView("orders").Epoch, []string{"g:workers"})
 			require.NoError(t, err)
 			batch := d.db.NewBatch()
 			require.NoError(t, batch.Set(receiptKey, receipt))
+			require.NoError(t, batch.Set(raft.DeliveryStateKey(next), receipt))
 			require.NoError(t, batch.Commit(storage.NoSync))
 			require.NoError(t, batch.Close())
 			chunk := d.collectScheduledTopic("orders", now)
-			require.Len(t, chunk.items, 1)
+			require.Len(t, chunk.items, 2)
 
 			delayKey := key
 			if slowRead == "receipt" {
@@ -159,13 +161,52 @@ func TestPublishedReceiptUsesRemainingValidationBudget(t *testing.T) {
 			default:
 				chunk.validationTime = 19 * time.Millisecond
 			}
-			require.Zero(t, d.deliverChunk(chunk, nil))
-			require.Empty(t, messages)
+			sent := d.deliverChunk(chunk, nil)
 			if slowRead == "receipt" {
-				require.Equal(t, 1, observed.reads, "the lookup started within budget")
+				require.Equal(t, 1, sent, "a successful receipt read started within budget")
+				require.Equal(t, 1, observed.reads, "the spent budget prevents reading the second receipt")
+				require.Len(t, messages, 1)
+				require.Equal(t, key, (<-messages).DeliveryTag)
 			} else {
+				require.Zero(t, sent)
+				require.Empty(t, messages)
 				require.Zero(t, observed.reads, "expired payload validation must prevent a receipt lookup")
 			}
 		})
+	}
+}
+
+func TestPublishedDispatchProgressesPastSlowOldestReceipt(t *testing.T) {
+	d, _ := newPreloadTest(t, "pebble")
+	d.PrepareBatch = nil
+	d.PublishedReceipts = true
+	d.Limits.ValidationTimeout = 10 * time.Millisecond
+	messages := make(chan *pb.QueueMessage, 2)
+	d.hub.Register("local", "orders", "workers", messages)
+	now := time.Now().UnixMilli()
+	oldest := putPipelineEvent(t, d, "orders", 1, now-1000)
+	healthy := putPipelineEvent(t, d, "orders", 2, now-999)
+	receipt, err := raft.MarshalPublishReceipt(d.hub.InterestView("orders").Epoch, []string{"g:workers"})
+	require.NoError(t, err)
+	batch := d.db.NewBatch()
+	require.NoError(t, batch.Set(raft.DeliveryStateKey(oldest), receipt))
+	require.NoError(t, batch.Set(raft.DeliveryStateKey(healthy), receipt))
+	require.NoError(t, batch.Commit(storage.NoSync))
+	require.NoError(t, batch.Close())
+	d.db = slowPublishedReadDB{DB: d.db, key: raft.DeliveryStateKey(oldest), delay: 30 * time.Millisecond}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { d.Run(ctx); close(done) }()
+	t.Cleanup(func() { cancel(); <-done })
+	timeout := time.NewTimer(2 * time.Second)
+	defer timeout.Stop()
+	for _, key := range [][]byte{oldest, healthy} {
+		select {
+		case msg := <-messages:
+			require.Equal(t, key, msg.DeliveryTag)
+		case <-timeout.C:
+			t.Fatal("delivery stalled behind the slow receipt")
+		}
 	}
 }

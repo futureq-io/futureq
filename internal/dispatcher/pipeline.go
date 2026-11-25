@@ -497,9 +497,8 @@ func (d *Dispatcher) deliverChunk(chunk deliveryChunk, states map[string]*raft.D
 				continue
 			}
 			if d.PublishedReceipts {
-				if validationTime >= d.Limits.ValidationTimeout {
-					break
-				}
+				// The budget gates new reads. Finish delivery checks for a receipt
+				// already read so a slow oldest message cannot stall the topic.
 				metrics.DeliveryManifestHitsTotal.Inc()
 			}
 			manifest = current
