@@ -33,6 +33,7 @@ const (
 
 	// Quorum publish: destinations are selected at this Raft log entry.
 	PublishBatchCmd
+	RetryDeliveryCmd
 )
 
 // StoreBatchItem is the minimal per-message metadata carried in a StoreBatchCmd.

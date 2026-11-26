@@ -266,6 +266,18 @@ go test ./...       # run tests
 golangci-lint run   # lint
 ```
 
+When testing protocol changes before the Go module is tagged, use the sibling
+`futureq-proto` checkout. From the broker root or the SDK's `go` directory, set
+`FUTUREQ_PROTOCOL_DIR` to the absolute path of `futureq-proto/proto/go` and run:
+
+```bash
+deps="$(mktemp -d)"
+cp go.mod go.sum "$deps/"
+go mod edit -modfile="$deps/go.mod" \
+  -replace="github.com/futureq-io/protocol/proto/go=$FUTUREQ_PROTOCOL_DIR"
+GOWORK=off go test -mod=mod -modfile="$deps/go.mod" ./...
+```
+
 Contributions are welcome — please open an issue to discuss substantial changes before sending a PR.
 
 ## License

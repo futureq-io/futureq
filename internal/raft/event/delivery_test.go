@@ -9,9 +9,14 @@ import (
 	"github.com/futureq-io/futureq/internal/repository"
 	"github.com/futureq-io/futureq/internal/storage"
 	"github.com/futureq-io/futureq/pkg/utils"
+	pb "github.com/futureq-io/protocol/proto/go"
+	deliverypb "github.com/futureq-io/protocol/proto/go/delivery"
+	storagepb "github.com/futureq-io/protocol/proto/go/storage"
 	"github.com/futureq-io/stormoar/v4/statemachine"
 	"github.com/stretchr/testify/require"
+	"github.com/stretchr/testify/suite"
 	"go.uber.org/zap"
+	"google.golang.org/protobuf/proto"
 )
 
 func newDeliveryTestSM(t *testing.T) (*EventStateMachine, storage.DB) {
@@ -23,6 +28,168 @@ func newDeliveryTestSM(t *testing.T) (*EventStateMachine, storage.DB) {
 	require.NoError(t, err)
 	sm := NewEventStateMachineFactory(db, repo, nil, zap.NewNop())(1, 1).(*EventStateMachine)
 	return sm, db
+}
+
+type DeliveryRetrySuite struct {
+	suite.Suite
+	sm *EventStateMachine
+	db storage.DB
+}
+
+func TestDeliveryRetrySuite(t *testing.T) {
+	suite.Run(t, new(DeliveryRetrySuite))
+}
+
+func (s *DeliveryRetrySuite) SetupTest() {
+	s.sm, s.db = newDeliveryTestSM(s.T())
+}
+
+func (s *DeliveryRetrySuite) apply(commands ...[]byte) []statemachine.Entry {
+	entries := make([]statemachine.Entry, len(commands))
+	for i, command := range commands {
+		entries[i] = statemachine.Entry{Index: s.sm.lastApplied + uint64(i) + 1, Cmd: command}
+	}
+	results, err := s.sm.Update(entries)
+	s.Require().NoError(err)
+	return results
+}
+
+func (s *DeliveryRetrySuite) store(message *storagepb.StoredMessage, recipients ...string) []byte {
+	data, err := proto.Marshal(message)
+	s.Require().NoError(err)
+	id := s.sm.lastPersistedID + 1
+	topic := utils.TopicHash(message.Topic)
+	key := utils.EventKey(1, topic, id)
+	receipt, err := MarshalPublishReceipt(0, recipients)
+	s.Require().NoError(err)
+	store, err := MarshalStoreDeliveryBatchCmd([]StoreBatchItem{{ID: id, Bucket: 1, TopicHash: topic, Msg: data, Receipt: receipt}})
+	s.Require().NoError(err)
+	s.apply(store)
+	return key
+}
+
+func (s *DeliveryRetrySuite) retry(op deliverypb.RetryCommand_Operation, now int64, targets ...*deliverypb.DeliveryAttemptTarget) []byte {
+	cmd, err := MarshalRetryCommand(&deliverypb.RetryCommand{Operation: op, NowMs: now, Attempts: targets})
+	s.Require().NoError(err)
+	return cmd
+}
+
+func (s *DeliveryRetrySuite) attempt(key []byte, recipient string, token byte, deadline int64) *deliverypb.DeliveryAttemptTarget {
+	return &deliverypb.DeliveryAttemptTarget{
+		Key: key, Recipient: recipient, Token: bytes.Repeat([]byte{token}, AttemptTokenSize), DeadlineMs: deadline,
+	}
+}
+
+func (s *DeliveryRetrySuite) TestTimeoutAndStaleOutcomesAfterSnapshotRecovery() {
+	key := s.store(&storagepb.StoredMessage{Topic: "orders", EnqueuedAtUnixMs: 100, MaxRetries: new(uint32(1))}, "g:worker", "u:audit")
+	first := s.attempt(key, "g:worker", 1, 110)
+	rival := s.attempt(key, "g:worker", 2, 110)
+	results := s.apply(s.retry(deliverypb.RetryCommand_START, 100, first), s.retry(deliverypb.RetryCommand_START, 100, rival))
+	s.Equal(uint64(1), results[0].Result.Value)
+	s.Zero(results[1].Result.Value)
+	snapshot, err := s.sm.PrepareSnapshot()
+	s.Require().NoError(err)
+	var encoded bytes.Buffer
+	s.Require().NoError(s.sm.SaveSnapshot(snapshot, &encoded, nil))
+	s.sm, s.db = newDeliveryTestSM(s.T())
+	s.Require().NoError(s.sm.RecoverFromSnapshot(&encoded, nil))
+	due, err := DueDeliveryAttempts(s.db, 109)
+	s.Require().NoError(err)
+	s.Empty(due)
+	due, err = DueDeliveryAttempts(s.db, 110)
+	s.Require().NoError(err)
+	s.Require().Len(due, 1)
+	expire := s.retry(deliverypb.RetryCommand_EXPIRE, 110, due...)
+	s.Zero(s.apply(expire)[0].Result.Value)
+
+	second := s.attempt(key, "g:worker", 3, 120)
+	s.Equal(uint64(2), s.apply(s.retry(deliverypb.RetryCommand_START, 111, second))[0].Result.Value)
+	stale := s.attempt(key, "g:worker", 1, 0)
+	s.apply(s.retry(deliverypb.RetryCommand_ACK, 112, stale), expire)
+	receipt, err := ReadDeliveryState(s.db, key)
+	s.Require().NoError(err)
+	s.Require().NotNil(receipt)
+	s.True(receipt.Needs("g:worker"))
+	s.False(receipt.Ready("g:worker"))
+	s.True(receipt.Ready("u:audit"))
+
+	due, err = DueDeliveryAttempts(s.db, 120)
+	s.Require().NoError(err)
+	s.Require().Len(due, 1)
+	expire = s.retry(deliverypb.RetryCommand_EXPIRE, 120, due...)
+	results = s.apply(expire, expire)
+	s.Equal(uint64(1), results[0].Result.Value)
+	s.Zero(results[1].Result.Value)
+	page, err := (DeadLetterQuery{Topic: "orders", Limit: 2}).Read(s.db)
+	s.Require().NoError(err)
+	s.Require().Len(page.Page.Entries, 1)
+	s.Equal(pb.DeadLetterReason_DEAD_LETTER_REASON_TIMEOUT, page.Page.Entries[0].Reason)
+	s.Equal(uint64(2), page.Page.Entries[0].Attempts)
+	receipt, err = ReadDeliveryState(s.db, key)
+	s.Require().NoError(err)
+	s.False(receipt.Needs("g:worker"))
+	s.True(receipt.Needs("u:audit"))
+}
+
+func (s *DeliveryRetrySuite) TestFanoutArchivesSharePayloadAndDeleteIndependently() {
+	key := s.store(&storagepb.StoredMessage{
+		Topic: "orders", Payload: []byte("original"), EnqueuedAtUnixMs: 100, DelayMs: 5, TtlMs: 50,
+		MaxRetries: new(uint32(0)), Indexes: []*pb.Index{{Value: &pb.Index_Int64Value{Int64Value: 42}}},
+	}, "g:worker", "u:audit")
+	worker := s.attempt(key, "g:worker", 1, 120)
+	audit := s.attempt(key, "u:audit", 2, 120)
+	s.apply(s.retry(deliverypb.RetryCommand_START, 105, worker), s.retry(deliverypb.RetryCommand_START, 105, audit))
+	worker.DeadlineMs, audit.DeadlineMs = 0, 0
+	results := s.apply(s.retry(deliverypb.RetryCommand_NACK, 110, worker), s.retry(deliverypb.RetryCommand_NACK, 111, audit))
+	s.Equal(uint64(1), results[0].Result.Value)
+	s.Equal(uint64(1), results[1].Result.Value)
+	_, _, err := s.db.Get(key)
+	s.ErrorIs(err, storage.ErrNotFound)
+
+	query := DeadLetterQuery{Topic: "orders", Limit: 1}
+	first, err := query.Read(s.db)
+	s.Require().NoError(err)
+	s.Require().Len(first.Page.Entries, 1)
+	s.Require().NotEmpty(first.Page.NextPageToken)
+	query.After = first.Page.NextPageToken
+	next, err := query.Read(s.db)
+	s.Require().NoError(err)
+	s.Require().Len(next.Page.Entries, 1)
+	s.Empty(next.Page.NextPageToken)
+	for _, item := range []*pb.DeadLetterSummary{first.Page.Entries[0], next.Page.Entries[0]} {
+		record, err := (DeadLetterQuery{Topic: "orders", ID: item.Id}).Read(s.db)
+		s.Require().NoError(err)
+		s.Require().NotNil(record.Entry)
+		s.Equal([]byte("original"), record.Entry.Message.Payload)
+		s.Equal(int64(42), record.Entry.Message.Indexes[0].GetInt64Value())
+		s.Require().NotNil(record.Entry.Message.MaxRetries)
+		s.Zero(*record.Entry.Message.MaxRetries)
+		cmd, err := MarshalRetryCommand(&deliverypb.RetryCommand{
+			Operation: deliverypb.RetryCommand_DELETE_DEAD_LETTER, Topic: "orders", DeadLetterId: item.Id,
+		})
+		s.Require().NoError(err)
+		s.apply(cmd, cmd)
+	}
+	_, _, err = s.db.Get(append([]byte(deadLetterPayload), key...))
+	s.ErrorIs(err, storage.ErrNotFound)
+}
+
+func (s *DeliveryRetrySuite) TestTTLAndUnlimitedMessagesDoNotArchive() {
+	unlimited := s.store(&storagepb.StoredMessage{Topic: "orders", EnqueuedAtUnixMs: 100}, "g:worker")
+	expiring := s.store(&storagepb.StoredMessage{Topic: "orders", EnqueuedAtUnixMs: 100, TtlMs: 5, MaxRetries: new(uint32(0))}, "g:worker")
+	results := s.apply(
+		s.retry(deliverypb.RetryCommand_START, 101, s.attempt(unlimited, "g:worker", 1, 110)),
+		s.retry(deliverypb.RetryCommand_START, 101, s.attempt(expiring, "g:worker", 2, 110)),
+	)
+	s.Zero(results[0].Result.Value)
+	s.Equal(uint64(1), results[1].Result.Value)
+	due, err := DueDeliveryAttempts(s.db, 110)
+	s.Require().NoError(err)
+	s.Require().Len(due, 1)
+	s.Zero(s.apply(s.retry(deliverypb.RetryCommand_EXPIRE, 110, due...))[0].Result.Value)
+	page, err := (DeadLetterQuery{Topic: "orders", Limit: 2}).Read(s.db)
+	s.Require().NoError(err)
+	s.Empty(page.Page.Entries)
 }
 
 func TestDeliveryReceiptsSurviveSnapshotAndAckBatch(t *testing.T) {

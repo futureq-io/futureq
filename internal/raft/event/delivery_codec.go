@@ -37,7 +37,7 @@ func receiptProto(s *DeliveryState) *deliverypb.DeliveryReceipt {
 	if s == nil {
 		return nil
 	}
-	return &deliverypb.DeliveryReceipt{PublishBound: s.PublishBound, Epoch: s.Epoch, Recipients: s.Recipients, Acknowledged: s.Acknowledged}
+	return &deliverypb.DeliveryReceipt{PublishBound: s.PublishBound, Epoch: s.Epoch, Recipients: s.Recipients, Acknowledged: s.Acknowledged, Attempts: s.attempts}
 }
 func receiptState(p *deliverypb.DeliveryReceipt) (*DeliveryState, error) {
 	if p == nil {
@@ -58,10 +58,18 @@ func receiptState(p *deliverypb.DeliveryReceipt) (*DeliveryState, error) {
 	if n := len(p.Recipients) % 8; n != 0 && p.Acknowledged[len(p.Acknowledged)-1]>>uint(n) != 0 {
 		return nil, fmt.Errorf("invalid receipt bitmap padding")
 	}
-	return &DeliveryState{PublishBound: p.PublishBound, Epoch: p.Epoch, Recipients: p.Recipients, Acknowledged: p.Acknowledged, remaining: remaining}, nil
+	for i, attempt := range p.Attempts {
+		if i >= uint32(len(p.Recipients)) || p.Acknowledged[i/8]&(1<<uint(i%8)) != 0 ||
+			attempt.GetNumber() == 0 || (len(attempt.GetToken()) != 0 && len(attempt.GetToken()) != AttemptTokenSize) ||
+			(len(attempt.GetToken()) == 0 && attempt.GetDeadlineMs() != 0) ||
+			(len(attempt.GetToken()) == AttemptTokenSize && attempt.GetDeadlineMs() <= 0) {
+			return nil, fmt.Errorf("invalid receipt attempt")
+		}
+	}
+	return &DeliveryState{PublishBound: p.PublishBound, Epoch: p.Epoch, Recipients: p.Recipients, Acknowledged: p.Acknowledged, attempts: p.Attempts, remaining: remaining}, nil
 }
 func marshalDeliveryState(s *DeliveryState) ([]byte, error) {
-	return proto.MarshalOptions{}.MarshalAppend(append([]byte(nil), receiptPrefix...), receiptProto(s))
+	return (proto.MarshalOptions{Deterministic: true}).MarshalAppend(append([]byte(nil), receiptPrefix...), receiptProto(s))
 }
 
 // UnmarshalDeliveryState reads a versioned Protobuf receipt.
@@ -86,7 +94,7 @@ func marshalPrepared(items []DeliveryPrepared) ([]byte, error) {
 	for i, item := range items {
 		p.Items[i] = &deliverypb.DeliveryPrepared{Key: item.Key, State: receiptProto(item.State)}
 	}
-	return proto.MarshalOptions{}.MarshalAppend(append([]byte(nil), preparedPrefix...), p)
+	return (proto.MarshalOptions{Deterministic: true}).MarshalAppend(append([]byte(nil), preparedPrefix...), p)
 }
 func UnmarshalDeliveryPrepared(data []byte) ([]DeliveryPrepared, error) {
 	if !bytes.HasPrefix(data, preparedPrefix) {

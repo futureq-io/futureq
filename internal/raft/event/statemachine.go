@@ -185,6 +185,10 @@ func (s *EventStateMachine) applyEntry(batch storage.Batch, delivery *DeliveryBa
 		result, deleted, err := delivery.Apply(cmd)
 		return result, deleted, 0, err
 
+	case RetryDeliveryCmd:
+		result, deleted, err := delivery.ApplyRetry(cmd)
+		return result, deleted, 0, err
+
 	default:
 		return statemachine.Result{}, nil, 0, fmt.Errorf("raft: unknown command type: %d", cmd[0])
 	}

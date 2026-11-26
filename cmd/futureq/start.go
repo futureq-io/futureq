@@ -129,14 +129,12 @@ func startRun(cmd *cobra.Command, _ []string) {
 	}
 
 	ledger := dispatcher.NewDeliveryLedger(a.DB, recipients, deleteBackend, proposeDelivery)
-	var standalonePublishLedger *dispatcher.DeliveryLedger
 	if cfg.Cluster.Enabled {
 		ledger.ProposeContext = func(ctx context.Context, cmd []byte) (statemachine.Result, error) {
 			return a.NodeHost.SyncPropose(ctx, a.NodeHost.GetNoOPSession(cfg.Cluster.ShardID), cmd)
 		}
 	} else if maxBytes, _ := cfg.Delivery.ReceiptCache.MaxBytes.Bytes(); maxBytes > 0 {
 		ledger.StandaloneReceipts = raft.NewStandaloneReceiptCache(maxBytes, cfg.Delivery.ReceiptCache.MaxEntries)
-		standalonePublishLedger = ledger
 	}
 	deleter := dispatcher.NewDeleter(ledger, deleteInterval, logger)
 	deleter.AckQueueCapacity = cfg.Delivery.AckQueueCapacity
@@ -253,8 +251,14 @@ func startRun(cmd *cobra.Command, _ []string) {
 		janitor.Run(a.Ctx)
 	}()
 
+	a.RegisterComponentWithShutdown()
+	go func() {
+		defer a.ComponentShutdownDone()
+		ledger.RunRetryExpiry(a.Ctx, dispatchInterval, a.Subscriptions.IsLeader, logger)
+	}()
+
 	// ── gRPC server ───────────────────────────────────────────────────────────
-	grpcserver.New(cfg.API.GRPC, hub, deleter, logger, standalonePublishLedger).
+	grpcserver.New(cfg.API.GRPC, hub, deleter, logger, ledger).
 		Listen().
 		WaitForShutdown(a.Ctx)
 

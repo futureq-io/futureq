@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"maps"
 	"sort"
 	"strings"
 
@@ -23,7 +24,8 @@ type DeliveryState struct {
 	Epoch        uint64
 	Recipients   []string // sorted, unique frozen roster
 	Acknowledged []byte   // bit i corresponds to Recipients[i]
-	remaining    int      // derived on read; updated only by the first ACK for a recipient
+	attempts     map[uint32]*deliverypb.DeliveryAttempt
+	remaining    int // derived on read; updated only by the first ACK for a recipient
 }
 
 func (s *DeliveryState) Needs(recipient string) bool {
@@ -42,6 +44,12 @@ func (s *DeliveryState) acknowledge(recipient string) bool {
 	}
 	i := sort.SearchStrings(s.Recipients, recipient)
 	s.Acknowledged[i/8] |= 1 << uint(i%8)
+	if s.attempts != nil {
+		delete(s.attempts, uint32(i))
+		if len(s.attempts) == 0 {
+			s.attempts = nil
+		}
+	}
 	s.remaining--
 	return true
 }
@@ -153,6 +161,8 @@ type DeliveryBatch struct {
 	standaloneReceipts *StandaloneReceiptCache
 	receiptHits        int
 	receiptMisses      int
+	archiveRefs        map[string]uint32
+	archiveEntries     map[string]bool
 }
 
 func NewDeliveryBatch(db storage.DB, batch storage.Batch) *DeliveryBatch {
@@ -190,6 +200,7 @@ func (b *DeliveryBatch) load(key []byte) (*DeliveryState, error) {
 			state := *committed
 			// The roster is immutable. ACKs mutate the bitmap in the batch copy.
 			state.Acknowledged = bytes.Clone(state.Acknowledged)
+			state.attempts = maps.Clone(state.attempts) // attempt values are immutable
 			b.states[string(key)] = &state
 			return &state, nil
 		}

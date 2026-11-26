@@ -208,6 +208,7 @@ func (ph *ProducerHandler) marshalMessages(
 			DelayMs:          msg.DelayMs,
 			TtlMs:            msg.TtlMs,
 			Indexes:          msg.Indexes,
+			MaxRetries:       msg.MaxRetries,
 		}
 
 		if err := fn(stored); err != nil {

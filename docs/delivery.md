@@ -2,12 +2,10 @@
 
 Consumers use manual ACK/NACK by default. An explicitly requested auto-ack stream
 requires `delivery.subscriptions.allowAutoAck: true`. After a successful gRPC
-send, the sender queues that recipient's completion through the usual batched
-ACK ledger. It does not wait for the application's handler. Failed sends remain
-pending, persistence failures retry, and independent recipients retain their
-copies. Manual ACKs and NACKs on auto-ack streams are ignored, including while a
-send is still blocked. A crash before completion commits can cause duplicates;
-handler failures cannot request redelivery after an auto-ack send.
+send, the sender records that recipient's completion without waiting for the
+application's handler. Failed sends remain pending and other recipients retain
+their copies. Manual ACKs and NACKs on auto-ack streams are ignored. A crash
+before completion commits can cause duplicates.
 
 ```text
  storage ──range scan──▶ Dispatcher ──▶ Hub ──▶ consumer channels
@@ -131,6 +129,25 @@ Consumer registration and rebalance activation retain their completion checks.
 - Failed batches are re-queued and retried on the next flush (`delete_failures_total` tracks failures).
 - After a successful ACK flush, the hub releases tracking for the committed recipients, allowing the rebalance drain to proceed. The shared payload is deleted only after all required recipients complete. Successful explicit deletions clear tracking for the deleted keys.
 
+## Retry limits and dead letters
+
+For a publish with `max_retries`, the broker commits a recipient-specific
+attempt before sending. Its lease uses `delivery.inFlightTimeout`. Time in the
+buffered sender queue does not consume a retry. If the broker loses the worker,
+cannot complete the send, or receives no acknowledgement by the deadline, the
+attempt can expire. A crash between committing the attempt and sending can
+also consume it. Each attempt has a distinct tag, so a delayed ACK or NACK
+cannot settle a later attempt. ACK and NACK outcomes for these deliveries
+are also committed before the broker releases the local reservation.
+
+A bounded deadline scan on the event-shard leader (or on the standalone broker)
+resolves expired attempts, including after restart or failover and when no
+workers are connected. A final NACK or timeout atomically archives the payload
+and marks that subscription's delivery complete. Other subscriptions keep
+their independent retry budgets. Message TTL and unsubscribing can discard
+pending deliveries before they are dead-lettered. See the
+[dead-letter queue API](api.md#dead-letter-queue) for retention and retrieval.
+
 ## TTL janitor
 
 The dispatcher's inline TTL check only covers topics with live consumers. The janitor sweeps the **entire database** every `delivery.ttlsweepInterval` (default 60s), skips non-event keys (metadata, indexes), and routes expired messages to the deleter — so TTL messages with zero consumers still get cleaned up.
@@ -139,4 +156,4 @@ The dispatcher's inline TTL check only covers topics with live consumers. The ja
 
 !!! warning "At-least-once"
 
-    A message is re-dispatched if the consumer never ACKs (timeout), NACKs, or disconnects. Consumers must be idempotent. Duplicate delivery is also possible across a leader failover window in rare cases. There is no exactly-once mode and no per-message dedup at the consume path.
+    A message is eligible for redelivery after a NACK, timeout, or disconnect while the subscription has retry budget. Consumers must handle duplicates, including across leader failover.

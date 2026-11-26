@@ -48,7 +48,10 @@ maximum is 256.
 
 `/futureq.FutureQProducer/PublishStream` — bidi stream of `PublishBatch` → `PublishBatchAck`.
 
-- Each `PublishBatch` carries `messages` (topic, payload, delay_ms, ttl_ms, optional indexes) and an `ack_level`.
+- Each `PublishBatch` carries `messages` (topic, payload, delay_ms, ttl_ms, optional indexes and `max_retries`) and an `ack_level`.
+- `max_retries` counts redeliveries independently for each durable subscription.
+  Omit it for unlimited retries. Set it to `0` for one attempt or `3` for up to
+  four attempts. Exhausted deliveries are retained in the topic's dead-letter queue.
 - Each accepted batch receives one `PublishBatchAck`. A rejected batch writes no
   messages and closes the stream with a gRPC error.
 - An empty batch returns a default (unsuccessful) ack and performs no write.
@@ -111,23 +114,38 @@ creation and generation are unchanged. The server rejects auto-ack streams with
 An accepting server includes `subscription-auto-ack: true` in initial metadata;
 clients must require that confirmation before suppressing ACK/NACK frames.
 
-On auto-ack streams both manual ACK and NACK requests are ignored. Handler errors
-cannot request redelivery, and successful send does not confirm application
-processing. Failed sends are not acknowledged. Completion uses the same batched
-recipient ledger and persistence retries as manual ACKs; other recipients keep
-their obligations. A crash before completion is committed can cause duplicates.
+On auto-ack streams both manual ACK and NACK requests are ignored. A successful
+send completes the subscription's delivery before application processing is
+known. Failed sends remain pending. A crash before completion is committed can
+cause duplicates.
 
 ### After registration
 
 - The broker assigns a UUID and registers the consumer with the [hub](delivery.md#hub-consumer-groups) (buffered channel, capacity 1024).
 - `group_id` selects competing workers. Otherwise `subscriber_id` selects a durable universal interest; different IDs receive independent copies, and multiple workers using one ID share its backlog.
-- Server → client frames are `QueueMessage` with `delivery_tag` — an opaque tag the client must echo back.
+- Server → client frames are `QueueMessage` with an opaque `delivery_tag` the client must echo unchanged. When `max_retries` is set, `attempt` is one-based and the tag identifies that specific attempt.
 - Client → server frames are `AckRequest{success, delivery_tag}`:
-    - `success = true` (ACK): the message is queued for batched deletion and becomes non-re-dispatchable.
-    - `success = false` (NACK): nothing is deleted; the message becomes re-dispatchable immediately.
-- Any ack frame also removes the in-flight entry for that consumer. Non-ack frames after handshake are logged and skipped.
+    - `success = true` (ACK) completes this subscription's delivery. The shared payload is deleted after all recipients finish.
+    - `success = false` (NACK) makes that subscription eligible for redelivery or archives the delivery if it exhausted its retry limit.
+- Non-ack frames after handshake are logged and skipped.
 - Client EOF ends the stream cleanly; the consumer is unregistered and its in-flight keys dropped.
 - Disconnect removes only the worker session. Both group and universal subscriptions retain pending deliveries; reconnect with the same topic and identity to resume.
+
+## Dead-letter queue
+
+`futureq.FutureQDeadLetter` provides three unary RPCs for retained failures.
+
+| RPC | Request and result |
+| --- | --- |
+| `ListDeadLetters` | Provide a topic and optional page size and token. Returns summaries ordered by storage key, with a token when more records are available. The default is 100 summaries, the maximum is 256, and the response may end earlier at its byte budget. |
+| `GetDeadLetter` | Provide the topic and an opaque ID from the list. Returns the summary and original publish fields, including payload and indexes. A missing record returns `NotFound`. |
+| `DeleteDeadLetter` | Provide the topic and ID. Deletion is idempotent. |
+
+A summary identifies the failed subscription and generation, attempt count,
+failure reason, and enqueue and dead-letter timestamps. Entries remain until
+deleted. Archived payloads shared by several entries are reclaimed after the
+last entry is deleted. In Raft mode, reads use a quorum read and deletes are
+replicated. The Go SDK exposes the same three operations on `Client`.
 
 ## Cluster RPCs
 

@@ -17,16 +17,20 @@ import (
 	"github.com/futureq-io/futureq/internal/app"
 	"github.com/futureq-io/futureq/internal/dispatcher"
 	"github.com/futureq-io/futureq/internal/metrics"
+	raft "github.com/futureq-io/futureq/internal/raft/event"
 	"github.com/futureq-io/futureq/pkg/raft/metadata"
+	"github.com/futureq-io/futureq/pkg/utils"
 	pb "github.com/futureq-io/protocol/proto/go"
+	deliverypb "github.com/futureq-io/protocol/proto/go/delivery"
 )
 
 // ConsumerHandler implements pb.FutureQConsumerServer.
 type ConsumerHandler struct {
 	pb.UnimplementedFutureQConsumerServer
-	logger  *zap.Logger
-	hub     *dispatcher.Hub
-	deleter *dispatcher.Deleter
+	logger      *zap.Logger
+	hub         *dispatcher.Hub
+	deleter     *dispatcher.Deleter
+	RetryLedger *dispatcher.DeliveryLedger
 }
 
 // NewConsumerHandler returns an initialised ConsumerHandler.
@@ -238,19 +242,37 @@ func (h *ConsumerHandler) sender(
 			errCh <- ctx.Err()
 			return
 		case msg := <-ch:
-			if !h.hub.BeginSend(consumerID, msg) {
+			wire := msg
+			if msg.MaxRetries != nil {
+				var err error
+				wire, err = h.beginLimitedSend(consumerID, init, msg)
+				if err != nil {
+					errCh <- err
+					return
+				}
+			} else if !h.hub.BeginSend(consumerID, msg) {
+				wire = nil
+			}
+			if wire == nil {
 				h.hub.RejectQueuedAttempt(consumerID, msg)
 				continue // expired, ACKed, or fenced buffered delivery
 			}
 			// Observe before Send: consumer backpressure can block this call.
 			// Count attempted sends here, including attempts that fail in Send.
 			metrics.DeliverySendLatenessMs.WithLabelValues(msg.Topic).Observe(float64(time.Now().UnixNano())/1e6 - float64(msg.EnqueuedAtUnixMs+msg.DelayMs))
-			if err := stream.Send(msg); err != nil {
+			if err := stream.Send(wire); err != nil {
 				errCh <- err
 				return
 			}
 			metrics.DeliveryGRPCSendsTotal.WithLabelValues(msg.Topic).Inc()
 			if init.AutoAck {
+				if msg.MaxRetries != nil {
+					if _, err := h.finishLimitedSend(consumerID, init, wire.DeliveryTag, true, false); err != nil {
+						errCh <- err
+						return
+					}
+					continue
+				}
 				// Expiry or disconnect may remove local tracking while Send is
 				// blocked. A successful send still completes this generation's
 				// recipient; local tracking is only a duplicate-send guard.
@@ -303,6 +325,17 @@ func (h *ConsumerHandler) receiver(
 			init.Topic, init.GroupId, boolToStr(success),
 		).Inc()
 
+		if len(ackReq.DeliveryTag) == utils.EventKeySize+raft.AttemptTokenSize {
+			accepted, err := h.finishLimitedSend(consumerID, init, ackReq.DeliveryTag, success, true)
+			if err != nil {
+				errCh <- err
+				return
+			}
+			if !accepted {
+				h.logger.Debug("ignoring ACK for a stale delivery attempt", zap.String("consumer_id", consumerID))
+			}
+			continue
+		}
 		accepted := false
 		if success {
 			accepted = h.hub.MarkAcknowledgedSent(consumerID, ackReq.DeliveryTag)
@@ -327,6 +360,64 @@ func (h *ConsumerHandler) receiver(
 		}
 		// NACK: the key remains in storage; the dispatcher will re-deliver it.
 	}
+}
+
+func (h *ConsumerHandler) beginLimitedSend(consumerID string, init *pb.SubscribeInit, message *pb.QueueMessage) (*pb.QueueMessage, error) {
+	if !h.hub.CanSend(consumerID, message) {
+		return nil, nil
+	}
+	if h.RetryLedger == nil {
+		return nil, status.Error(codes.Unavailable, "delivery retry ledger unavailable")
+	}
+	now := time.Now()
+	deadline := max(now.UnixMilli()+1, now.Add(h.hub.AttemptTimeout()).UnixMilli())
+	token := uuid.New()
+	recipient := metadata.DeliveryRecipient(init.GroupId, consumerID)
+	attempt, err := h.RetryLedger.ApplyRetry(&deliverypb.RetryCommand{
+		Operation: deliverypb.RetryCommand_START, NowMs: now.UnixMilli(),
+		Attempts: []*deliverypb.DeliveryAttemptTarget{{
+			Key: message.DeliveryTag, Recipient: recipient, Token: token[:], DeadlineMs: deadline,
+		}},
+	})
+	if err != nil {
+		return nil, status.Errorf(codes.Unavailable, "reserve delivery attempt: %v", err)
+	}
+	if attempt == 0 || !h.hub.BeginRetrySend(consumerID, message, token[:], time.UnixMilli(deadline)) {
+		return nil, nil
+	}
+	tag := make([]byte, 0, utils.EventKeySize+raft.AttemptTokenSize)
+	tag = append(tag, message.DeliveryTag...)
+	tag = append(tag, token[:]...)
+	return &pb.QueueMessage{
+		Topic: message.Topic, Payload: message.Payload, DeliveryTag: tag,
+		EnqueuedAtUnixMs: message.EnqueuedAtUnixMs, DelayMs: message.DelayMs,
+		MaxRetries: message.MaxRetries, Attempt: attempt,
+	}, nil
+}
+
+func (h *ConsumerHandler) finishLimitedSend(consumerID string, init *pb.SubscribeInit, tag []byte, success, requireTracking bool) (bool, error) {
+	key, token := tag[:utils.EventKeySize], tag[utils.EventKeySize:]
+	if !h.hub.MarkRetryOutcome(consumerID, key, token) && requireTracking {
+		return false, nil
+	}
+	op := deliverypb.RetryCommand_ACK
+	if !success {
+		op = deliverypb.RetryCommand_NACK
+	}
+	_, err := h.RetryLedger.ApplyRetry(&deliverypb.RetryCommand{
+		Operation: op, NowMs: time.Now().UnixMilli(),
+		Attempts: []*deliverypb.DeliveryAttemptTarget{{
+			Key: key, Recipient: metadata.DeliveryRecipient(init.GroupId, consumerID), Token: token,
+		}},
+	})
+	if err != nil {
+		return false, status.Errorf(codes.Unavailable, "commit delivery outcome: %v", err)
+	}
+	h.hub.ReleaseRetrySend(consumerID, key, token)
+	if !success && h.hub.OnNack != nil {
+		h.hub.OnNack(key)
+	}
+	return true, nil
 }
 
 func boolToStr(b bool) string {
