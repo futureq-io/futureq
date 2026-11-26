@@ -18,16 +18,108 @@ import (
 	"go.uber.org/zap"
 )
 
-const retryOwnerLeaseDuration = 15 * time.Second
-
 type retryIdentity [utils.EventKeySize + raft.AttemptTokenSize]byte
 
 type retryCoordination struct {
-	mu       sync.Mutex
-	outcomes map[retryIdentity]struct{}
-	expiring map[retryIdentity]struct{}
-	owner    []byte
-	until    atomic.Int64
+	mu          sync.Mutex
+	outcomes    map[retryIdentity]struct{}
+	authorizing map[retryIdentity]struct{}
+	refunds     map[retryIdentity]*deliverypb.RetryCommand
+	expiring    map[retryIdentity]struct{}
+	owner       []byte
+	until       atomic.Int64
+}
+
+// AuthorizeRetrySend protects the reservation from expiry until the caller can
+// recheck its fence after the Raft wait. Refund it if transport will not run.
+func (l *DeliveryLedger) AuthorizeRetrySend(command *deliverypb.RetryCommand, canSend func() bool) (bool, error) {
+	id := identifyRetry(command.Attempts[0])
+	capacity := cap(l.retryOutcomes)
+	if capacity == 0 {
+		capacity = MaxPendingCompletions
+	}
+	l.retry.mu.Lock()
+	if _, expiring := l.retry.expiring[id]; expiring || len(l.retry.authorizing)+len(l.retry.refunds) >= capacity {
+		l.retry.mu.Unlock()
+		return false, nil
+	}
+	if l.retry.authorizing == nil {
+		l.retry.authorizing = make(map[retryIdentity]struct{})
+	}
+	l.retry.authorizing[id] = struct{}{}
+	l.retry.mu.Unlock()
+	var refund *deliverypb.RetryCommand
+	defer func() {
+		l.retry.mu.Lock()
+		delete(l.retry.authorizing, id)
+		if refund != nil {
+			if l.retry.refunds == nil {
+				l.retry.refunds = make(map[retryIdentity]*deliverypb.RetryCommand)
+			}
+			l.retry.refunds[id] = refund
+		}
+		l.retry.mu.Unlock()
+	}()
+
+	authorized, err := l.ApplyRetry(command)
+	if err == nil && authorized != 0 && canSend() &&
+		(len(l.retry.owner) == 0 || time.Now().UnixMilli() < l.retry.until.Load()) {
+		return true, nil
+	}
+
+	cancel := &deliverypb.RetryCommand{
+		Operation: deliverypb.RetryCommand_CANCEL_RESERVATION,
+		NowMs:     time.Now().UnixMilli(),
+		Attempts:  command.Attempts,
+	}
+	if _, cancelErr := l.ApplyRetry(cancel); cancelErr != nil {
+		// Keep the protection reserved before charging. A failed refund
+		// cannot compete for space in the consumer outcome queue.
+		refund = cancel
+	}
+	return false, err
+}
+
+func (l *DeliveryLedger) flushRetryRefunds(ctx context.Context) error {
+	var refunds [32]*deliverypb.RetryCommand
+	l.retry.mu.Lock()
+	n := 0
+	for _, command := range l.retry.refunds {
+		refunds[n] = command
+		n++
+		if n == len(refunds) {
+			break
+		}
+	}
+	l.retry.mu.Unlock()
+	for _, command := range refunds[:n] {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if _, err := l.ApplyRetry(command); err != nil {
+			return err
+		}
+		l.retry.mu.Lock()
+		delete(l.retry.refunds, identifyRetry(command.Attempts[0]))
+		l.retry.mu.Unlock()
+	}
+	return nil
+}
+
+// RetrySendActive checks the committed receipt and the owner's local expiry
+// arbitration before the sender exposes another fragment of the same attempt.
+func (l *DeliveryLedger) RetrySendActive(key []byte, recipient string, token []byte) (bool, error) {
+	state, err := raft.ReadDeliveryState(l.db, key)
+	if err != nil || !state.HasActiveAttempt(recipient, token) {
+		return false, err
+	}
+	var id retryIdentity
+	copy(id[:utils.EventKeySize], key)
+	copy(id[utils.EventKeySize:], token)
+	l.retry.mu.Lock()
+	defer l.retry.mu.Unlock()
+	_, expiring := l.retry.expiring[id]
+	return !expiring && (len(l.retry.owner) == 0 || time.Now().UnixMilli() < l.retry.until.Load()), nil
 }
 
 func identifyRetry(target *deliverypb.DeliveryAttemptTarget) retryIdentity {
@@ -44,14 +136,14 @@ func (l *DeliveryLedger) SetRetryOwner(nodeID uint64) {
 }
 
 // RunRetryOwner renews independently of both the outcome and expiry workers.
-func (l *DeliveryLedger) RunRetryOwner(ctx context.Context, logger *zap.Logger) {
-	ticker := time.NewTicker(retryOwnerLeaseDuration / 5)
+func (l *DeliveryLedger) RunRetryOwner(ctx context.Context, lease time.Duration, logger *zap.Logger) {
+	ticker := time.NewTicker(lease / 5)
 	defer ticker.Stop()
 	for ctx.Err() == nil {
 		now := time.Now()
 		until, err := l.ApplyRetry(&deliverypb.RetryCommand{
 			Operation: deliverypb.RetryCommand_RENEW_OWNER, Owner: l.retry.owner,
-			NowMs: now.UnixMilli(), LeaseUntilMs: now.Add(retryOwnerLeaseDuration).UnixMilli(),
+			NowMs: now.UnixMilli(), LeaseUntilMs: now.Add(lease).UnixMilli(),
 		})
 		if err != nil {
 			if ctx.Err() == nil {
@@ -196,6 +288,9 @@ func (l *DeliveryLedger) RunRetryExpiry(ctx context.Context, interval time.Durat
 		case <-ctx.Done():
 			return
 		case now := <-ticker.C:
+			if err := l.flushRetryRefunds(ctx); err != nil && ctx.Err() == nil {
+				logger.Warn("failed to refund unsent delivery attempts", zap.Error(err))
+			}
 			if err := l.expireDueRetryAttempts(ctx, now.UnixMilli(), isLeader); err != nil && ctx.Err() == nil {
 				logger.Warn("failed to expire delivery attempts", zap.Error(err))
 			}
@@ -249,8 +344,10 @@ func (l *DeliveryLedger) expireRetryPage(attempts []*deliverypb.DeliveryAttemptT
 	for _, target := range eligible {
 		id := identifyRetry(target)
 		_, pending := l.retry.outcomes[id]
+		_, authorizing := l.retry.authorizing[id]
+		_, refunding := l.retry.refunds[id]
 		_, expiringElsewhere := l.retry.expiring[id]
-		if !pending && !expiringElsewhere {
+		if !pending && !authorizing && !refunding && !expiringElsewhere {
 			if l.retry.expiring == nil {
 				l.retry.expiring = make(map[retryIdentity]struct{})
 			}

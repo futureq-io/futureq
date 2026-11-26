@@ -258,6 +258,21 @@ func (q DeadLetterQuery) list(db storage.DB) (*pb.ListDeadLettersResponse, error
 		if ok {
 			tokenSize = protowire.SizeTag(2) + protowire.SizeBytes(len(summary.Id))
 		}
+		if entrySize+tokenSize > budget {
+			summary.GroupId, summary.SubscriberId = "", ""
+			summary.IdentityOmitted = true
+			entrySize = protowire.SizeTag(1) + protowire.SizeBytes(proto.Size(summary))
+		}
+		if entrySize+tokenSize > budget {
+			// The request already identifies the topic and the opaque ID
+			// identifies the subscription generation for a full lookup.
+			summary.Topic, summary.Generation = "", ""
+			entrySize = protowire.SizeTag(1) + protowire.SizeBytes(proto.Size(summary))
+		}
+		if entrySize+tokenSize > budget {
+			summary = &pb.DeadLetterSummary{Id: summary.Id, IdentityOmitted: true}
+			entrySize = protowire.SizeTag(1) + protowire.SizeBytes(proto.Size(summary))
+		}
 		if size+entrySize+tokenSize > budget {
 			if len(page.Entries) == 0 {
 				return nil, ErrDeadLetterPageTooSmall

@@ -215,6 +215,7 @@ type Delivery struct {
 	PreloadLookahead           time.Duration `mapstructure:"preloadLookahead" yaml:"preloadLookahead"`
 	PreloadMaxMessages         int           `mapstructure:"preloadMaxMessages" yaml:"preloadMaxMessages"`
 	InFlightTimeout            time.Duration `mapstructure:"inFlightTimeout" yaml:"inFlightTimeout"`
+	RetryOwnerLease            time.Duration `mapstructure:"retryOwnerLease" yaml:"retryOwnerLease"`
 	ReadPermit                 time.Duration `mapstructure:"readPermit" yaml:"readPermit"`
 	DeleteBatchInterval        time.Duration `mapstructure:"deleteBatchInterval" yaml:"deleteBatchInterval"`
 	DeleteWorkers              int           `mapstructure:"deleteWorkers" yaml:"deleteWorkers"`
@@ -487,6 +488,13 @@ func (c *Config) validatePublishAndDelivery() error {
 	}
 
 	d := c.Delivery
+	if d.RetryOwnerLease <= 0 || d.RetryOwnerLease%time.Millisecond != 0 {
+		return fmt.Errorf("delivery.retryOwnerLease must be a positive whole number of milliseconds")
+	}
+	// Keep enough time for renewal to recover from a timed-out proposal.
+	if c.Cluster.Enabled && d.RetryOwnerLease/3 < c.Publish.ProposalTimeout {
+		return fmt.Errorf("delivery.retryOwnerLease must be at least three times publish.proposalTimeout in cluster mode")
+	}
 	switch d.HeapType {
 	case HeapBinary, Heap4Ary, Heap8Ary:
 	default:

@@ -35,6 +35,14 @@ func (s *DeliveryState) Ready(recipient string) bool {
 	return len(s.attempts[i].GetToken()) == 0
 }
 
+func (s *DeliveryState) HasActiveAttempt(recipient string, token []byte) bool {
+	if len(token) != AttemptTokenSize || !s.Needs(recipient) {
+		return false
+	}
+	attempt := s.attempts[uint32(sort.SearchStrings(s.Recipients, recipient))]
+	return !attempt.GetReserved() && bytes.Equal(attempt.GetToken(), token)
+}
+
 func MarshalRetryCommand(cmd *deliverypb.RetryCommand) ([]byte, error) {
 	if err := validateRetryCommand(cmd); err != nil {
 		return nil, err
@@ -235,9 +243,6 @@ func (b *DeliveryBatch) applyAttempt(op deliverypb.RetryCommand_Operation, nowMs
 		}
 		return 1, false, nil
 	}
-	if op == deliverypb.RetryCommand_CANCEL_RESERVATION && !previous.Reserved {
-		return 0, false, nil
-	}
 	if previous.Reserved && (op == deliverypb.RetryCommand_ACK || op == deliverypb.RetryCommand_NACK) {
 		return 0, false, nil
 	}
@@ -250,8 +255,9 @@ func (b *DeliveryBatch) applyAttempt(op deliverypb.RetryCommand_Operation, nowMs
 	if op == deliverypb.RetryCommand_ACK {
 		return b.completeAttempt(state, target, 0)
 	}
-	if previous.Reserved && (op == deliverypb.RetryCommand_EXPIRE || op == deliverypb.RetryCommand_CANCEL_RESERVATION) {
-		// The sender cannot expose the attempt without committed authorization.
+	if op == deliverypb.RetryCommand_CANCEL_RESERVATION || (op == deliverypb.RetryCommand_EXPIRE && previous.Reserved) {
+		// Explicit cancellation means the owner skipped the send. An expired
+		// reservation can also be refunded if authorization never committed.
 		if previous.Number == 1 {
 			delete(state.attempts, i)
 			if len(state.attempts) == 0 {

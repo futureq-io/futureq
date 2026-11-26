@@ -21,6 +21,8 @@ import (
 	"github.com/stretchr/testify/suite"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -31,6 +33,15 @@ func TestLimitedConsumerSuite(t *testing.T) {
 }
 
 func (s *LimitedConsumerSuite) TestRebalanceBetweenReservationAndSendDoesNotCharge() {
+	s.Run("during-reservation", func() { s.exerciseCanceledSend(deliverypb.RetryCommand_START, false) })
+	s.Run("during-authorization", func() { s.exerciseCanceledSend(deliverypb.RetryCommand_SENT, false) })
+}
+
+func (s *LimitedConsumerSuite) TestAuthorizationThatReturnsPastDeadlineIsRefunded() {
+	s.exerciseCanceledSend(deliverypb.RetryCommand_SENT, true)
+}
+
+func (s *LimitedConsumerSuite) exerciseCanceledSend(blockAt deliverypb.RetryCommand_Operation, stall bool) {
 	a, hub, producer, _ := openPublishTest(s.T(), "pebble")
 	ctx := context.Background()
 	subscription, err := a.Subscriptions.Create(ctx, "orders", "workers", "")
@@ -49,33 +60,52 @@ func (s *LimitedConsumerSuite) TestRebalanceBetweenReservationAndSendDoesNotChar
 	hub.Register("consumer", "orders", group, queue)
 	defer hub.Unregister("consumer")
 	epoch := uint64(1)
-	hub.SetDeliveryFence(func() (uint64, bool) { return epoch, true }, time.Second)
+	const timeout = 400 * time.Millisecond
+	hub.SetDeliveryFence(func() (uint64, bool) { return epoch, true }, timeout)
 	hub.GrantDeliveryPermit(epoch, time.Now())
 
 	local := dispatcher.NewDeliveryLedger(a.DB, nil, nil, nil)
 	logger := zap.NewNop()
 	handler := NewConsumerHandler(logger, hub, nil)
+	interrupted := false
 	handler.RetryLedger = dispatcher.NewDeliveryLedger(a.DB, nil, nil, func(raw []byte) (statemachine.Result, error) {
 		var cmd deliverypb.RetryCommand
 		if err := proto.Unmarshal(raw[1:], &cmd); err != nil {
 			return statemachine.Result{}, err
 		}
 		value, err := local.ApplyRetry(&cmd)
-		if epoch == 1 && cmd.Operation == deliverypb.RetryCommand_START {
-			epoch++
+		if cmd.Operation == blockAt && !interrupted {
+			interrupted = true
+			if stall {
+				time.Sleep(timeout + 75*time.Millisecond)
+			} else {
+				epoch++
+			}
 		}
 		return statemachine.Result{Value: value}, err
 	})
+	if stall {
+		expiryCtx, stopExpiry := context.WithCancel(ctx)
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			handler.RetryLedger.RunRetryExpiry(expiryCtx, time.Millisecond, nil, logger)
+		}()
+		defer func() { stopExpiry(); <-done }()
+	}
 	input := &pb.QueueMessage{Topic: "orders", MaxRetries: new(uint32(0))}
 	s.Require().NotEmpty(hub.DispatchToTopic("orders", input, key))
 	queued := <-queue
 	wire, err := handler.beginLimitedSend("consumer", init, queued)
 	s.Require().NoError(err)
-	s.Require().Nil(wire, "revoking the permit must prevent any send")
+	s.Require().Nil(wire, "an expired or invalid permit must prevent any send")
 	hub.RejectQueuedAttempt("consumer", queued)
 	due, err := raft.DueDeliveryAttempts(a.DB, time.Now().Add(time.Minute).UnixMilli())
 	s.Require().NoError(err)
 	s.Empty(due, "the unsent reservation should be released immediately")
+	page, err := (raft.DeadLetterQuery{Topic: "orders", Limit: 10}).Read(a.DB)
+	s.Require().NoError(err)
+	s.Empty(page.Page.Entries, "expiry must not archive an attempt whose send was skipped")
 
 	hub.GrantDeliveryPermit(epoch, time.Now())
 	s.Require().NotEmpty(hub.DispatchToTopic("orders", input, key))
@@ -154,14 +184,30 @@ func (s *LimitedConsumerSuite) TestLaterACKCommitsWhileFirstOutcomeIsStalled() {
 }
 
 func (s *LimitedConsumerSuite) TestBlockedSendCannotRefundItsAttempt() {
+	s.exerciseExpiredSend(false)
+}
+
+func (s *LimitedConsumerSuite) TestChunkedSendStopsAfterItsRecipientExpires() {
+	s.exerciseExpiredSend(true)
+}
+
+func (s *LimitedConsumerSuite) exerciseExpiredSend(chunked bool) {
 	a, hub, producer, _ := openPublishTest(s.T(), "pebble")
 	logger := zap.NewNop()
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	subscription, err := a.Subscriptions.Create(ctx, "orders", "workers", "")
 	s.Require().NoError(err)
+	var otherRecipient string
+	var payload []byte
+	if chunked {
+		other, err := a.Subscriptions.Create(ctx, "orders", "offline", "")
+		s.Require().NoError(err)
+		otherRecipient = other.Recipient
+		payload = bytes.Repeat([]byte("chunk"), 500)
+	}
 	ack, err := producer.processBatch(ctx, &pb.PublishBatch{Messages: []*pb.PublishMessage{{
-		Topic: "orders", MaxRetries: new(uint32(0)),
+		Topic: "orders", Payload: payload, MaxRetries: new(uint32(0)),
 	}}})
 	s.Require().NoError(err)
 	s.Require().True(ack.GetSuccess())
@@ -172,10 +218,13 @@ func (s *LimitedConsumerSuite) TestBlockedSendCannotRefundItsAttempt() {
 	queue := make(chan *pb.QueueMessage, 1)
 	hub.Register("consumer", "orders", group, queue)
 	defer hub.Unregister("consumer")
-	s.Require().NotEmpty(hub.DispatchToTopic("orders", &pb.QueueMessage{Topic: "orders", MaxRetries: new(uint32(0))}, key))
+	s.Require().NotEmpty(hub.DispatchToTopic("orders", &pb.QueueMessage{Topic: "orders", Payload: payload, MaxRetries: new(uint32(0))}, key))
 	ledger := dispatcher.NewDeliveryLedger(a.DB, nil, nil, nil)
 	handler := NewConsumerHandler(logger, hub, nil)
 	handler.RetryLedger = ledger
+	if chunked {
+		handler.MaxSendBytes = 1024
+	}
 	stream := &blockedRetrySend{ctx: ctx, sending: make(chan *pb.QueueMessage, 1), unblock: make(chan struct{})}
 	errCh := make(chan error, 1)
 	done := make(chan struct{})
@@ -186,7 +235,11 @@ func (s *LimitedConsumerSuite) TestBlockedSendCannotRefundItsAttempt() {
 	defer func() { cancel(); <-done }()
 	select {
 	case msg := <-stream.sending:
-		s.Equal(uint64(1), msg.Attempt)
+		if chunked {
+			s.Require().True(msg.GetMoreChunks())
+		} else {
+			s.Equal(uint64(1), msg.Attempt)
+		}
 	case <-ctx.Done():
 		s.FailNow("send did not start")
 	}
@@ -202,7 +255,22 @@ func (s *LimitedConsumerSuite) TestBlockedSendCannotRefundItsAttempt() {
 	s.Require().NoError(err)
 	s.Require().Len(page.Page.Entries, 1)
 	s.Equal(uint64(1), page.Page.Entries[0].Attempts)
+	if chunked {
+		receipt, err := raft.ReadDeliveryState(a.DB, key)
+		s.Require().NoError(err)
+		s.Require().True(receipt.Needs(otherRecipient), "expiry completes only the sending recipient")
+	}
 	close(stream.unblock)
+	if chunked {
+		select {
+		case err := <-errCh:
+			s.Equal(codes.Aborted, status.Code(err))
+		case <-stream.sending:
+			s.FailNow("sender exposed another chunk after the attempt expired")
+		case <-ctx.Done():
+			s.FailNow("sender did not stop after expiry")
+		}
+	}
 }
 
 type blockedRetrySend struct {
@@ -213,7 +281,11 @@ type blockedRetrySend struct {
 }
 
 func (s *blockedRetrySend) Send(message *pb.QueueMessage) error {
-	s.sending <- message
+	select {
+	case s.sending <- message:
+	case <-s.ctx.Done():
+		return s.ctx.Err()
+	}
 	select {
 	case <-s.unblock:
 		return nil

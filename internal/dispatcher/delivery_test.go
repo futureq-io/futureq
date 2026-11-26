@@ -27,6 +27,102 @@ func TestRetryExpirySuite(t *testing.T) {
 	suite.Run(t, new(RetryExpirySuite))
 }
 
+func (s *RetryExpirySuite) TestFullOutcomeQueueDoesNotDropAnUnsentRefund() {
+	db, err := storage.NewPebble(config.Pebble{Mode: "memory"}, zap.NewNop())
+	s.Require().NoError(err)
+	defer db.Close() //nolint:errcheck
+	local := NewDeliveryLedger(db, nil, nil, nil)
+	cancelFailures := 2
+	ledger := NewDeliveryLedger(db, nil, nil, func(raw []byte) (statemachine.Result, error) {
+		var cmd deliverypb.RetryCommand
+		if err := proto.Unmarshal(raw[1:], &cmd); err != nil {
+			return statemachine.Result{}, err
+		}
+		if cmd.Operation == deliverypb.RetryCommand_CANCEL_RESERVATION && cancelFailures > 0 {
+			cancelFailures--
+			return statemachine.Result{}, errors.New("transient cancellation failure")
+		}
+		value, err := local.ApplyRetry(&cmd)
+		return statemachine.Result{Value: value}, err
+	})
+	ledger.ConfigureRetryOutcomes(1)
+	topic, recipient := "orders", "g:workers"
+	key := utils.EventKey(1, utils.TopicHash(topic), 1)
+	token := bytes.Repeat([]byte{1}, raft.AttemptTokenSize)
+	s.Require().True(ledger.TryRetryOutcome(&deliverypb.RetryCommand{
+		Operation: deliverypb.RetryCommand_ACK, NowMs: 101,
+		Attempts: []*deliverypb.DeliveryAttemptTarget{{
+			Key: utils.EventKey(1, utils.TopicHash(topic), 2), Recipient: recipient, Token: token,
+		}},
+	}, func() {}))
+
+	receipt, err := raft.MarshalPublishReceipt(0, []string{recipient})
+	s.Require().NoError(err)
+	body, err := proto.Marshal(&storagepb.StoredMessage{Topic: topic, EnqueuedAtUnixMs: 100, MaxRetries: new(uint32(0))})
+	s.Require().NoError(err)
+	batch := db.NewBatch()
+	s.Require().NoError(batch.Set(key, body))
+	s.Require().NoError(batch.Set(raft.DeliveryStateKey(key), receipt))
+	s.Require().NoError(batch.Commit(storage.Sync))
+	s.Require().NoError(batch.Close())
+	target := &deliverypb.DeliveryAttemptTarget{Key: key, Recipient: recipient, Token: token, DeadlineMs: 110}
+	start := &deliverypb.RetryCommand{Operation: deliverypb.RetryCommand_START, NowMs: 100, Attempts: []*deliverypb.DeliveryAttemptTarget{target}}
+	attempt, err := ledger.ApplyRetry(start)
+	s.Require().NoError(err)
+	s.Require().Equal(uint64(1), attempt)
+	target.DeadlineMs = 0
+	sent := &deliverypb.RetryCommand{Operation: deliverypb.RetryCommand_SENT, NowMs: 101, Attempts: []*deliverypb.DeliveryAttemptTarget{target}}
+	allowed, err := ledger.AuthorizeRetrySend(sent, func() bool { return false })
+	s.False(allowed)
+	s.NoError(err)
+
+	ctx := context.Background()
+	s.Require().ErrorContains(ledger.flushRetryRefunds(ctx), "transient cancellation failure")
+	s.Require().NoError(ledger.expireDueRetryAttempts(ctx, 110, nil))
+	page, err := (raft.DeadLetterQuery{Topic: topic, Limit: 10}).Read(db)
+	s.Require().NoError(err)
+	s.Empty(page.Page.Entries)
+	s.Require().NoError(ledger.flushRetryRefunds(ctx))
+	s.Len(ledger.retryOutcomes, 1, "refund does not require a slot in the outcome queue")
+	target.DeadlineMs, target.Token = 125, bytes.Repeat([]byte{2}, raft.AttemptTokenSize)
+	start.NowMs = 112
+	attempt, err = ledger.ApplyRetry(start)
+	s.Require().NoError(err)
+	s.Equal(uint64(1), attempt, "the unsent delivery must retain its first attempt")
+}
+
+func (s *RetryExpirySuite) TestOwnerRenewalUsesConfiguredLease() {
+	const lease = 250 * time.Millisecond
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	renewed := make(chan time.Duration, 2)
+	ledger := NewDeliveryLedger(nil, nil, nil, func(raw []byte) (statemachine.Result, error) {
+		var cmd deliverypb.RetryCommand
+		if err := proto.Unmarshal(raw[1:], &cmd); err != nil {
+			return statemachine.Result{}, err
+		}
+		select {
+		case renewed <- time.Duration(cmd.LeaseUntilMs-cmd.NowMs) * time.Millisecond:
+		case <-ctx.Done():
+		}
+		return statemachine.Result{Value: uint64(cmd.LeaseUntilMs)}, nil
+	})
+	ledger.SetRetryOwner(1)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ledger.RunRetryOwner(ctx, lease, zap.NewNop())
+	}()
+	defer func() { cancel(); <-done }()
+	for range 2 {
+		select {
+		case duration := <-renewed:
+			s.Equal(lease, duration)
+		case <-ctx.Done():
+			s.FailNow("retry owner renewal did not run")
+		}
+	}
+}
+
 func (s *RetryExpirySuite) TestSweepDrainsMultipleBatchesAcrossTopics() {
 	logger := zap.NewNop()
 	db, err := storage.NewPebble(config.Pebble{Mode: "memory"}, logger)

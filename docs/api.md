@@ -127,6 +127,7 @@ cause duplicates.
 - The broker assigns a UUID and registers the consumer with the [hub](delivery.md#hub-consumer-groups) (buffered channel, capacity 1024).
 - `group_id` selects competing workers. Otherwise `subscriber_id` selects a durable universal interest; different IDs receive independent copies, and multiple workers using one ID share its backlog.
 - Server → client frames are `QueueMessage` with an opaque `delivery_tag` the client must echo unchanged. When `max_retries` is set, `attempt` is one-based and the tag identifies that specific attempt.
+- If a delivery exceeds the serving replica's gRPC send limit, the broker sends consecutive frames containing `chunk_data`. Concatenate the bytes through the first frame with `more_chunks = false`, decode them as a single `QueueMessage`, and acknowledge that message's tag. The Go SDK reassembles these frames before invoking the handler.
 - Client → server frames are `AckRequest{success, delivery_tag}`:
     - `success = true` (ACK) completes this subscription's delivery. The shared payload is deleted after all recipients finish.
     - `success = false` (NACK) makes that subscription eligible for redelivery or archives the delivery if it exhausted its retry limit.
@@ -140,7 +141,7 @@ cause duplicates.
 
 | RPC | Request and result |
 | --- | --- |
-| `ListDeadLetters` | Provide a topic and optional page size and token. Returns summaries ordered by storage key, with a token when more records are available. The default is 100 summaries and the maximum is 256. Each page, including its token, fits the configured gRPC send limit. |
+| `ListDeadLetters` | Provide a topic and optional page size and token. Returns summaries ordered by storage key, with a token when more records are available. The default is 100 summaries and the maximum is 256. At small frame limits, an entry may omit fields and set `identity_omitted` to keep its ID and continuation token. Use that record ID to get the full summary. |
 | `GetDeadLetter` | Provide the topic and an opaque ID from the list. Concatenate the streamed chunk bytes and decode them as a `DeadLetter` with the summary and original publish fields. A missing record returns `NotFound`. |
 | `DeleteDeadLetter` | Provide the topic and ID. Deletion is idempotent. |
 

@@ -268,7 +268,7 @@ func startRun(cmd *cobra.Command, _ []string) {
 		a.RegisterComponentWithShutdown()
 		go func() {
 			defer a.ComponentShutdownDone()
-			ledger.RunRetryOwner(a.Ctx, logger)
+			ledger.RunRetryOwner(a.Ctx, cfg.Delivery.RetryOwnerLease, logger)
 		}()
 	}
 

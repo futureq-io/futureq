@@ -133,17 +133,23 @@ Consumer registration and rebalance activation retain their completion checks.
 
 For a publish with `max_retries`, the broker reserves a recipient-specific
 attempt and durably charges it before calling gRPC Send. Its deadline uses
-`delivery.inFlightTimeout`. An uncharged reservation can expire and reuse
-its attempt number. A charged attempt retains its number through transport
-stalls, failures, and broker crashes. Each attempt has a distinct tag, so a
-delayed ACK or NACK cannot settle a later attempt.
+`delivery.inFlightTimeout`. The sender checks its permit and deadline after
+authorization commits. If either check fails before entering transport, it
+refunds the unsent attempt. Once the sender enters transport, the attempt
+retains its number through stalls, failures, and broker crashes. Each attempt
+has a distinct tag, so a delayed ACK or NACK cannot settle a later attempt.
+A failed refund stays protected from expiry while the owner retries it. The
+broker bounds authorizations and refunds separately from the ACK queue, using
+`delivery.ackQueueCapacity` for both. During a chunked send the broker checks
+the permit and attempt before each frame and ends the stream if the delivery
+is no longer eligible.
 
 The broker queues outcomes for asynchronous persistence and releases local
 tracking after commit. While a broker owns an attempt, outcomes it accepts
-into that queue take precedence over expiry. Clustered brokers renew a
-15-second Raft lease to keep ownership. If the owner crashes or loses its
-lease, the leader can recover expired attempts and any outcomes that failed
-to commit can be lost.
+into that queue take precedence over expiry. Clustered brokers renew
+`delivery.retryOwnerLease` every fifth of its duration (every 3 seconds by
+default). If the owner crashes or the lease lapses, the leader can recover
+expired attempts and any outcomes that failed to commit can be lost.
 
 Deadline scans drain expired attempts in bounded batches, including when no
 workers are connected. A final NACK or timeout atomically archives the payload
