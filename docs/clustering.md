@@ -17,24 +17,22 @@ Replication is built on [Dragonboat v4](https://github.com/lni/dragonboat) (mult
 
 ## Event-shard commands
 
-Event commands include the storage format in `internal/raft/event/commands.go`
-and publish-bound delivery in `internal/raft/event/published_delivery.go`:
+Event command formats are defined in `internal/raft/event/commands.go`
+and `internal/raft/event/publish_command.go`.
 
 | Command             | Payload |
 | ------------------- | ------- |
 | `StoreBatchCmd (0)` | Each item carries a proposed `u64 id`, a 9-byte shard slot and time bucket, a `u64 topicHash`, index entries, and a `u32 len` followed by the serialized `StoredMessage`. Ordered apply advances stale IDs past the applied watermark so keys converge. |
 | `DeleteBatchCmd (1)`| Count and fixed 25-byte message keys for ACK-driven deletes and TTL expirations. |
-| `StoreDeliveryBatchCmd (8)` | Legacy leader/no-ACK publish. Encoded store batch followed by a length-prefixed frozen receipt per message; payload and destinations commit atomically. |
 | `SubscriptionCmd (9)` | Protobuf subscription create/remove, worker connect/disconnect, batched session renewal, conditional idle expiry, and bounded retired-recipient cleanup. |
-| `PublishBatchCmd (10)` | Legacy quorum publish. Encoded store batch without receipts. Apply selects destinations from subscription state at this log position and writes payload plus receipt atomically. |
-| `PublishGroupCmd (11)` | One or more client batches in a single ordered Raft entry. The header specifies the byte budget and whether destinations are frozen. Each client batch gets an independent apply result. |
+| `PublishCmd (11)` | One client batch with a byte budget. Early ACKs carry frozen destinations. For quorum ACKs, apply selects destinations at this log position. |
 
 Quorum publishers use one proposal with no admission quorum read. Apply uses
 subscription state at the publish entry's log position so every replica chooses
-the same recipients. A client batch with an invalid destination set or whose
-expanded writes exceed the remaining proposal budget is rejected atomically. Leader and no-ACK publishers catch up the
-event view and freeze durable destinations before proposal, preserving early ACKs. The
-event group stores group and universal subscriptions independently of the metadata
+the same recipients. Apply rejects the entire client batch if destinations
+are invalid or the expanded writes exceed its budget. Leader and no-ACK
+publishers catch up the event view and freeze durable destinations before
+proposal. The event group stores group and universal subscriptions independently of the metadata
 group's live worker assignments. Subscription records, session leases and retired
 generation markers are included in snapshots. Unsubscribe and expiry cannot be
 undone by a stale worker reconnect or receipt-cleanup command. Publish-bound delivery therefore needs no per-batch
@@ -43,10 +41,11 @@ still renew the bounded ownership permit, and receipt reads observe locally
 applied committed state. Lag in observing an ACK can produce duplicate delivery.
 
 Each event storage transaction commits the matching applied Raft index and
-event ID watermark. When Stormoar delivers several publish entries together,
-the state machine keeps their combined declared write budgets within 16 MiB per
-transaction and commits other event commands separately. The `OnDeleteKeys`
-hook clears dispatcher in-flight entries on each replica. Snapshots stream the
+event ID watermark. Stormoar can apply publishes and delivery updates together.
+The state machine starts a new transaction before a publish would take staged
+event data beyond 16 MiB, accounting for the expanded receipt and the writes
+already staged. The `OnDeleteKeys` hook clears dispatcher in-flight entries on
+each replica. Snapshots stream the
 whole database as length-prefixed records. Recovery clears the database first
 and validates the applied index.
 

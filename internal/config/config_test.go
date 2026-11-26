@@ -152,7 +152,6 @@ func (s *ConfigSuite) TestRejectsUnknownAndInvalidValues() {
 		{"unspecified advertise", "cluster:\n  enabled: true\napi:\n  grpc:\n    advertise: '0.0.0.0:8443'\n", "api.grpc.advertise"},
 		{"bootstrap and join", "cluster:\n  enabled: true\n  joinSeeds: ['node2.example:8443']\n  raft:\n    advertise: 'node1.example:50005'\n    initialMembers: {1: 'node1.example:50005'}\napi:\n  grpc:\n    advertise: 'node1.example:8443'\n", "cannot both be set"},
 		{"missing bolt file", "storage:\n  engine: bolt\n  bolt:\n    file: ''\n", "storage.bolt.file"},
-		{"zero publish flush limit", "publish:\n  batchMaxInFlight: 0\n", "publish.batchMaxInFlight"},
 		{"excessive pending publish limit", "publish:\n  maxPendingRequests: 4097\n", "publish.maxPendingRequests"},
 		{"zero dispatch interval", "delivery:\n  dispatchPollInterval: 0s\n", "delivery intervals"},
 		{"zero compaction concurrency", "storage:\n  pebble:\n    compactionConcurrency: 0\n", "compactionConcurrency"},

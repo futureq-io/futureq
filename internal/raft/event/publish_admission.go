@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
-	"maps"
 	"sort"
 
 	"github.com/futureq-io/futureq/internal/storage"
@@ -12,39 +11,6 @@ import (
 	"github.com/futureq-io/stormoar/v4/statemachine"
 	"google.golang.org/protobuf/proto"
 )
-
-// PublishBatchCmd deliberately carries no receipt: only quorum publishers use
-// it, and their receipt is decided by the subscription state at this log entry.
-func MarshalPublishBatchCmd(items []StoreBatchItem) ([]byte, error) {
-	if len(items) == 0 {
-		return nil, fmt.Errorf("empty publish batch")
-	}
-	for _, item := range items {
-		if len(item.Receipt) != 0 {
-			return nil, fmt.Errorf("quorum publish command cannot contain frozen receipts")
-		}
-	}
-	cmd, err := MarshalStoreBatchCmd(items)
-	if err != nil {
-		return nil, err
-	}
-	cmd[0] = byte(PublishBatchCmd)
-	return cmd, nil
-}
-func UnmarshalPublishBatchCmd(cmd []byte) ([]StoreBatchItem, error) {
-	if len(cmd) == 0 || CommandType(cmd[0]) != PublishBatchCmd {
-		return nil, fmt.Errorf("invalid publish command")
-	}
-	// The shared decoder leaves payload/index slices in the original log buffer.
-	items, err := unmarshalStoreBatch(cmd, PublishBatchCmd)
-	if err != nil {
-		return nil, err
-	}
-	if len(items) == 0 {
-		return nil, fmt.Errorf("empty publish batch")
-	}
-	return items, nil
-}
 
 type PublishRejectionReason byte
 
@@ -65,7 +31,7 @@ type PublishRejectedError struct {
 func (e *PublishRejectedError) Error() string {
 	switch e.Reason {
 	case PublishStorageBudgetExceeded:
-		return "publish batch exceeds the remaining storage byte budget"
+		return "publish batch exceeds its byte budget"
 	case PublishTopicNotFound:
 		return fmt.Sprintf("topic %q does not exist", e.Topic)
 	case PublishTooManyDestinations:
@@ -177,22 +143,14 @@ func (b *DeliveryBatch) subscriptionRecipients(topic string) ([]string, error) {
 	return names, nil
 }
 
-// bindPublishRecipients validates the entire batch before adding any storage
-// mutations. Later subscription entries cannot change an admitted message's
-// receipt; all messages on a topic share its view at this publish log entry.
-func (b *DeliveryBatch) bindPublishRecipients(items []StoreBatchItem) (statemachine.Result, bool, error) {
-	_, result, err := b.measurePublish(items, false, int(^uint(0)>>1), nil)
-	return result, len(result.Data) == 0 && err == nil, err
-}
-
 // measurePublish binds any unresolved receipts and counts the expanded writes
 // before the client batch can modify storage or advance the last event ID.
-func (b *DeliveryBatch) measurePublish(items []StoreBatchItem, frozen bool, budget int, groupReceipts map[string][]byte) (int, statemachine.Result, error) {
+func (b *DeliveryBatch) measurePublish(items []StoreBatchItem, frozen bool, budget int) (int, statemachine.Result, error) {
 	var size int
 	receipts := make(map[string][]byte)
 	for i := range items {
 		if !frozen {
-			result, err := b.bindPublishItem(&items[i], receipts, groupReceipts)
+			result, err := b.bindPublishItem(&items[i], receipts)
 			if err != nil || len(result.Data) != 0 {
 				return 0, result, err
 			}
@@ -203,25 +161,16 @@ func (b *DeliveryBatch) measurePublish(items []StoreBatchItem, frozen bool, budg
 		}
 		size += itemBytes
 	}
-	// Reuse a topic's receipt across client frames at this log position.
-	// Only admitted receipts are retained, so the cache fits the write budget.
-	if groupReceipts != nil {
-		maps.Copy(groupReceipts, receipts)
-	}
 	return size, statemachine.Result{}, nil
 }
 
-func (b *DeliveryBatch) bindPublishItem(item *StoreBatchItem, receipts, groupReceipts map[string][]byte) (statemachine.Result, error) {
+func (b *DeliveryBatch) bindPublishItem(item *StoreBatchItem, receipts map[string][]byte) (statemachine.Result, error) {
 	var message deliverypb.StoredMessageMetadata
 	if err := (proto.UnmarshalOptions{DiscardUnknown: true}).Unmarshal(item.Msg, &message); err != nil {
 		return statemachine.Result{}, fmt.Errorf("invalid publish message: %w", err)
 	}
 	if message.Topic == "" {
 		return statemachine.Result{}, fmt.Errorf("publish message lacks topic")
-	}
-	if receipt, exists := groupReceipts[message.Topic]; exists {
-		item.Receipt = receipt
-		return statemachine.Result{}, nil
 	}
 	receipt, exists := receipts[message.Topic]
 	if !exists {

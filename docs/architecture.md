@@ -40,7 +40,7 @@ One binary, two operating modes, selected by `cluster.enabled`:
 3. The leader reserves a proposed event ID, computes the **time bucket** from `enqueue time + delay`, and hashes the topic. Ordered Raft apply finalizes each ID above the applied high-water mark, so an in-flight reservation from a former leader cannot overwrite another message. The final watermark is committed with the payloads and restored across restart and snapshots.
 4. Snapshot all durable named destinations (including offline groups) and live
    universal subscriptions. Reject the whole batch if any topic has no destinations.
-5. Clustered mode: one `StoreDeliveryBatchCmd` commits both payloads and frozen
+5. Clustered mode: one `PublishCmd` commits both payloads and frozen
    receipts through Raft. Standalone: one storage batch commits both with fsync.
 6. The message lands in storage under a 25-byte [time-bucketed key](storage.md) (`topicHash · bucket · eventID`) plus optional secondary indexes.
 

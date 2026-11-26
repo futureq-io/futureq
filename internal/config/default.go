@@ -40,7 +40,7 @@ var defaultConfig = Config{
 	},
 	Publish: Publish{MinAckLevel: Quorum, ProposalTimeout: 5 * time.Second,
 		BatchMaxRequests: 1, BatchMaxBytes: "1MiB", BatchMaxWait: time.Millisecond,
-		BatchMaxInFlight: 16, MaxPendingRequests: 256},
+		MaxPendingRequests: 256},
 	Delivery: Delivery{
 		ShardDistribution:          metadata.ShardDistributionConsumerCount,
 		HeapType:                   HeapBinary,

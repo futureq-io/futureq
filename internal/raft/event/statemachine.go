@@ -102,40 +102,22 @@ func (s *EventStateMachine) readStoredUint64(key []byte) (uint64, error) {
 // Update. Every replica makes the same choice without consulting local NextID
 // reservations, which may differ across an in-flight leader handoff.
 //
-// Any storage error aborts the entire Update: the batch is only committed at
-// the end of Update, so returning an error means nothing partial is written.
-// A replica that cannot write must stop (Dragonboat halts it on Update error)
-// rather than silently diverge with a watermark lagging its stored keys.
+// A storage error aborts the current transaction. Stormoar stops a replica
+// on an Update error. Earlier transactions already include their applied
+// index so recovery can replay only the unapplied suffix.
 func (s *EventStateMachine) applyEntry(batch storage.Batch, delivery *DeliveryBatch, cmd []byte, lastID uint64) (statemachine.Result, [][]byte, uint64, error) {
 	if len(cmd) == 0 {
 		return statemachine.Result{Value: 0}, nil, 0, nil
 	}
 
 	switch CommandType(cmd[0]) {
-	case PublishGroupCmd:
-		result, maxID, err := s.applyPublishGroup(batch, delivery, cmd, lastID)
-		return result, nil, maxID, err
 	case SubscriptionCmd:
 		result, deleted, err := delivery.ApplySubscription(cmd)
 		return result, deleted, 0, err
-	case StoreBatchCmd, StoreDeliveryBatchCmd, PublishBatchCmd:
-		var items []StoreBatchItem
-		var err error
-		if CommandType(cmd[0]) == PublishBatchCmd {
-			items, err = UnmarshalPublishBatchCmd(cmd)
-		} else if CommandType(cmd[0]) == StoreDeliveryBatchCmd {
-			items, err = UnmarshalStoreDeliveryBatchCmd(cmd)
-		} else {
-			items, err = UnmarshalStoreBatchCmd(cmd)
-		}
+	case StoreBatchCmd:
+		items, err := UnmarshalStoreBatchCmd(cmd)
 		if err != nil {
 			return statemachine.Result{}, nil, 0, fmt.Errorf("raft: invalid StoreBatchCmd: %w", err)
-		}
-		if CommandType(cmd[0]) == PublishBatchCmd {
-			result, admitted, err := delivery.bindPublishRecipients(items)
-			if err != nil || !admitted {
-				return result, nil, 0, err
-			}
 		}
 		result, maxID, err := s.applyStoreItems(batch, delivery, items, lastID)
 		return result, nil, maxID, err
@@ -189,7 +171,7 @@ func (s *EventStateMachine) applyStoreItems(batch storage.Batch, delivery *Deliv
 			if err != nil {
 				return statemachine.Result{}, 0, err
 			}
-			delivery.save(key, state)
+			delivery.saveReceipt(key, state, len(it.Receipt))
 		}
 		if it.ID > maxID {
 			maxID = it.ID
@@ -198,62 +180,95 @@ func (s *EventStateMachine) applyStoreItems(batch storage.Batch, delivery *Deliv
 	return statemachine.Result{Value: uint64(len(items))}, maxID, nil
 }
 
+// measuredEventBatch counts staged key and value bytes. Deferred receipts
+// live in the DeliveryBatch overlay until commit and are counted separately.
+type measuredEventBatch struct {
+	storage.Batch
+	bytes int
+}
+
+func (b *measuredEventBatch) Set(key, value []byte) error {
+	b.bytes += len(key) + len(value)
+	return b.Batch.Set(key, value)
+}
+
+func (b *measuredEventBatch) Delete(key []byte) error {
+	b.bytes += len(key)
+	return b.Batch.Delete(key)
+}
+
 func (s *EventStateMachine) Update(entries []statemachine.Entry) ([]statemachine.Entry, error) {
-	// Stormoar may deliver several entries in one Update. Group publish-only
-	// transactions by their declared budgets to bound the physical write too.
-	// Each storage commit persists its matching Raft index.
-	start, reserved := 0, 0
-	for i, entry := range entries {
-		budget := 0
-		if len(entry.Cmd) != 0 && CommandType(entry.Cmd[0]) == PublishGroupCmd {
-			var err error
-			budget, err = publishGroupBudget(entry.Cmd)
+	if len(entries) == 0 {
+		return entries, nil
+	}
+	batch := &measuredEventBatch{Batch: s.db.NewBatch()}
+	delivery := NewDeliveryBatch(s.db, batch)
+	delivery.receipts, delivery.measureReceipts = &s.receipts, true
+	defer func() { _ = batch.Close() }()
+
+	var allDeletedKeys [][]byte
+	lastApplied, lastID := s.lastApplied, s.lastPersistedID
+	for i := range entries {
+		cmd := entries[i].Cmd
+		publish := len(cmd) > 0 && CommandType(cmd[0]) == PublishCmd
+		var result statemachine.Result
+		var items []StoreBatchItem
+		var publishBytes int
+		if publish {
+			decoded, frozen, budget, err := unmarshalPublishCmd(cmd)
+			if err != nil {
+				return nil, err
+			}
+			items = decoded
+			publishBytes, result, err = delivery.measurePublish(items, frozen, budget)
 			if err != nil {
 				return nil, err
 			}
 		}
-		if i > start && ((budget == 0) != (reserved == 0) || budget > config.MaxPublishBatchBytes-reserved) {
-			if err := s.updateEntries(entries[start:i]); err != nil {
+
+		// A publish that fits on its own starts a fresh transaction if
+		// necessary. Admission still sees every preceding entry in order,
+		// including subscription mutations staged in the current overlay.
+		staged := batch.bytes + delivery.pendingReceiptBytes
+		if i > 0 && (staged >= config.MaxPublishBatchBytes || publishBytes > config.MaxPublishBatchBytes-staged) {
+			if err := s.commitUpdate(batch, delivery, lastApplied, lastID, allDeletedKeys); err != nil {
 				return nil, err
 			}
-			start, reserved = i, 0
+			_ = batch.Close()
+			batch.Batch, batch.bytes = s.db.NewBatch(), 0
+			delivery = NewDeliveryBatch(s.db, batch)
+			delivery.receipts, delivery.measureReceipts = &s.receipts, true
+			allDeletedKeys = nil
 		}
-		reserved += budget
+
+		var entryMaxID uint64
+		if publish {
+			if len(result.Data) == 0 {
+				var err error
+				result, entryMaxID, err = s.applyStoreItems(batch, delivery, items, lastID)
+				if err != nil {
+					return nil, err
+				}
+			}
+		} else {
+			entryResult, deletedKeys, maxID, err := s.applyEntry(batch, delivery, cmd, lastID)
+			if err != nil {
+				return nil, err
+			}
+			result, entryMaxID = entryResult, maxID
+			allDeletedKeys = append(allDeletedKeys, deletedKeys...)
+		}
+		entries[i].Result = result
+		lastApplied = entries[i].Index
+		lastID = max(lastID, entryMaxID)
 	}
-	if start < len(entries) {
-		if err := s.updateEntries(entries[start:]); err != nil {
-			return nil, err
-		}
+	if err := s.commitUpdate(batch, delivery, lastApplied, lastID, allDeletedKeys); err != nil {
+		return nil, err
 	}
 	return entries, nil
 }
 
-func (s *EventStateMachine) updateEntries(entries []statemachine.Entry) error {
-	batch := s.db.NewBatch()
-	delivery := NewDeliveryBatch(s.db, batch)
-	delivery.receipts = &s.receipts
-
-	defer batch.Close() //nolint:errcheck
-
-	var allDeletedKeys [][]byte
-	lastApplied := s.lastApplied
-	lastID := s.lastPersistedID
-
-	for i := range entries {
-		result, deletedKeys, entryMaxID, err := s.applyEntry(batch, delivery, entries[i].Cmd, lastID)
-		if err != nil {
-			return err
-		}
-		entries[i].Result = result
-		if len(deletedKeys) > 0 {
-			allDeletedKeys = append(allDeletedKeys, deletedKeys...)
-		}
-		lastApplied = entries[i].Index
-		if entryMaxID > lastID {
-			lastID = entryMaxID
-		}
-	}
-
+func (s *EventStateMachine) commitUpdate(batch storage.Batch, delivery *DeliveryBatch, lastApplied, lastID uint64, allDeletedKeys [][]byte) error {
 	if err := delivery.Flush(); err != nil {
 		return err
 	}

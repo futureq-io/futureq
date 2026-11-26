@@ -134,7 +134,7 @@ func TestPublishBoundRaftFollowerReconnectAndRestart(t *testing.T) {
 	data, err := proto.Marshal(&storagepb.StoredMessage{Topic: "orders", Payload: []byte("payload"), EnqueuedAtUnixMs: due})
 	require.NoError(t, err)
 	bucket := utils.CalculateBucket(due, time.Second)
-	cmd, err := raft.MarshalStoreDeliveryBatchCmd([]raft.StoreBatchItem{{ID: 999, Bucket: bucket, TopicHash: utils.TopicHash("orders"), Msg: data, Receipt: receipt}})
+	cmd, err := raft.MarshalPublishCmd([]raft.StoreBatchItem{{ID: 999, Bucket: bucket, TopicHash: utils.TopicHash("orders"), Msg: data, Receipt: receipt}}, true, 1<<20)
 	require.NoError(t, err)
 	_, err = node.nh.SyncPropose(ctx, node.nh.GetNoOPSession(replicaTestShard), cmd)
 	require.NoError(t, err)

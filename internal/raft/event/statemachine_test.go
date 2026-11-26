@@ -592,7 +592,7 @@ func (s *EventStateMachineSuite) TestClose_NoError() {
 	require.NoError(sm.Close())
 }
 
-func allocationCommand(t *testing.T, kind CommandType, ids []uint64, payloads ...string) []byte {
+func allocationCommand(t *testing.T, raw, frozen bool, ids []uint64, payloads ...string) []byte {
 	t.Helper()
 	receipt, err := MarshalPublishReceipt(0, []string{"g:s:workers"})
 	require.NoError(t, err)
@@ -601,28 +601,26 @@ func allocationCommand(t *testing.T, kind CommandType, ids []uint64, payloads ..
 		value, err := proto.Marshal(&storagepb.StoredMessage{Topic: "orders", Payload: []byte(payloads[i]), EnqueuedAtUnixMs: 1000})
 		require.NoError(t, err)
 		items[i] = StoreBatchItem{ID: id, Bucket: 1, TopicHash: utils.TopicHash("orders"), Msg: value, Indexes: [][]byte{[]byte("index/" + payloads[i])}}
-		if kind == StoreDeliveryBatchCmd {
+		if frozen {
 			items[i].Receipt = receipt
 		}
 	}
 	var command []byte
-	switch kind {
-	case StoreBatchCmd:
+	if raw {
 		command, err = MarshalStoreBatchCmd(items)
-	case StoreDeliveryBatchCmd:
-		command, err = MarshalStoreDeliveryBatchCmd(items)
-	case PublishBatchCmd:
-		command, err = MarshalPublishBatchCmd(items)
+	} else {
+		command, err = MarshalPublishCmd(items, frozen, 1<<20)
 	}
 	require.NoError(t, err)
 	return command
 }
 
 func TestOrderedApplyReassignsStaleAndDuplicateReservations(t *testing.T) {
-	for _, kind := range []CommandType{StoreBatchCmd, StoreDeliveryBatchCmd, PublishBatchCmd} {
-		t.Run(map[CommandType]string{StoreBatchCmd: "raw", StoreDeliveryBatchCmd: "early-ack", PublishBatchCmd: "quorum"}[kind], func(t *testing.T) {
+	for _, mode := range []string{"raw", "early-ack", "quorum"} {
+		t.Run(mode, func(t *testing.T) {
+			raw, frozen := mode == "raw", mode == "early-ack"
 			sm, db := newDeliveryTestSM(t)
-			if kind == PublishBatchCmd {
+			if mode == "quorum" {
 				create, err := testSubscriptionCommand("orders", "workers", "g:s:workers")
 				require.NoError(t, err)
 				applyAdmissionSequence(t, sm, create)
@@ -630,8 +628,8 @@ func TestOrderedApplyReassignsStaleAndDuplicateReservations(t *testing.T) {
 			// Duplicate IDs inside a command and a later stale command in the
 			// same Update must all use the running applied high-water mark.
 			applyAdmissionSequence(t, sm,
-				allocationCommand(t, kind, []uint64{20, 20}, "first", "second"),
-				allocationCommand(t, kind, []uint64{1}, "third"))
+				allocationCommand(t, raw, frozen, []uint64{20, 20}, "first", "second"),
+				allocationCommand(t, raw, frozen, []uint64{1}, "third"))
 			for i, want := range []string{"first", "second", "third"} {
 				key := utils.EventKey(1, utils.TopicHash("orders"), 20+uint64(i))
 				value, closer, err := db.Get(key)
@@ -644,7 +642,7 @@ func TestOrderedApplyReassignsStaleAndDuplicateReservations(t *testing.T) {
 				require.NoError(t, err)
 				require.Equal(t, key, index, "indexes must reference the assigned ID")
 				require.NoError(t, closer.Close())
-				if kind != StoreBatchCmd {
+				if !raw {
 					state, err := ReadDeliveryState(db, key)
 					require.NoError(t, err)
 					require.NotNil(t, state)
@@ -662,7 +660,7 @@ func TestOrderedApplyReassignsStaleAndDuplicateReservations(t *testing.T) {
 
 func TestOrderedApplyKeepsIDWatermarkAcrossDeletionAndSnapshot(t *testing.T) {
 	sm, _ := newDeliveryTestSM(t)
-	applyAdmissionSequence(t, sm, allocationCommand(t, StoreDeliveryBatchCmd, []uint64{9}, "original"))
+	applyAdmissionSequence(t, sm, allocationCommand(t, false, true, []uint64{9}, "original"))
 	snapshot, err := sm.PrepareSnapshot()
 	require.NoError(t, err)
 	var stream bytes.Buffer
@@ -672,7 +670,7 @@ func TestOrderedApplyKeepsIDWatermarkAcrossDeletionAndSnapshot(t *testing.T) {
 	oldKey := utils.EventKey(1, utils.TopicHash("orders"), 9)
 	remove, err := MarshalDeleteBatchCmd([][]byte{oldKey})
 	require.NoError(t, err)
-	applyAdmissionSequence(t, recovered, remove, allocationCommand(t, StoreDeliveryBatchCmd, []uint64{9}, "delayed"))
+	applyAdmissionSequence(t, recovered, remove, allocationCommand(t, false, true, []uint64{9}, "delayed"))
 	_, _, err = db.Get(oldKey)
 	require.ErrorIs(t, err, storage.ErrNotFound, "completion must not allow a stale reservation to reuse a key")
 	state, err := ReadDeliveryState(db, oldKey)
@@ -690,15 +688,15 @@ func TestOrderedApplyKeepsIDWatermarkAcrossDeletionAndSnapshot(t *testing.T) {
 
 func TestOrderedApplyRejectsIDExhaustionWithoutWrappingOrPartialWrites(t *testing.T) {
 	sm, db := newDeliveryTestSM(t)
-	command := allocationCommand(t, StoreBatchCmd, []uint64{^uint64(0), 0}, "maximum", "wrapped")
+	command := allocationCommand(t, true, false, []uint64{^uint64(0), 0}, "maximum", "wrapped")
 	_, err := sm.Update([]statemachine.Entry{{Index: 1, Cmd: command}})
 	require.ErrorContains(t, err, "event ID space exhausted")
 	require.Zero(t, sm.lastApplied)
 	require.Zero(t, sm.lastPersistedID)
 	_, _, err = db.Get(utils.EventKey(1, utils.TopicHash("orders"), ^uint64(0)))
 	require.ErrorIs(t, err, storage.ErrNotFound, "the whole Update must abort")
-	applyAdmissionSequence(t, sm, allocationCommand(t, StoreBatchCmd, []uint64{^uint64(0)}, "maximum"))
-	_, err = sm.Update([]statemachine.Entry{{Index: 2, Cmd: allocationCommand(t, StoreBatchCmd, []uint64{0}, "wrapped")}})
+	applyAdmissionSequence(t, sm, allocationCommand(t, true, false, []uint64{^uint64(0)}, "maximum"))
+	_, err = sm.Update([]statemachine.Entry{{Index: 2, Cmd: allocationCommand(t, true, false, []uint64{0}, "wrapped")}})
 	require.ErrorContains(t, err, "event ID space exhausted")
 	require.Equal(t, uint64(1), sm.lastApplied)
 	_, _, err = db.Get(utils.EventKey(1, utils.TopicHash("orders"), 0))

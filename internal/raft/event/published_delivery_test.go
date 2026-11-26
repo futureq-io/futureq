@@ -19,7 +19,7 @@ func TestPublishedDeliveryAtomicApplySnapshotAndAckIsolation(t *testing.T) {
 	require.NoError(t, err)
 	receipt, err := MarshalPublishReceipt(1, []string{"g:s:a", "g:s:b"})
 	require.NoError(t, err)
-	store, err := MarshalStoreDeliveryBatchCmd([]StoreBatchItem{{ID: 3, Bucket: 1, TopicHash: 2, Msg: []byte("payload"), Receipt: receipt}})
+	store, err := MarshalPublishCmd([]StoreBatchItem{{ID: 3, Bucket: 1, TopicHash: 2, Msg: []byte("payload"), Receipt: receipt}}, true, 1<<20)
 	require.NoError(t, err)
 	key := utils.EventKey(1, 2, 3)
 	ack, err := MarshalAckDeliveryBatchCmd([]DeliveryAck{{Key: key, Recipient: "g:s:a"}})
@@ -57,15 +57,15 @@ func TestPublishedDeliveryAtomicApplySnapshotAndAckIsolation(t *testing.T) {
 func TestPublishCommandRejectsEveryTruncatedPrefix(t *testing.T) {
 	receipt, err := MarshalPublishReceipt(0, []string{"g:s:a"})
 	require.NoError(t, err)
-	cmd, err := MarshalStoreDeliveryBatchCmd([]StoreBatchItem{{ID: 1, Bucket: 2, TopicHash: 3, Msg: []byte("payload"), Receipt: receipt}})
+	cmd, err := MarshalPublishCmd([]StoreBatchItem{{ID: 1, Bucket: 2, TopicHash: 3, Msg: []byte("payload"), Receipt: receipt}}, true, 1<<20)
 	require.NoError(t, err)
 	for n := 0; n < len(cmd); n++ {
-		_, err := UnmarshalStoreDeliveryBatchCmd(cmd[:n])
+		_, _, _, err := unmarshalPublishCmd(cmd[:n])
 		require.Error(t, err, "prefix=%d", n)
 	}
-	_, err = UnmarshalStoreDeliveryBatchCmd(append(cmd, 0))
+	_, _, _, err = unmarshalPublishCmd(append(cmd, 0))
 	require.Error(t, err)
-	items, err := UnmarshalStoreDeliveryBatchCmd(cmd)
+	items, _, _, err := unmarshalPublishCmd(cmd)
 	require.NoError(t, err)
 	require.Equal(t, receipt, items[0].Receipt)
 	_, err = MarshalPublishReceipt(0, nil)

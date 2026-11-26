@@ -82,10 +82,9 @@ storage:
 publish:
   minAckLevel: quorum # quorum, leader, or noAck
   proposalTimeout: 5s
-  batchMaxRequests: 1 # 1 disables server-side grouping
+  batchMaxRequests: 1 # 1 disables standalone grouping
   batchMaxBytes: 1MiB
   batchMaxWait: 1ms
-  batchMaxInFlight: 16
   maxPendingRequests: 256
 
 delivery:

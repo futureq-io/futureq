@@ -3,7 +3,6 @@ package handlers
 import (
 	"bytes"
 	"context"
-	"encoding/binary"
 	"errors"
 	"net"
 	"path/filepath"
@@ -48,8 +47,6 @@ type observedAdmissionSM struct {
 	admissionUnavailable atomic.Bool
 	mu                   sync.Mutex
 	commands             [][]byte
-	capture              bool
-	proposals            atomic.Int64
 	applyGate            atomic.Pointer[publishGate]
 	logGate              atomic.Pointer[publishGate]
 }
@@ -88,15 +85,12 @@ func (g *publishGate) wait() {
 
 func (sm *observedAdmissionSM) Update(entries []statemachine.Entry) ([]statemachine.Entry, error) {
 	for _, entry := range entries {
-		if len(entry.Cmd) == 0 || raft.CommandType(entry.Cmd[0]) != raft.PublishGroupCmd {
+		if len(entry.Cmd) == 0 || raft.CommandType(entry.Cmd[0]) != raft.PublishCmd {
 			continue
 		}
-		sm.proposals.Add(1)
-		if sm.capture {
-			sm.mu.Lock()
-			sm.commands = append(sm.commands, append([]byte(nil), entry.Cmd...))
-			sm.mu.Unlock()
-		}
+		sm.mu.Lock()
+		sm.commands = append(sm.commands, append([]byte(nil), entry.Cmd...))
+		sm.mu.Unlock()
 		if gate := sm.applyGate.Load(); gate != nil {
 			gate.wait()
 		}
@@ -136,7 +130,7 @@ func (db observedPublishLogDB) SaveRaftState(updates []raftpb.Update, shardID ui
 				if entry.Type == raftpb.EncodedEntry && len(cmd) > 0 && cmd[0] == 0 {
 					cmd = cmd[1:]
 				}
-				if len(cmd) > 0 && raft.CommandType(cmd[0]) == raft.PublishGroupCmd {
+				if len(cmd) > 0 && raft.CommandType(cmd[0]) == raft.PublishCmd {
 					gate.wait()
 				}
 			}
@@ -145,25 +139,11 @@ func (db observedPublishLogDB) SaveRaftState(updates []raftpb.Update, shardID ui
 	return db.ILogDB.SaveRaftState(updates, shardID)
 }
 
-func publishFrameCount(t testing.TB, cmd []byte) int {
-	t.Helper()
-	count := 0
-	for data := cmd[raft.PublishGroupHeaderSize:]; len(data) > 0; {
-		require.GreaterOrEqual(t, len(data), raft.PublishGroupFrameOverhead)
-		length := int(binary.BigEndian.Uint32(data))
-		require.Positive(t, length)
-		require.LessOrEqual(t, length, len(data)-raft.PublishGroupFrameOverhead)
-		data = data[raft.PublishGroupFrameOverhead+length:]
-		count++
-	}
-	return count
-}
-
 func openRaftAdmissionTest(t *testing.T) (*app.App, *ProducerHandler, *observedAdmissionSM, *admissionReadDB) {
-	return openRaftPublishFixture(t, config.DefaultPublish(), true)
+	return openRaftPublishFixture(t, config.DefaultPublish())
 }
 
-func openRaftPublishFixture(t testing.TB, publish config.Publish, capture bool) (*app.App, *ProducerHandler, *observedAdmissionSM, *admissionReadDB) {
+func openRaftPublishFixture(t testing.TB, publish config.Publish) (*app.App, *ProducerHandler, *observedAdmissionSM, *admissionReadDB) {
 	t.Helper()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
@@ -178,7 +158,7 @@ func openRaftPublishFixture(t testing.TB, publish config.Publish, capture bool) 
 	require.NoError(t, a.WithRepositories())
 	tracker := leaderpersist.NewTracker()
 	nhc := raftconfig.NodeHostConfig{NodeHostDir: filepath.Join(root, "raft"), RaftAddress: address, RTTMillisecond: 10}
-	sm := &observedAdmissionSM{capture: capture, IOnDiskStateMachine: raft.NewEventStateMachineFactory(a.DB, a.Repositories.Events, nil, zap.NewNop())(1, 1)}
+	sm := &observedAdmissionSM{IOnDiskStateMachine: raft.NewEventStateMachineFactory(a.DB, a.Repositories.Events, nil, zap.NewNop())(1, 1)}
 	nhc.Expert.LogDBFactory = observedPublishLogFactory{LogDBFactory: leaderpersist.NewFactory(tracker), gate: &sm.logGate}
 	nhc.Expert.Engine = raftconfig.EngineConfig{ExecShards: 1, CommitShards: 1, ApplyShards: 1, SnapshotShards: 1, CloseShards: 1}
 	nh, err := dragonboat.NewNodeHost(nhc)
@@ -254,7 +234,6 @@ func TestRaftPublishAdmissionReadCountsAndAllAckModes(t *testing.T) {
 	commands := sm.publishedCommands()
 	require.Len(t, commands, 3)
 	for i, cmd := range commands {
-		require.Equal(t, 1, publishFrameCount(t, cmd))
 		require.Equal(t, i != 0, cmd[1] == 1, "only early ACKs freeze destinations in the log")
 	}
 	for _, key := range publishedKeys(t, a.DB) {
@@ -316,12 +295,12 @@ func TestRaftEarlyAckRejectsUnavailableAdmissionBeforeProposal(t *testing.T) {
 	require.Eventually(t, func() bool { return len(publishedKeys(t, a.DB)) == len(modes) }, time.Second, time.Millisecond)
 }
 
-func TestRaftGroupedPublishAckGuarantees(t *testing.T) {
+func TestRaftPublishAckGuarantees(t *testing.T) {
 	for _, mode := range []pb.AckLevel{pb.AckLevel_ACK_LEVEL_QUORUM, pb.AckLevel_ACK_LEVEL_LEADER, pb.AckLevel_ACK_LEVEL_NO_ACK} {
 		t.Run(mode.String(), func(t *testing.T) {
 			publish := config.DefaultPublish()
 			publish.BatchMaxRequests, publish.BatchMaxWait = 2, 500*time.Millisecond
-			a, producer, sm, _ := openRaftPublishFixture(t, publish, true)
+			a, producer, sm, _ := openRaftPublishFixture(t, publish)
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
 			_, err := a.Subscriptions.Create(ctx, "orders", "workers", "")
@@ -329,19 +308,16 @@ func TestRaftGroupedPublishAckGuarantees(t *testing.T) {
 
 			releaseLog, logged := holdPublish(t, &sm.logGate)
 			releaseApply, applying := holdPublish(t, &sm.applyGate)
-			returned := make(chan error, 2)
-			for range 2 {
-				go func() {
-					ack, err := producer.processBatch(ctx, &pb.PublishBatch{AckLevel: mode, Messages: []*pb.PublishMessage{{Topic: "orders"}}})
-					if err == nil && !ack.Success {
-						err = errors.New("publish was not acknowledged")
-					}
-					returned <- err
-				}()
-			}
+			returned := make(chan error, 1)
+			go func() {
+				ack, err := producer.processBatch(ctx, &pb.PublishBatch{AckLevel: mode, Messages: []*pb.PublishMessage{{Topic: "orders"}, {Topic: "orders"}}})
+				if err == nil && !ack.Success {
+					err = errors.New("publish was not acknowledged")
+				}
+				returned <- err
+			}()
 			awaitPublishSignal(t, logged)
 			if mode == pb.AckLevel_ACK_LEVEL_NO_ACK {
-				require.NoError(t, awaitPublishError(t, returned))
 				require.NoError(t, awaitPublishError(t, returned))
 			} else {
 				assertPublishWaiting(t, returned)
@@ -351,19 +327,61 @@ func TestRaftGroupedPublishAckGuarantees(t *testing.T) {
 			require.Empty(t, publishedKeys(t, a.DB))
 			if mode == pb.AckLevel_ACK_LEVEL_LEADER {
 				require.NoError(t, awaitPublishError(t, returned))
-				require.NoError(t, awaitPublishError(t, returned))
 			} else if mode == pb.AckLevel_ACK_LEVEL_QUORUM {
 				assertPublishWaiting(t, returned)
 			}
 			releaseApply()
 			if mode == pb.AckLevel_ACK_LEVEL_QUORUM {
 				require.NoError(t, awaitPublishError(t, returned))
-				require.NoError(t, awaitPublishError(t, returned))
-				require.Len(t, publishedKeys(t, a.DB), 2)
 			}
+			require.Eventually(t, func() bool { return len(publishedKeys(t, a.DB)) == 2 }, time.Second, time.Millisecond)
 			commands := sm.publishedCommands()
 			require.Len(t, commands, 1)
-			require.Equal(t, 2, publishFrameCount(t, commands[0]))
+			require.Nil(t, producer.batcher, "standalone grouping must be ignored in clustered mode")
 		})
 	}
+}
+
+func TestRaftConcurrentPublishesHaveIndependentBudgets(t *testing.T) {
+	cfg := config.DefaultPublish()
+	cfg.BatchMaxRequests, cfg.BatchMaxWait, cfg.BatchMaxBytes = 2, 500*time.Millisecond, "480B"
+	a, producer, sm, _ := openRaftPublishFixture(t, cfg)
+	require.NoError(t, createTestInterest(context.Background(), "orders", "workers"))
+	require.Nil(t, producer.batcher)
+	batch := &pb.PublishBatch{Messages: []*pb.PublishMessage{{Topic: "orders", Payload: make([]byte, 256)}}}
+	returned := make(chan error, 2)
+	for range 2 {
+		go func() {
+			_, err := producer.processBatch(context.Background(), batch)
+			returned <- err
+		}()
+	}
+	require.NoError(t, awaitPublishError(t, returned))
+	require.NoError(t, awaitPublishError(t, returned))
+	require.Len(t, sm.publishedCommands(), 2)
+	require.Len(t, publishedKeys(t, a.DB), 2)
+}
+
+func TestPublishAdmissionLimitAppliesAcrossAckLevels(t *testing.T) {
+	cfg := config.DefaultPublish()
+	cfg.MaxPendingRequests = 1
+	a, producer, sm, _ := openRaftPublishFixture(t, cfg)
+	require.NoError(t, createTestInterest(context.Background(), "orders", "workers"))
+	release, applying := holdPublish(t, &sm.applyGate)
+	batch := &pb.PublishBatch{Messages: []*pb.PublishMessage{{Topic: "orders"}}}
+	returned := make(chan error, 1)
+	go func() {
+		_, err := producer.processBatch(context.Background(), batch)
+		returned <- err
+	}()
+	awaitPublishSignal(t, applying)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	early := &pb.PublishBatch{AckLevel: pb.AckLevel_ACK_LEVEL_NO_ACK, Messages: batch.Messages}
+	_, err := producer.processBatch(ctx, early)
+	require.Equal(t, codes.ResourceExhausted, status.Code(err))
+	require.Zero(t, sm.reads.Load(), "overloaded requests should never reach receipt lookup")
+	release()
+	require.NoError(t, awaitPublishError(t, returned))
+	require.Len(t, publishedKeys(t, a.DB), 1)
 }

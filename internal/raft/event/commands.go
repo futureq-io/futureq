@@ -27,13 +27,10 @@ const (
 	ProtoAckDeliveryBatchCmd
 	ProtoPrepareDeliveryCmd
 
-	// Publish-time delivery and durable group registration.
-	StoreDeliveryBatchCmd
+	_ // 8: reserved for the removed early-ACK publish command.
 	SubscriptionCmd
-
-	// Quorum publish: destinations are selected at this Raft log entry.
-	PublishBatchCmd
-	PublishGroupCmd // ordered group of independent publish batches
+	_          // 10: reserved for the removed quorum publish command.
+	PublishCmd // one client batch, with frozen or apply-time destinations
 )
 
 // StoreBatchItem is the minimal per-message metadata carried in a StoreBatchCmd.
@@ -78,8 +75,19 @@ const storeItemHeaderSize = 8 + utils.StorageBucketSize + 8 + 2
 //
 // The Msg and Indexes slices in items are appended directly with a single copy.
 func MarshalStoreBatchCmd(items []StoreBatchItem) ([]byte, error) {
-	// Pre-calculate total size to do a single allocation.
-	size := 1 + 8 // cmdType + count
+	out, err := marshalStoreItems(items, 1, 0, 0)
+	if err != nil {
+		return nil, err
+	}
+	out[0] = byte(StoreBatchCmd)
+	return out, nil
+}
+
+// marshalStoreItems leaves space for the caller's command header and any
+// receipt trailer. The count and message fields have the same layout for both
+// storage and publish commands.
+func marshalStoreItems(items []StoreBatchItem, header, trailer, budget int) ([]byte, error) {
+	size := header + 8
 	for i, it := range items {
 		if it.ShardSlot < 0 || it.ShardSlot >= 2*utils.MaxVirtualShards {
 			return nil, fmt.Errorf("raft: item %d has invalid shard slot %d", i, it.ShardSlot)
@@ -100,11 +108,13 @@ func MarshalStoreBatchCmd(items []StoreBatchItem) ([]byte, error) {
 		size += 4 + len(it.Msg) // valLen + value
 	}
 
-	out := make([]byte, size)
-	out[0] = byte(StoreBatchCmd)
-	binary.BigEndian.PutUint64(out[1:9], uint64(len(items)))
+	if budget > 0 && size+trailer > budget {
+		return nil, &PublishRejectedError{Reason: PublishStorageBudgetExceeded}
+	}
+	out := make([]byte, size, size+trailer)
+	binary.BigEndian.PutUint64(out[header:], uint64(len(items)))
 
-	pos := 9
+	pos := header + 8
 	for _, it := range items {
 		binary.BigEndian.PutUint64(out[pos:pos+8], it.ID)
 		pos += 8
@@ -136,28 +146,34 @@ func MarshalStoreBatchCmd(items []StoreBatchItem) ([]byte, error) {
 // The Msg and Indexes slices in the returned items alias the input data slice — they are
 // zero-copy views into the Dragonboat log buffer. Callers must not mutate them.
 func UnmarshalStoreBatchCmd(data []byte) ([]StoreBatchItem, error) {
-	return unmarshalStoreBatch(data, StoreBatchCmd)
+	if len(data) == 0 || CommandType(data[0]) != StoreBatchCmd {
+		return nil, fmt.Errorf("raft: invalid store command")
+	}
+	items, rest, err := unmarshalStoreItems(data[1:])
+	if err != nil {
+		return nil, err
+	}
+	if len(rest) != 0 {
+		return nil, fmt.Errorf("raft: StoreBatchCmd has %d trailing bytes", len(rest))
+	}
+	return items, nil
 }
 
-func unmarshalStoreBatch(data []byte, commandType CommandType) ([]StoreBatchItem, error) {
-	if len(data) < 1+8 {
-		return nil, fmt.Errorf("raft: StoreBatchCmd too short: %d bytes", len(data))
+func unmarshalStoreItems(data []byte) ([]StoreBatchItem, []byte, error) {
+	if len(data) < 8 {
+		return nil, nil, fmt.Errorf("raft: store data too short: %d bytes", len(data))
 	}
-	if CommandType(data[0]) != commandType {
-		return nil, fmt.Errorf("raft: expected command %d, got %d", commandType, data[0])
-	}
-
-	count := binary.BigEndian.Uint64(data[1:9])
+	count := binary.BigEndian.Uint64(data)
 	// Each item needs at least its fixed fields and the message length.
-	if count > uint64((len(data)-9)/(storeItemHeaderSize+4)) {
-		return nil, fmt.Errorf("raft: StoreBatchCmd too short for %d items", count)
+	if count > uint64((len(data)-8)/(storeItemHeaderSize+4)) {
+		return nil, nil, fmt.Errorf("raft: store data too short for %d items", count)
 	}
 	items := make([]StoreBatchItem, 0, count)
 
-	pos := 9
+	pos := 8
 	for i := uint64(0); i < count; i++ {
 		if pos+storeItemHeaderSize > len(data) {
-			return nil, fmt.Errorf("raft: StoreBatchCmd truncated at item %d header", i)
+			return nil, nil, fmt.Errorf("raft: StoreBatchCmd truncated at item %d header", i)
 		}
 		id := binary.BigEndian.Uint64(data[pos : pos+8])
 		pos += 8
@@ -172,30 +188,30 @@ func unmarshalStoreBatch(data []byte, commandType CommandType) ([]StoreBatchItem
 		indexes := make([][]byte, 0, numIdx)
 		for j := 0; j < numIdx; j++ {
 			if pos+2 > len(data) {
-				return nil, fmt.Errorf("raft: StoreBatchCmd truncated at item %d index %d len", i, j)
+				return nil, nil, fmt.Errorf("raft: StoreBatchCmd truncated at item %d index %d len", i, j)
 			}
 			idxLen := int(binary.BigEndian.Uint16(data[pos : pos+2]))
 			pos += 2
 
 			if pos+idxLen > len(data) {
-				return nil, fmt.Errorf("raft: StoreBatchCmd truncated at item %d index %d data", i, j)
+				return nil, nil, fmt.Errorf("raft: StoreBatchCmd truncated at item %d index %d data", i, j)
 			}
 			indexes = append(indexes, data[pos:pos+idxLen])
 			pos += idxLen
 		}
 
 		if pos+4 > len(data) {
-			return nil, fmt.Errorf("raft: StoreBatchCmd truncated at item %d valLen", i)
+			return nil, nil, fmt.Errorf("raft: StoreBatchCmd truncated at item %d valLen", i)
 		}
-		valLen := int(binary.BigEndian.Uint32(data[pos : pos+4]))
+		valLen := binary.BigEndian.Uint32(data[pos : pos+4])
 		pos += 4
 
-		if pos+valLen > len(data) {
-			return nil, fmt.Errorf("raft: StoreBatchCmd truncated at item %d value (need %d, have %d)", i, valLen, len(data)-pos)
+		if uint64(valLen) > uint64(len(data)-pos) {
+			return nil, nil, fmt.Errorf("raft: StoreBatchCmd truncated at item %d value (need %d, have %d)", i, valLen, len(data)-pos)
 		}
 		// Zero-copy: alias the command buffer directly.
-		value := data[pos : pos+valLen]
-		pos += valLen
+		value := data[pos : pos+int(valLen)]
+		pos += int(valLen)
 
 		items = append(items, StoreBatchItem{
 			ID:        id,
@@ -206,11 +222,7 @@ func unmarshalStoreBatch(data []byte, commandType CommandType) ([]StoreBatchItem
 			Msg:       value,
 		})
 	}
-	if pos != len(data) {
-		return nil, fmt.Errorf("raft: StoreBatchCmd has %d trailing bytes", len(data)-pos)
-	}
-
-	return items, nil
+	return items, data[pos:], nil
 }
 
 // MarshalDeleteBatchCmd serialises a list of 25-byte event keys to delete.

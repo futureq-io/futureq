@@ -49,7 +49,7 @@ func TestRaftDurableUniversalSubscriptionRestartAndRemoval(t *testing.T) {
 	data, err := proto.Marshal(&storagepb.StoredMessage{Topic: "orders", Payload: []byte("offline"), EnqueuedAtUnixMs: due})
 	require.NoError(t, err)
 	bucket := utils.CalculateBucket(due, time.Second)
-	cmd, err := raft.MarshalStoreDeliveryBatchCmd([]raft.StoreBatchItem{{ID: 707, Bucket: bucket, TopicHash: utils.TopicHash("orders"), Msg: data, Receipt: receipt}})
+	cmd, err := raft.MarshalPublishCmd([]raft.StoreBatchItem{{ID: 707, Bucket: bucket, TopicHash: utils.TopicHash("orders"), Msg: data, Receipt: receipt}}, true, 1<<20)
 	require.NoError(t, err)
 	_, err = c.nodes[1].nh.SyncPropose(ctx, c.nodes[1].nh.GetNoOPSession(replicaTestShard), cmd)
 	require.NoError(t, err)

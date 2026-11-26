@@ -68,8 +68,8 @@ func NewProducerHandler(logger *zap.Logger) *ProducerHandler {
 		pending:         make(chan struct{}, cfg.MaxPendingRequests),
 		maxPublishBytes: int(maxBytes),
 	}
-	if cfg.BatchMaxRequests > 1 {
-		h.batcher = newPublishBatcher(cfg, app.A.NodeHost != nil, h.flushPublishGroup)
+	if app.A.NodeHost == nil && cfg.BatchMaxRequests > 1 {
+		h.batcher = newPublishBatcher(cfg, h.writeStandaloneGroup)
 	}
 	return h
 }
@@ -77,17 +77,15 @@ func NewProducerHandler(logger *zap.Logger) *ProducerHandler {
 // Close stops the optional publish workers and waits for in-flight flushes.
 func (ph *ProducerHandler) Close() {
 	if ph.batcher != nil {
-		ph.batcher.cancel()
-		ph.batcher.workers.Wait()
-		ph.batcher.flushes.Wait()
+		ph.batcher.close()
 	}
 }
 
 // PublishStream handles a bidirectional stream where clients send PublishBatch
 // frames and receive PublishBatchAck responses.
 //
-// Each client batch is atomic. The server can group independent client batches
-// into a single commit when internal batching is enabled. The ack_level field controls
+// Each client batch is atomic. A standalone server can group independent
+// client batches into a single commit. In a cluster, the ack_level field controls
 // whether the broker waits for quorum commit (ACK_LEVEL_QUORUM, default) or
 // returns immediately after leader write (ACK_LEVEL_LEADER).
 func (ph *ProducerHandler) PublishStream(stream grpc.BidiStreamingServer[pb.PublishBatch, pb.PublishBatchAck]) error {
@@ -163,14 +161,24 @@ func (ph *ProducerHandler) processBatch(ctx context.Context, batch *pb.PublishBa
 		}
 	}
 
-	req, processErr := ph.preparePublish(ctx, batch, start.UnixMilli(), ackLevel, receipts)
+	clustered := app.A.NodeHost != nil
+	items, processErr := ph.buildStoreItems(batch, start.UnixMilli(), receipts, clustered)
 	if processErr == nil {
-		if ph.batcher == nil {
-			ph.flushPublishGroup(ctx, ackLevel, []*queuedPublish{req})
-			processErr = <-req.done
-		} else {
-			req.release = func() { <-ph.pending }
-			transferred, processErr = ph.batcher.queue(req, ackLevel)
+		var size int
+		size, processErr = ph.publishStorageBytes(items)
+		if processErr == nil {
+			switch {
+			case clustered:
+				processErr = ph.processRaftPublish(ctx, ackLevel, items)
+			case ph.batcher == nil:
+				processErr = ph.writeStandaloneGroup(ctx, []*queuedPublish{{items: items}})
+			default:
+				req := &queuedPublish{
+					ctx: ctx, items: items, bytes: size, done: make(chan error, 1),
+					release: func() { <-ph.pending },
+				}
+				transferred, processErr = ph.batcher.queue(req)
+			}
 		}
 	}
 
@@ -306,6 +314,37 @@ func (ph *ProducerHandler) buildStoreItems(batch *pb.PublishBatch, nowMs int64, 
 		return nil, fmt.Errorf("failed to build store batch: %w", err)
 	}
 	return items, nil
+}
+
+func (ph *ProducerHandler) publishStorageBytes(items []raft.StoreBatchItem) (int, error) {
+	var size int
+	for _, item := range items {
+		itemBytes := raft.PublishItemStorageBytes(item)
+		if itemBytes > ph.maxPublishBytes-size {
+			return 0, status.Error(codes.ResourceExhausted, "publish batch exceeds its byte budget")
+		}
+		size += itemBytes
+	}
+	return size, nil
+}
+
+func (ph *ProducerHandler) processRaftPublish(ctx context.Context, level pb.AckLevel, items []raft.StoreBatchItem) error {
+	if err := checkPublishLeader(); err != nil {
+		return err
+	}
+	frozen := level != pb.AckLevel_ACK_LEVEL_QUORUM
+	command, err := raft.MarshalPublishCmd(items, frozen, ph.maxPublishBytes)
+	if err != nil {
+		return publishProposalError(err)
+	}
+	if err := ctx.Err(); err != nil {
+		return status.FromContextError(err).Err()
+	}
+	result, err := ph.proposePublish(ctx, level, command)
+	if err == nil && !frozen {
+		err = raft.CheckPublishResult(result, len(items))
+	}
+	return publishProposalError(err)
 }
 
 func (ph *ProducerHandler) proposePublish(ctx context.Context, ackLevel pb.AckLevel, cmdBytes []byte) (statemachine.Result, error) {

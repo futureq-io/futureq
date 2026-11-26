@@ -11,6 +11,7 @@ import (
 	"github.com/futureq-io/futureq/pkg/utils"
 	deliverypb "github.com/futureq-io/protocol/proto/go/delivery"
 	"github.com/futureq-io/stormoar/v4/statemachine"
+	"google.golang.org/protobuf/proto"
 )
 
 // DeliveryState shares one payload across independent logical deliveries.
@@ -142,17 +143,19 @@ func MarshalAckDeliveryBatchCmd(acks []DeliveryAck) ([]byte, error) {
 // deletes in one Dragonboat Update see each other, rather than stale DB reads.
 // Call Flush before committing the storage batch to persist final receipts.
 type DeliveryBatch struct {
-	subscriptions      map[string]*deliverypb.SubscriptionRecord
-	createdTopics      map[string]struct{}
-	db                 storage.DB
-	batch              storage.Batch
-	states             map[string]*DeliveryState
-	present            map[string]bool
-	dirty              map[string]bool
-	receipts           *receiptCache
-	standaloneReceipts *StandaloneReceiptCache
-	receiptHits        int
-	receiptMisses      int
+	subscriptions       map[string]*deliverypb.SubscriptionRecord
+	createdTopics       map[string]struct{}
+	db                  storage.DB
+	batch               storage.Batch
+	states              map[string]*DeliveryState
+	present             map[string]bool
+	dirty               map[string]int
+	measureReceipts     bool
+	pendingReceiptBytes int
+	receipts            *receiptCache
+	standaloneReceipts  *StandaloneReceiptCache
+	receiptHits         int
+	receiptMisses       int
 }
 
 func NewDeliveryBatch(db storage.DB, batch storage.Batch) *DeliveryBatch {
@@ -170,6 +173,7 @@ func (b *DeliveryBatch) Delete(key []byte) error {
 	}
 	b.present[string(key)] = false
 	b.states[string(key)] = nil
+	b.pendingReceiptBytes -= b.dirty[string(key)]
 	delete(b.dirty, string(key))
 	return nil
 }
@@ -217,11 +221,24 @@ func (b *DeliveryBatch) exists(key []byte) (bool, error) {
 }
 
 func (b *DeliveryBatch) save(key []byte, state *DeliveryState) {
-	b.states[string(key)] = state
-	if b.dirty == nil {
-		b.dirty = make(map[string]bool)
+	var size int
+	if b.measureReceipts {
+		size = len(receiptPrefix) + proto.Size(receiptProto(state))
 	}
-	b.dirty[string(key)] = true
+	b.saveReceipt(key, state, size)
+}
+
+func (b *DeliveryBatch) saveReceipt(key []byte, state *DeliveryState, size int) {
+	k := string(key)
+	b.states[k] = state
+	if b.dirty == nil {
+		b.dirty = make(map[string]int)
+	}
+	if b.measureReceipts {
+		size += publishReceiptKeySize
+		b.pendingReceiptBytes += size - b.dirty[k]
+	}
+	b.dirty[k] = size
 }
 
 // Flush serializes each surviving receipt once, after all commands in this
@@ -235,6 +252,7 @@ func (b *DeliveryBatch) Flush() error {
 		if err := b.batch.Set(DeliveryStateKey([]byte(key)), data); err != nil {
 			return err
 		}
+		b.pendingReceiptBytes -= b.dirty[key]
 		delete(b.dirty, key)
 	}
 	return nil
