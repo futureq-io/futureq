@@ -216,6 +216,7 @@ type Delivery struct {
 	PreloadMaxMessages         int           `mapstructure:"preloadMaxMessages" yaml:"preloadMaxMessages"`
 	InFlightTimeout            time.Duration `mapstructure:"inFlightTimeout" yaml:"inFlightTimeout"`
 	RetryOwnerLease            time.Duration `mapstructure:"retryOwnerLease" yaml:"retryOwnerLease"`
+	RetryOwnerMaxClockSkew     time.Duration `mapstructure:"retryOwnerMaxClockSkew" yaml:"retryOwnerMaxClockSkew"`
 	ReadPermit                 time.Duration `mapstructure:"readPermit" yaml:"readPermit"`
 	DeleteBatchInterval        time.Duration `mapstructure:"deleteBatchInterval" yaml:"deleteBatchInterval"`
 	DeleteWorkers              int           `mapstructure:"deleteWorkers" yaml:"deleteWorkers"`
@@ -490,6 +491,9 @@ func (c *Config) validatePublishAndDelivery() error {
 	d := c.Delivery
 	if d.RetryOwnerLease <= 0 || d.RetryOwnerLease%time.Millisecond != 0 {
 		return fmt.Errorf("delivery.retryOwnerLease must be a positive whole number of milliseconds")
+	}
+	if d.RetryOwnerMaxClockSkew < 0 || d.RetryOwnerMaxClockSkew%time.Millisecond != 0 {
+		return fmt.Errorf("delivery.retryOwnerMaxClockSkew must be a nonnegative whole number of milliseconds")
 	}
 	// Keep enough time for renewal to recover from a timed-out proposal.
 	if c.Cluster.Enabled && d.RetryOwnerLease/3 < c.Publish.ProposalTimeout {

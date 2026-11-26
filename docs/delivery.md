@@ -132,9 +132,11 @@ Consumer registration and rebalance activation retain their completion checks.
 ## Retry limits and dead letters
 
 For a publish with `max_retries`, the broker reserves a recipient-specific
-attempt and durably charges it before calling gRPC Send. Its deadline uses
-`delivery.inFlightTimeout`. The sender checks its permit and deadline after
-authorization commits. If either check fails before entering transport, it
+attempt and durably charges it before calling gRPC Send. The reservation
+deadline includes two `publish.proposalTimeout` windows and one
+`delivery.inFlightTimeout` window. The full ACK window starts when the
+sender is ready to enter transport, after authorization commits and the
+sender checks its permit and reservation deadline. If either check fails, it
 refunds the unsent attempt. Once the sender enters transport, the attempt
 retains its number through stalls, failures, and broker crashes. Each attempt
 has a distinct tag, so a delayed ACK or NACK cannot settle a later attempt.
@@ -148,10 +150,15 @@ no longer eligible.
 
 The broker queues outcomes for asynchronous persistence and releases local
 tracking after commit. While a broker owns an attempt, outcomes it accepts
-into that queue take precedence over expiry. Clustered brokers renew
+into that queue take precedence over expiry. On graceful shutdown, the broker
+stops accepting new outcomes and keeps proposals and lease renewal active
+while it drains accepted outcomes within the shutdown window. Clustered brokers renew
 `delivery.retryOwnerLease` every fifth of its duration (every 3 seconds by
-default). If the owner crashes or the lease lapses, the leader can recover
-expired attempts and any outcomes that failed to commit can be lost.
+default). Leaders wait an additional `delivery.retryOwnerMaxClockSkew`
+(default 2 seconds) before recovering another broker's expired attempts.
+The margin covers the maximum wall-clock difference between brokers.
+An outage that prevents outcomes from committing before recovery can still
+result in a retry or a dead letter.
 
 Deadline scans drain expired attempts in bounded batches, including when no
 workers are connected. A final NACK or timeout atomically archives the payload

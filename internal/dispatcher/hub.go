@@ -990,6 +990,26 @@ func (h *Hub) BeginRetrySend(consumerID string, msg *pb.QueueMessage, token []by
 	return h.beginSend(consumerID, msg, token, deadline)
 }
 
+// ActivateRetrySend starts the ACK window after durable authorization.
+func (h *Hub) ActivateRetrySend(consumerID string, msg *pb.QueueMessage, token []byte, deadline time.Time) bool {
+	h.deliveryMu.RLock()
+	defer h.deliveryMu.RUnlock()
+	if !h.permitted() {
+		return false
+	}
+	h.inFlightMu.Lock()
+	defer h.inFlightMu.Unlock()
+	key := string(msg.DeliveryTag)
+	record, exists := h.deliveryRecords[consumerID][key]
+	if !exists || record.message != msg || !bytes.Equal(record.token, token) ||
+		!time.Now().Before(record.expires) || (h.version != nil && record.epoch != h.permitEpoch) {
+		return false
+	}
+	record.expires = deadline
+	h.deliveryRecords[consumerID][key] = record
+	return true
+}
+
 func (h *Hub) beginSend(consumerID string, msg *pb.QueueMessage, token []byte, deadline time.Time) bool {
 	h.deliveryMu.RLock()
 	defer h.deliveryMu.RUnlock()
@@ -1109,7 +1129,7 @@ func (h *Hub) MarkRetryOutcome(consumerID string, key, token []byte) bool {
 	h.inFlightMu.Lock()
 	defer h.inFlightMu.Unlock()
 	record, exists := h.deliveryRecords[consumerID][string(key)]
-	if !exists || !record.sending || record.ackPending || !bytes.Equal(record.token, token) {
+	if !exists || !record.sending || record.ackPending || !bytes.Equal(record.token, token) || !time.Now().Before(record.expires) {
 		return false
 	}
 	record.ackPending = true

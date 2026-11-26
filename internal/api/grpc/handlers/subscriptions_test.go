@@ -197,12 +197,12 @@ func (s *DeadLetterDeliverySuite) archiveFinalNack(ledger *dispatcher.DeliveryLe
 	})
 	s.Require().NoError(err)
 	s.Require().Equal(uint64(1), value)
-	target.DeadlineMs = 0
 	value, err = ledger.ApplyRetry(&deliverypb.RetryCommand{
 		Operation: deliverypb.RetryCommand_SENT, NowMs: 100, Attempts: []*deliverypb.DeliveryAttemptTarget{target},
 	})
 	s.Require().NoError(err)
 	s.Require().Equal(uint64(1), value)
+	target.DeadlineMs = 0
 	value, err = ledger.ApplyRetry(&deliverypb.RetryCommand{
 		Operation: deliverypb.RetryCommand_NACK, NowMs: 101, Attempts: []*deliverypb.DeliveryAttemptTarget{target},
 	})

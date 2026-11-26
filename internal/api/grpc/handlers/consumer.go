@@ -444,18 +444,26 @@ func (h *ConsumerHandler) beginLimitedSend(consumerID string, init *pb.Subscribe
 		return nil, status.Error(codes.Unavailable, "delivery retry ledger unavailable")
 	}
 	now := time.Now()
-	deadline := max(now.UnixMilli()+1, now.Add(h.hub.AttemptTimeout()).UnixMilli())
+	ackWindow := h.hub.AttemptTimeout()
+	proposalTimeout := app.A.Config().Publish.ProposalTimeout
+	// Allow START and SENT their own proposal budgets while keeping an
+	// abandoned reservation recoverable.
+	reservationDeadline := now.Add(proposalTimeout).Add(proposalTimeout).Add(ackWindow)
 	token := uuid.New()
+	if !h.hub.BeginRetrySend(consumerID, message, token[:], reservationDeadline) {
+		return nil, nil
+	}
 	recipient := metadata.DeliveryRecipient(init.GroupId, consumerID)
 	start := &deliverypb.RetryCommand{
 		Operation: deliverypb.RetryCommand_START, NowMs: now.UnixMilli(),
 		Attempts: []*deliverypb.DeliveryAttemptTarget{{
-			Key: message.DeliveryTag, Recipient: recipient, Token: token[:], DeadlineMs: deadline,
+			Key: message.DeliveryTag, Recipient: recipient, Token: token[:],
+			DeadlineMs: max(now.UnixMilli()+1, reservationDeadline.UnixMilli()),
 		}},
 	}
 	var frames *deliveryFrames
-	authorized, err := h.RetryLedger.AuthorizeRetrySend(start, func(attempt uint64) (bool, error) {
-		if !h.hub.BeginRetrySend(consumerID, message, token[:], time.UnixMilli(deadline)) {
+	authorized, err := h.RetryLedger.AuthorizeRetrySend(start, ackWindow, func(attempt uint64) (bool, error) {
+		if !h.hub.CanSend(consumerID, message) {
 			return false, nil
 		}
 		tag := make([]byte, 0, utils.EventKeySize+raft.AttemptTokenSize)
@@ -468,13 +476,18 @@ func (h *ConsumerHandler) beginLimitedSend(consumerID string, init *pb.Subscribe
 		})
 		frames = prepared
 		return err == nil, err
-	}, func() (bool, error) {
+	}, func() (time.Time, error) {
 		if frames.encoded != nil {
-			err := h.checkDeliveryChunk(consumerID, recipient, message, frames.QueueMessage)
-			frames.firstChecked = err == nil
-			return err == nil, err
+			if err := h.checkDeliveryChunk(consumerID, recipient, message, frames.QueueMessage); err != nil {
+				return time.Time{}, err
+			}
+			frames.firstChecked = true
 		}
-		return h.hub.CanSend(consumerID, message), nil
+		deadline := time.Now().Add(ackWindow)
+		if !h.hub.ActivateRetrySend(consumerID, message, token[:], deadline) {
+			return time.Time{}, nil
+		}
+		return deadline, nil
 	})
 	if !authorized {
 		h.hub.ReleaseRetrySend(consumerID, message.DeliveryTag, token[:])

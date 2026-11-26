@@ -59,9 +59,9 @@ func (s *RetryExpirySuite) TestAuthorizationCapacityIsCheckedBeforeReservation()
 	first, second := s.storeRetryFixture(db, 1, deadline), s.storeRetryFixture(db, 2, deadline)
 	entered, finish := make(chan struct{}), make(chan struct{})
 	done := make(chan error, 1)
-	ready := func() (bool, error) { return true, nil }
+	ready := func() (time.Time, error) { return deadline, nil }
 	go func() {
-		_, err := ledger.AuthorizeRetrySend(first, func(uint64) (bool, error) {
+		_, err := ledger.AuthorizeRetrySend(first, time.Minute, func(uint64) (bool, error) {
 			close(entered)
 			<-finish
 			return true, nil
@@ -79,7 +79,7 @@ func (s *RetryExpirySuite) TestAuthorizationCapacityIsCheckedBeforeReservation()
 	case <-time.After(time.Second):
 		s.FailNow("first authorization did not reserve capacity")
 	}
-	allowed, err := ledger.AuthorizeRetrySend(second, func(uint64) (bool, error) {
+	allowed, err := ledger.AuthorizeRetrySend(second, time.Minute, func(uint64) (bool, error) {
 		s.Fail("second authorization should not reserve an attempt")
 		return true, nil
 	}, ready)
@@ -95,7 +95,7 @@ func (s *RetryExpirySuite) TestAuthorizationCapacityIsCheckedBeforeReservation()
 	close(finish)
 	s.NoError(<-done)
 	finish = nil
-	allowed, err = ledger.AuthorizeRetrySend(second, func(attempt uint64) (bool, error) {
+	allowed, err = ledger.AuthorizeRetrySend(second, time.Minute, func(attempt uint64) (bool, error) {
 		s.Equal(uint64(1), attempt)
 		return true, nil
 	}, ready)
@@ -129,10 +129,10 @@ func (s *RetryExpirySuite) TestStalledRefundDoesNotBlockUnrelatedExpiry() {
 	deadline := time.Now().Add(600 * time.Millisecond)
 	first, second := s.storeRetryFixture(db, 1, deadline), s.storeRetryFixture(db, 2, deadline)
 	prepared := func(uint64) (bool, error) { return true, nil }
-	allowed, err := ledger.AuthorizeRetrySend(first, prepared, func() (bool, error) { return false, nil })
+	allowed, err := ledger.AuthorizeRetrySend(first, 600*time.Millisecond, prepared, func() (time.Time, error) { return time.Time{}, nil })
 	s.Require().NoError(err)
 	s.False(allowed)
-	allowed, err = ledger.AuthorizeRetrySend(second, prepared, func() (bool, error) { return true, nil })
+	allowed, err = ledger.AuthorizeRetrySend(second, 600*time.Millisecond, prepared, func() (time.Time, error) { return deadline, nil })
 	s.Require().NoError(err)
 	s.Require().True(allowed)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -195,10 +195,10 @@ func (s *RetryExpirySuite) TestFullOutcomeQueueDoesNotDropAnUnsentRefund() {
 	deadline := now.Add(time.Second).UnixMilli()
 	target := &deliverypb.DeliveryAttemptTarget{Key: key, Recipient: recipient, Token: token, DeadlineMs: deadline}
 	start := &deliverypb.RetryCommand{Operation: deliverypb.RetryCommand_START, NowMs: now.UnixMilli(), Attempts: []*deliverypb.DeliveryAttemptTarget{target}}
-	allowed, err := ledger.AuthorizeRetrySend(start, func(attempt uint64) (bool, error) {
+	allowed, err := ledger.AuthorizeRetrySend(start, time.Second, func(attempt uint64) (bool, error) {
 		s.Equal(uint64(1), attempt)
 		return true, nil
-	}, func() (bool, error) { return false, nil })
+	}, func() (time.Time, error) { return time.Time{}, nil })
 	s.False(allowed)
 	s.NoError(err)
 
@@ -219,6 +219,7 @@ func (s *RetryExpirySuite) TestFullOutcomeQueueDoesNotDropAnUnsentRefund() {
 
 func (s *RetryExpirySuite) TestOwnerRenewalUsesConfiguredLease() {
 	const lease = 250 * time.Millisecond
+	const maxClockSkew = 1500 * time.Millisecond
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	renewed := make(chan time.Duration, 2)
 	ledger := NewDeliveryLedger(nil, nil, nil, func(raw []byte) (statemachine.Result, error) {
@@ -236,17 +237,19 @@ func (s *RetryExpirySuite) TestOwnerRenewalUsesConfiguredLease() {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		ledger.RunRetryOwner(ctx, lease, zap.NewNop())
+		ledger.RunRetryOwner(ctx, lease, maxClockSkew, zap.NewNop())
 	}()
 	defer func() { cancel(); <-done }()
 	for range 2 {
 		select {
 		case duration := <-renewed:
-			s.Equal(lease, duration)
+			s.Equal(lease+maxClockSkew, duration)
 		case <-ctx.Done():
 			s.FailNow("retry owner renewal did not run")
 		}
 	}
+	s.Require().Eventually(ledger.retryOwnerActive, time.Second, time.Millisecond)
+	s.LessOrEqual(time.Until(*ledger.retry.until.Load()), lease, "the recovery margin cannot extend local admission")
 }
 
 func (s *RetryExpirySuite) TestSweepDrainsMultipleBatchesAcrossTopics() {
@@ -277,7 +280,6 @@ func (s *RetryExpirySuite) TestSweepDrainsMultipleBatchesAcrossTopics() {
 		})
 		s.Require().NoError(err)
 		s.Require().Equal(uint64(1), result)
-		target.DeadlineMs = 0
 		_, err = ledger.ApplyRetry(&deliverypb.RetryCommand{
 			Operation: deliverypb.RetryCommand_SENT, NowMs: 100, Attempts: []*deliverypb.DeliveryAttemptTarget{target},
 		})
@@ -304,18 +306,31 @@ func (s *RetryExpirySuite) TestReceivedACKSurvivesExpiryWhileOutcomeWorkersAreBl
 	started := make(chan struct{}, 2)
 	unblock := make(chan struct{})
 	ctx, cancel := context.WithCancel(context.Background())
-	ledger := NewDeliveryLedger(db, nil, nil, func(raw []byte) (statemachine.Result, error) {
+	brokerCtx, stopBroker := context.WithCancel(context.Background())
+	defer stopBroker()
+	propose := func(ctx context.Context, raw []byte) (statemachine.Result, error) {
 		var cmd deliverypb.RetryCommand
 		if err := proto.Unmarshal(raw[1:], &cmd); err != nil {
 			return statemachine.Result{}, err
 		}
 		if cmd.Operation == deliverypb.RetryCommand_ACK {
 			started <- struct{}{}
-			<-unblock
+			select {
+			case <-unblock:
+			case <-ctx.Done():
+				return statemachine.Result{}, ctx.Err()
+			}
+		}
+		if err := ctx.Err(); err != nil {
+			return statemachine.Result{}, err
 		}
 		value, err := local.ApplyRetry(&cmd)
 		return statemachine.Result{Value: value}, err
+	}
+	ledger := NewDeliveryLedger(db, nil, nil, func(raw []byte) (statemachine.Result, error) {
+		return propose(brokerCtx, raw)
 	})
+	ledger.ProposeContext = propose
 	ledger.ConfigureRetryOutcomes(4)
 	done := make(chan struct{})
 	go func() { defer close(done); ledger.RunRetryOutcomes(ctx, 2, logger) }()
@@ -349,12 +364,12 @@ func (s *RetryExpirySuite) TestReceivedACKSurvivesExpiryWhileOutcomeWorkersAreBl
 			Operation: deliverypb.RetryCommand_START, NowMs: 100, Attempts: []*deliverypb.DeliveryAttemptTarget{target},
 		})
 		s.Require().NoError(err)
-		target.DeadlineMs = 0
 		value, err := ledger.ApplyRetry(&deliverypb.RetryCommand{
 			Operation: deliverypb.RetryCommand_SENT, NowMs: 101, Attempts: []*deliverypb.DeliveryAttemptTarget{target},
 		})
 		s.Require().NoError(err)
 		s.Require().Equal(uint64(1), value)
+		target.DeadlineMs = 0
 		isAccepted := ledger.TryRetryOutcome(&deliverypb.RetryCommand{
 			Operation: deliverypb.RetryCommand_ACK, NowMs: 109, Attempts: []*deliverypb.DeliveryAttemptTarget{target},
 		}, func() { committed <- struct{}{} })
@@ -371,8 +386,23 @@ func (s *RetryExpirySuite) TestReceivedACKSurvivesExpiryWhileOutcomeWorkersAreBl
 
 	<-started
 	<-started
+	stopBroker()
+	ledger.StopRetryOutcomeAdmission()
+	s.False(ledger.TryRetryOutcome(&deliverypb.RetryCommand{
+		Operation: deliverypb.RetryCommand_ACK, NowMs: 109,
+		Attempts: []*deliverypb.DeliveryAttemptTarget{due[0]},
+	}, func() {}), "shutdown rejects new outcomes")
 	close(unblock)
-	s.Require().Eventually(func() bool { return len(committed) == 3 }, time.Second, time.Millisecond)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		s.FailNow("outcome workers did not finish draining")
+	}
+	s.Len(committed, 3, "shutdown must commit accepted outcomes, including the buffered ACK")
+	s.Require().NoError(NewDeliveryLedger(db, nil, nil, nil).expireDueRetryAttempts(ctx, 110, nil))
+	page, err = (raft.DeadLetterQuery{Topic: topic, Limit: 10}).Read(db)
+	s.Require().NoError(err)
+	s.Empty(page.Page.Entries, "recovery must not archive acknowledged messages")
 	due, err = raft.DueDeliveryAttempts(db, 110)
 	s.Require().NoError(err)
 	s.Empty(due)

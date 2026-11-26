@@ -52,6 +52,28 @@ func (s *ConfigSuite) TestRetryOwnerLeaseLeavesTimeForClusterRenewal() {
 	s.Equal(24*time.Second, cfg.Delivery.RetryOwnerLease)
 }
 
+func (s *ConfigSuite) TestRetryOwnerMaxClockSkewConfiguration() {
+	cfg, err := Load("")
+	s.Require().NoError(err)
+	s.Equal(2*time.Second, cfg.Delivery.RetryOwnerMaxClockSkew)
+
+	path := s.writeConfig("delivery:\n  retryOwnerMaxClockSkew: 1500ms\n")
+	cfg, err = Load(path)
+	s.Require().NoError(err)
+	s.Equal(1500*time.Millisecond, cfg.Delivery.RetryOwnerMaxClockSkew)
+
+	s.T().Setenv("FUTUREQ_DELIVERY_RETRYOWNERMAXCLOCKSKEW", "0s")
+	cfg, err = Load(path)
+	s.Require().NoError(err)
+	s.Zero(cfg.Delivery.RetryOwnerMaxClockSkew)
+
+	for _, value := range []string{"-1ms", "1500us"} {
+		s.T().Setenv("FUTUREQ_DELIVERY_RETRYOWNERMAXCLOCKSKEW", value)
+		_, err = Load(path)
+		s.Require().ErrorContains(err, "delivery.retryOwnerMaxClockSkew must be a nonnegative whole number of milliseconds")
+	}
+}
+
 func (s *ConfigSuite) TestVirtualShardCountMinimum() {
 	cfg, err := Load(s.writeConfig("storage:\n  virtualShards: 1\n"))
 	s.Require().NoError(err)

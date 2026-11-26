@@ -97,7 +97,7 @@ func (s *ClusterRetrySuite) TestNewLeaderDeadLettersAnAbandonedFinalAttempt() {
 		Operation: deliverypb.RetryCommand_SENT, Owner: owner, NowMs: sendAt.UnixMilli(),
 		Attempts: []*deliverypb.DeliveryAttemptTarget{{
 			Key: utils.EventKey(bucket, topic, id), Recipient: subscription.Recipient,
-			Token: bytes.Repeat([]byte{23}, raft.AttemptTokenSize),
+			Token: bytes.Repeat([]byte{23}, raft.AttemptTokenSize), DeadlineMs: deadline,
 		}},
 	})
 	s.Require().NoError(err)

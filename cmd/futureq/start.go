@@ -122,7 +122,15 @@ func startRun(cmd *cobra.Command, _ []string) {
 			return a.MetadataSM.DeliveryRecipients(topic)
 		}
 		proposeDelivery = func(cmd []byte) (statemachine.Result, error) {
-			ctx, cancel := context.WithTimeout(a.Ctx, cfg.Publish.ProposalTimeout)
+			parent := a.Ctx
+			select {
+			case <-a.Ctx.Done():
+				// An authorization interrupted by shutdown can still refund
+				// its reservation while Raft is available.
+				parent = a.ShutCtx
+			default:
+			}
+			ctx, cancel := context.WithTimeout(parent, cfg.Publish.ProposalTimeout)
 			defer cancel()
 			return a.NodeHost.SyncPropose(ctx, a.NodeHost.GetNoOPSession(cfg.Cluster.ShardID), cmd)
 		}
@@ -132,6 +140,8 @@ func startRun(cmd *cobra.Command, _ []string) {
 	if cfg.Cluster.Enabled {
 		ledger.SetRetryOwner(cfg.Cluster.NodeID)
 		ledger.ProposeContext = func(ctx context.Context, cmd []byte) (statemachine.Result, error) {
+			ctx, cancel := context.WithTimeout(ctx, cfg.Publish.ProposalTimeout)
+			defer cancel()
 			return a.NodeHost.SyncPropose(ctx, a.NodeHost.GetNoOPSession(cfg.Cluster.ShardID), cmd)
 		}
 	} else if maxBytes, _ := cfg.Delivery.ReceiptCache.MaxBytes.Bytes(); maxBytes > 0 {
@@ -262,15 +272,8 @@ func startRun(cmd *cobra.Command, _ []string) {
 	a.RegisterComponentWithShutdown()
 	go func() {
 		defer a.ComponentShutdownDone()
-		ledger.RunRetryOutcomes(a.Ctx, max(2, deleter.MaxConcurrentFlushes), logger)
+		runRetryWorkers(a, ledger, max(2, deleter.MaxConcurrentFlushes), logger)
 	}()
-	if cfg.Cluster.Enabled {
-		a.RegisterComponentWithShutdown()
-		go func() {
-			defer a.ComponentShutdownDone()
-			ledger.RunRetryOwner(a.Ctx, cfg.Delivery.RetryOwnerLease, logger)
-		}()
-	}
 
 	// ── gRPC server ───────────────────────────────────────────────────────────
 	grpcserver.New(cfg.API.GRPC, hub, deleter, logger, ledger).
@@ -281,6 +284,35 @@ func startRun(cmd *cobra.Command, _ []string) {
 	if err := a.WithGracefulShutdown(); err != nil {
 		logger.Fatal("failed to graceful shutdown", zap.Error(err))
 	}
+}
+
+// Keep the owner and Raft proposal context alive until accepted outcomes drain.
+func runRetryWorkers(a *app.App, ledger *dispatcher.DeliveryLedger, workers int, logger *zap.Logger) {
+	ctx, cancel := context.WithCancel(context.WithoutCancel(a.Ctx))
+	ownerDone := make(chan struct{})
+	go func() {
+		defer close(ownerDone)
+		if a.Config().Cluster.Enabled {
+			cfg := a.Config().Delivery
+			ledger.RunRetryOwner(ctx, cfg.RetryOwnerLease, cfg.RetryOwnerMaxClockSkew, logger)
+		}
+	}()
+	outcomesDone := make(chan struct{})
+	go func() {
+		defer close(outcomesDone)
+		ledger.RunRetryOutcomes(ctx, workers, logger)
+	}()
+
+	<-a.Ctx.Done()
+	ledger.StopRetryOutcomeAdmission()
+	select {
+	case <-outcomesDone:
+	case <-a.ShutCtx.Done():
+		logger.Warn("delivery outcome drain timed out with accepted outcomes still pending")
+	}
+	cancel()
+	<-outcomesDone
+	<-ownerDone
 }
 
 // consumerMetadataLoop drains deliveries, reconciles subscriptions, and fences

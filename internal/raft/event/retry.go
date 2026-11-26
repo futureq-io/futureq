@@ -85,7 +85,7 @@ func validateRetryCommand(cmd *deliverypb.RetryCommand) error {
 			return fmt.Errorf("invalid retry target")
 		}
 		switch op {
-		case deliverypb.RetryCommand_START:
+		case deliverypb.RetryCommand_START, deliverypb.RetryCommand_SENT:
 			if attempt.GetDeadlineMs() <= cmd.GetNowMs() {
 				return fmt.Errorf("attempt deadline must follow its start time")
 			}
@@ -236,8 +236,19 @@ func (b *DeliveryBatch) applyAttempt(op deliverypb.RetryCommand_Operation, nowMs
 			}
 		}
 		if previous.Reserved {
+			if previous.DeadlineMs != target.DeadlineMs {
+				reservation := &deliverypb.DeliveryAttemptTarget{
+					Key: target.Key, Token: target.Token, Recipient: target.Recipient, DeadlineMs: previous.DeadlineMs,
+				}
+				if err := b.batch.Delete(retryExpiryKey(reservation)); err != nil {
+					return 0, false, err
+				}
+				if err := b.batch.Set(retryExpiryKey(target), previous.Owner); err != nil {
+					return 0, false, err
+				}
+			}
 			state.attempts[i] = &deliverypb.DeliveryAttempt{
-				Number: previous.Number, Token: previous.Token, DeadlineMs: previous.DeadlineMs, Owner: previous.Owner,
+				Number: previous.Number, Token: previous.Token, DeadlineMs: target.DeadlineMs, Owner: previous.Owner,
 			}
 			b.save(target.Key, state)
 		}

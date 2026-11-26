@@ -104,6 +104,7 @@ delivery:
   preloadMaxMessages: 512 # global full-message future-cache cap; 0 disables future caching
   inFlightTimeout: 5s
   retryOwnerLease: 15s # Raft retry ownership, at least 3x publish.proposalTimeout
+  retryOwnerMaxClockSkew: 2s # Maximum clock difference between brokers, added to the recovery grace period
   readPermit: 1s # Raft delivery authorization from quorum-read start; 100ms..30s, whole milliseconds
   deleteBatchInterval: 500ms
   deleteWorkers: 16 # 1..256 concurrent ACK/delete flushes in Raft mode; standalone stays serial

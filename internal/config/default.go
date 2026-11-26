@@ -54,6 +54,7 @@ var defaultConfig = Config{
 		PreloadMaxMessages:         512,
 		InFlightTimeout:            5 * time.Second,
 		RetryOwnerLease:            15 * time.Second,
+		RetryOwnerMaxClockSkew:     2 * time.Second,
 		ReadPermit:                 time.Second,
 		DeleteBatchInterval:        500 * time.Millisecond,
 		DeleteWorkers:              16,

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -118,6 +119,7 @@ func (s *LimitedConsumerSuite) TestAuthorizationThatReturnsPastDeadlineIsRefunde
 
 func (s *LimitedConsumerSuite) exerciseCanceledSend(blockAt deliverypb.RetryCommand_Operation, stall bool) {
 	a, hub, producer, _ := openPublishTest(s.T(), "pebble")
+	a.Config().Publish.ProposalTimeout = 25 * time.Millisecond
 	ctx := context.Background()
 	subscription, err := a.Subscriptions.Create(ctx, "orders", "workers", "")
 	s.Require().NoError(err)
@@ -188,6 +190,88 @@ func (s *LimitedConsumerSuite) exerciseCanceledSend(blockAt deliverypb.RetryComm
 	s.Require().NoError(err)
 	s.Require().NotNil(wire)
 	s.Equal(uint64(1), wire.Attempt)
+}
+
+func (s *LimitedConsumerSuite) TestSlowRaftProposalsLeaveAFullACKWindow() {
+	a, hub, producer, _ := openPublishTest(s.T(), "pebble")
+	const ackWindow = 250 * time.Millisecond
+	a.Config().Publish.ProposalTimeout = 500 * time.Millisecond
+	hub.SetDeliveryTimeout(ackWindow)
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+	subscription, err := a.Subscriptions.Create(ctx, "orders", "workers", "")
+	s.Require().NoError(err)
+	ack, err := producer.processBatch(ctx, &pb.PublishBatch{Messages: []*pb.PublishMessage{{
+		Topic: "orders", MaxRetries: new(uint32(0)),
+	}}})
+	s.Require().NoError(err)
+	s.Require().True(ack.GetSuccess())
+	keys := publishedKeys(s.T(), a.DB)
+	s.Require().Len(keys, 1)
+	key := keys[0]
+	group := strings.TrimPrefix(subscription.Recipient, "g:")
+	init := &pb.SubscribeInit{Topic: "orders", GroupId: group}
+	queue := make(chan *pb.QueueMessage, 1)
+	hub.Register("consumer", "orders", group, queue)
+	defer hub.Unregister("consumer")
+
+	local := dispatcher.NewDeliveryLedger(a.DB, nil, nil, nil)
+	logger := zap.NewNop()
+	ledger := dispatcher.NewDeliveryLedger(a.DB, nil, nil, func(raw []byte) (statemachine.Result, error) {
+		var cmd deliverypb.RetryCommand
+		if err := proto.Unmarshal(raw[1:], &cmd); err != nil {
+			return statemachine.Result{}, err
+		}
+		value, err := local.ApplyRetry(&cmd)
+		if cmd.Operation == deliverypb.RetryCommand_START || cmd.Operation == deliverypb.RetryCommand_SENT {
+			time.Sleep(150 * time.Millisecond)
+		}
+		return statemachine.Result{Value: value}, err
+	})
+	ledger.ConfigureRetryOutcomes(2)
+	handler := NewConsumerHandler(logger, hub, nil)
+	handler.RetryLedger = ledger
+	stream := &blockedRetrySend{ctx: ctx, sending: make(chan *pb.QueueMessage, 1), unblock: make(chan struct{})}
+	errCh := make(chan error, 1)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		handler.sender(ctx, stream, "consumer", init, queue, errCh)
+	}()
+	defer func() { cancel(); <-done }()
+	var workers sync.WaitGroup
+	workers.Go(func() { ledger.RunRetryExpiry(ctx, time.Millisecond, nil, logger) })
+	workers.Go(func() { ledger.RunRetryOutcomes(ctx, 2, logger) })
+	defer func() { cancel(); workers.Wait() }()
+
+	s.Require().NotEmpty(hub.DispatchToTopic("orders", &pb.QueueMessage{Topic: "orders", MaxRetries: new(uint32(0))}, key))
+	var wire *pb.QueueMessage
+	select {
+	case wire = <-stream.sending:
+	case err := <-errCh:
+		s.Require().NoError(err)
+		s.FailNow("sender returned without a delivery")
+	case <-ctx.Done():
+		s.FailNow("authorization never reached transport")
+	}
+	s.Equal(uint64(1), wire.Attempt)
+	// The recovery deadline starts 150ms before Send. Wait until a live
+	// reaper has seen that deadline, while still inside the real ACK window.
+	time.Sleep(160 * time.Millisecond)
+	due, err := raft.DueDeliveryAttempts(a.DB, time.Now().UnixMilli())
+	s.Require().NoError(err)
+	s.Require().Len(due, 1)
+	accepted, err := handler.finishLimitedSend("consumer", init, wire.DeliveryTag, true, true)
+	s.Require().NoError(err)
+	s.Require().True(accepted)
+	close(stream.unblock)
+	s.Require().Eventually(func() bool {
+		state, err := raft.ReadDeliveryState(a.DB, key)
+		return err == nil && !state.Needs(subscription.Recipient)
+	}, time.Second, time.Millisecond)
+	page, err := (raft.DeadLetterQuery{Topic: "orders", Limit: 10}).Read(a.DB)
+	s.Require().NoError(err)
+	s.Empty(page.Page.Entries)
 }
 
 func (s *LimitedConsumerSuite) TestLaterACKCommitsWhileFirstOutcomeIsStalled() {
