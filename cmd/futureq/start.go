@@ -7,6 +7,7 @@ import (
 	"context"
 	stdLogger "log"
 	"runtime"
+	"sync"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -211,8 +212,8 @@ func startRun(cmd *cobra.Command, _ []string) {
 	// removed immediately without waiting for the next scan pass.
 	if cfg.Cluster.Enabled {
 		if err := a.StartRaft(joining, func(keys [][]byte) {
-			disp.RemoveInFlightBatch(keys)
-			hub.RemoveDeletedBatch(keys)
+			ledger.RemoveRetryTransports(keys)
+			ledger.OnDelete(keys)
 		}); err != nil {
 			logger.Fatal("failed to start raft", zap.Error(err))
 		}
@@ -286,7 +287,7 @@ func startRun(cmd *cobra.Command, _ []string) {
 	}
 }
 
-// Keep the owner and Raft proposal context alive until accepted outcomes drain.
+// Keep the owner and Raft proposal context alive until outcomes and refunds drain.
 func runRetryWorkers(a *app.App, ledger *dispatcher.DeliveryLedger, workers int, logger *zap.Logger) {
 	ctx, cancel := context.WithCancel(context.WithoutCancel(a.Ctx))
 	ownerDone := make(chan struct{})
@@ -297,21 +298,24 @@ func runRetryWorkers(a *app.App, ledger *dispatcher.DeliveryLedger, workers int,
 			ledger.RunRetryOwner(ctx, cfg.RetryOwnerLease, cfg.RetryOwnerMaxClockSkew, logger)
 		}
 	}()
-	outcomesDone := make(chan struct{})
+	drainDone := make(chan struct{})
 	go func() {
-		defer close(outcomesDone)
-		ledger.RunRetryOutcomes(ctx, workers, logger)
+		defer close(drainDone)
+		var group sync.WaitGroup
+		group.Go(func() { ledger.RunRetryOutcomes(ctx, workers, logger) })
+		group.Go(func() { ledger.RunRetryRefunds(ctx, a.Config().Delivery.DispatchPollInterval, logger) })
+		group.Wait()
 	}()
 
 	<-a.Ctx.Done()
 	ledger.StopRetryOutcomeAdmission()
 	select {
-	case <-outcomesDone:
+	case <-drainDone:
 	case <-a.ShutCtx.Done():
-		logger.Warn("delivery outcome drain timed out with accepted outcomes still pending")
+		logger.Warn("delivery retry drain timed out with outcomes or refunds still pending")
 	}
 	cancel()
-	<-outcomesDone
+	<-drainDone
 	<-ownerDone
 }
 

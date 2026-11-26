@@ -26,7 +26,7 @@ type retryCoordination struct {
 	authorizing map[retryIdentity]struct{}
 	refunds     map[retryIdentity]*deliverypb.RetryCommand
 	expiring    map[retryIdentity]struct{}
-	transports  map[retryIdentity]retryTransport
+	transports  map[[utils.EventKeySize]byte]map[retryIdentity]retryTransport
 	draining    bool
 	owner       []byte
 	until       atomic.Pointer[time.Time]
@@ -42,6 +42,7 @@ type retryTransport struct {
 func (l *DeliveryLedger) AuthorizeRetrySend(start *deliverypb.RetryCommand, ackWindow time.Duration, prepare func(uint64) (bool, error), checkTransport func() (time.Time, error)) (authorized bool, err error) {
 	target := start.Attempts[0]
 	id := identifyRetry(target)
+	key := [utils.EventKeySize]byte(id[:utils.EventKeySize])
 	capacity := cap(l.retryOutcomes)
 	if capacity == 0 {
 		capacity = MaxPendingCompletions
@@ -55,9 +56,17 @@ func (l *DeliveryLedger) AuthorizeRetrySend(start *deliverypb.RetryCommand, ackW
 		l.retry.authorizing = make(map[retryIdentity]struct{})
 	}
 	l.retry.authorizing[id] = struct{}{}
+	if l.retry.transports == nil {
+		l.retry.transports = make(map[[utils.EventKeySize]byte]map[retryIdentity]retryTransport)
+	}
+	if l.retry.transports[key] == nil {
+		l.retry.transports[key] = make(map[retryIdentity]retryTransport)
+	}
+	// A committed deletion can invalidate this authorization before it
+	// installs a timer.
+	l.retry.transports[key][id] = retryTransport{}
 	l.retry.mu.Unlock()
 	needsRefund := true
-	var transportDeadline time.Time
 	defer func() {
 		var refund *deliverypb.RetryCommand
 		if needsRefund && !authorized {
@@ -77,17 +86,8 @@ func (l *DeliveryLedger) AuthorizeRetrySend(start *deliverypb.RetryCommand, ackW
 
 		l.retry.mu.Lock()
 		delete(l.retry.authorizing, id)
-		if authorized {
-			// The durable deadline is a recovery index set before the SENT
-			// proposal. Keep the live owner's full, monotonic ACK window.
-			if l.retry.transports == nil {
-				l.retry.transports = make(map[retryIdentity]retryTransport)
-			}
-			l.retry.transports[id] = retryTransport{deadline: transportDeadline, timer: time.AfterFunc(time.Until(transportDeadline), func() {
-				l.retry.mu.Lock()
-				delete(l.retry.transports, id)
-				l.retry.mu.Unlock()
-			})}
+		if !authorized {
+			l.removeRetryTransportLocked(id)
 		}
 		if refund != nil {
 			if l.retry.refunds == nil {
@@ -121,10 +121,51 @@ func (l *DeliveryLedger) AuthorizeRetrySend(start *deliverypb.RetryCommand, ackW
 	if err != nil || result == 0 {
 		return false, err
 	}
-	transportDeadline, err = checkTransport()
+	transportDeadline, err := checkTransport()
 	l.retry.mu.Lock()
 	defer l.retry.mu.Unlock()
-	return err == nil && !transportDeadline.IsZero() && !l.retry.draining && l.retryOwnerActive(), err
+	transports := l.retry.transports[key]
+	if _, exists := transports[id]; !exists || err != nil || !time.Now().Before(transportDeadline) || l.retry.draining || !l.retryOwnerActive() {
+		return false, err
+	}
+	// The durable deadline is set before SENT. The local owner gives the
+	// consumer its full monotonic ACK window starting at transport.
+	transports[id] = retryTransport{deadline: transportDeadline, timer: time.AfterFunc(time.Until(transportDeadline), func() {
+		l.retry.mu.Lock()
+		l.removeRetryTransportLocked(id)
+		l.retry.mu.Unlock()
+	})}
+	return true, nil
+}
+
+func (l *DeliveryLedger) removeRetryTransportLocked(id retryIdentity) {
+	key := [utils.EventKeySize]byte(id[:utils.EventKeySize])
+	transports := l.retry.transports[key]
+	if timer := transports[id].timer; timer != nil {
+		timer.Stop()
+	}
+	delete(transports, id)
+	if len(transports) == 0 {
+		delete(l.retry.transports, key)
+	}
+}
+
+// RemoveRetryTransports releases local ACK windows after a committed deletion.
+func (l *DeliveryLedger) RemoveRetryTransports(keys [][]byte) {
+	l.retry.mu.Lock()
+	defer l.retry.mu.Unlock()
+	for _, key := range keys {
+		if len(key) != utils.EventKeySize {
+			continue
+		}
+		eventKey := [utils.EventKeySize]byte(key)
+		for _, transport := range l.retry.transports[eventKey] {
+			if transport.timer != nil {
+				transport.timer.Stop()
+			}
+		}
+		delete(l.retry.transports, eventKey)
+	}
 }
 
 func (l *DeliveryLedger) flushRetryRefunds(ctx context.Context) error {
@@ -143,7 +184,7 @@ func (l *DeliveryLedger) flushRetryRefunds(ctx context.Context) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if _, err := l.ApplyRetry(command); err != nil {
+		if _, err := l.applyRetry(ctx, command); err != nil {
 			return err
 		}
 		l.retry.mu.Lock()
@@ -293,10 +334,7 @@ func (l *DeliveryLedger) commitRetryOutcome(ctx context.Context, outcome retryOu
 			l.retry.mu.Lock()
 			id := identifyRetry(outcome.command.Attempts[0])
 			delete(l.retry.outcomes, id)
-			if transport, ok := l.retry.transports[id]; ok {
-				transport.timer.Stop()
-				delete(l.retry.transports, id)
-			}
+			l.removeRetryTransportLocked(id)
 			l.retry.mu.Unlock()
 			return
 		}
@@ -369,11 +407,7 @@ func (l *DeliveryLedger) applyRetry(ctx context.Context, command *deliverypb.Ret
 // that originally delivered them is gone. An active broker expires its own
 // attempts. The leader also recovers attempts whose owner lease has lapsed.
 func (l *DeliveryLedger) RunRetryExpiry(ctx context.Context, interval time.Duration, isLeader func() bool, logger *zap.Logger) {
-	interval = min(max(interval, 25*time.Millisecond), 250*time.Millisecond)
-	var refunds sync.WaitGroup
-	refunds.Go(func() { l.runRetryRefunds(ctx, interval, logger) })
-	defer refunds.Wait()
-	ticker := time.NewTicker(interval)
+	ticker := time.NewTicker(min(max(interval, 25*time.Millisecond), 250*time.Millisecond))
 	defer ticker.Stop()
 	for {
 		select {
@@ -387,17 +421,34 @@ func (l *DeliveryLedger) RunRetryExpiry(ctx context.Context, interval time.Durat
 	}
 }
 
-func (l *DeliveryLedger) runRetryRefunds(ctx context.Context, interval time.Duration, logger *zap.Logger) {
-	ticker := time.NewTicker(interval)
+// RunRetryRefunds drains refunds independently of expiry. During shutdown it
+// also waits for authorizations that may still hand off an unsent attempt.
+func (l *DeliveryLedger) RunRetryRefunds(ctx context.Context, interval time.Duration, logger *zap.Logger) {
+	ticker := time.NewTicker(min(max(interval, 25*time.Millisecond), 250*time.Millisecond))
 	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
+	backoff := false
+	for ctx.Err() == nil {
+		l.retry.mu.Lock()
+		draining := l.retry.draining
+		pending := len(l.retry.refunds)
+		drained := draining && len(l.retry.authorizing) == 0 && pending == 0
+		l.retry.mu.Unlock()
+		if drained {
 			return
-		case <-ticker.C:
-			if err := l.flushRetryRefunds(ctx); err != nil && ctx.Err() == nil {
-				logger.Warn("failed to refund unsent delivery attempts", zap.Error(err))
+		}
+		// Keep making progress through batches during the bounded shutdown
+		// window. Wait between failures or while authorizations are settling.
+		if !draining || pending == 0 || backoff {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
 			}
+		}
+		err := l.flushRetryRefunds(ctx)
+		backoff = err != nil
+		if backoff && ctx.Err() == nil {
+			logger.Warn("failed to refund unsent delivery attempts", zap.Error(err))
 		}
 	}
 }
@@ -451,7 +502,7 @@ func (l *DeliveryLedger) expireRetryPage(attempts []*deliverypb.DeliveryAttemptT
 		_, authorizing := l.retry.authorizing[id]
 		_, refunding := l.retry.refunds[id]
 		_, expiringElsewhere := l.retry.expiring[id]
-		transport := l.retry.transports[id]
+		transport := l.retry.transports[[utils.EventKeySize]byte(id[:utils.EventKeySize])][id]
 		if !pending && !authorizing && !refunding && !expiringElsewhere && !time.Now().Before(transport.deadline) {
 			if l.retry.expiring == nil {
 				l.retry.expiring = make(map[retryIdentity]struct{})

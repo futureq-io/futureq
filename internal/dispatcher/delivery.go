@@ -270,8 +270,11 @@ func (l *DeliveryLedger) applyLocal(mode storage.SyncMode, apply func(*raft.Deli
 	if l.StandaloneReceipts != nil {
 		l.StandaloneReceipts.CommitBatch(delivery)
 	}
-	if len(deleted) > 0 && l.OnDelete != nil {
-		l.OnDelete(deleted)
+	if len(deleted) > 0 {
+		l.RemoveRetryTransports(deleted)
+		if l.OnDelete != nil {
+			l.OnDelete(deleted)
+		}
 	}
 	return nil
 }
@@ -290,6 +293,7 @@ func (l *DeliveryLedger) DeleteKeys(keys [][]byte) error {
 	if l.StandaloneReceipts != nil {
 		l.StandaloneReceipts.Delete(keys)
 	}
+	l.RemoveRetryTransports(keys)
 	return nil
 }
 

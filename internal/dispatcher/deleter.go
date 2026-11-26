@@ -62,12 +62,10 @@ func NewDirectDeleteBackend(db storage.DB, logger *zap.Logger) DeleteBackend {
 func (b *directDeleteBackend) DeleteKeys(keys [][]byte) error {
 	batch := b.db.NewBatch()
 	defer batch.Close() //nolint:errcheck
+	delivery := raft.NewDeliveryBatch(b.db, batch)
 
 	for _, key := range keys {
-		if err := batch.Delete(key); err != nil {
-			return err
-		}
-		if err := batch.Delete(raft.DeliveryStateKey(key)); err != nil {
+		if err := delivery.Delete(key); err != nil {
 			return err
 		}
 	}

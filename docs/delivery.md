@@ -151,8 +151,9 @@ no longer eligible.
 The broker queues outcomes for asynchronous persistence and releases local
 tracking after commit. While a broker owns an attempt, outcomes it accepts
 into that queue take precedence over expiry. On graceful shutdown, the broker
-stops accepting new outcomes and keeps proposals and lease renewal active
-while it drains accepted outcomes within the shutdown window. Clustered brokers renew
+stops accepting new authorizations and outcomes. It keeps proposals and lease
+renewal active while it drains accepted outcomes and refunds unsent attempts
+within the shutdown window. Clustered brokers renew
 `delivery.retryOwnerLease` every fifth of its duration (every 3 seconds by
 default). Leaders wait an additional `delivery.retryOwnerMaxClockSkew`
 (default 2 seconds) before recovering another broker's expired attempts.
@@ -161,8 +162,9 @@ An outage that prevents outcomes from committing before recovery can still
 result in a retry or a dead letter.
 
 Deadline scans drain expired attempts in bounded batches, including when no
-workers are connected. A final NACK or timeout atomically archives the payload
-and marks that subscription's delivery complete. Other subscriptions keep
+workers are connected. Deletion removes the durable retry deadlines with the
+receipt and stops local transport timers after commit. A final NACK or timeout
+atomically archives the payload and marks that subscription's delivery complete. Other subscriptions keep
 their independent retry budgets. Message TTL and unsubscribing can discard
 pending deliveries before they are dead-lettered. See the
 [dead-letter queue API](api.md#dead-letter-queue) for retention and retrieval.

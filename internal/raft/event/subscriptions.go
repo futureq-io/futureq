@@ -299,7 +299,10 @@ func (b *DeliveryBatch) cleanSubscriptions(keys [][]byte) (statemachine.Result, 
 				return statemachine.Result{}, nil, err
 			}
 			if record != nil && !record.Active {
-				changed = state.acknowledge(recipient) || changed
+				if err := b.acknowledgeRecipient(key, state, recipient); err != nil {
+					return statemachine.Result{}, nil, err
+				}
+				changed = true
 			}
 		}
 		if !changed {

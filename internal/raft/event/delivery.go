@@ -173,6 +173,17 @@ func NewDeliveryBatch(db storage.DB, batch storage.Batch) *DeliveryBatch {
 func (b *DeliveryBatch) ObserveStore(key []byte) { b.present[string(key)] = true }
 
 func (b *DeliveryBatch) Delete(key []byte) error {
+	state, err := b.load(key)
+	if err != nil {
+		return err
+	}
+	if state != nil {
+		for i, attempt := range state.attempts {
+			if err := b.deleteAttemptDeadline(key, state.Recipients[i], attempt); err != nil {
+				return err
+			}
+		}
+	}
 	if err := b.batch.Delete(key); err != nil {
 		return err
 	}
@@ -182,6 +193,27 @@ func (b *DeliveryBatch) Delete(key []byte) error {
 	b.present[string(key)] = false
 	b.states[string(key)] = nil
 	delete(b.dirty, string(key))
+	return nil
+}
+
+func (b *DeliveryBatch) deleteAttemptDeadline(key []byte, recipient string, attempt *deliverypb.DeliveryAttempt) error {
+	if len(attempt.GetToken()) == 0 {
+		return nil
+	}
+	return b.batch.Delete(retryExpiryKey(&deliverypb.DeliveryAttemptTarget{
+		Key: key, Recipient: recipient, Token: attempt.Token, DeadlineMs: attempt.DeadlineMs,
+	}))
+}
+
+func (b *DeliveryBatch) acknowledgeRecipient(key []byte, state *DeliveryState, recipient string) error {
+	if !state.Needs(recipient) {
+		return nil
+	}
+	i := uint32(sort.SearchStrings(state.Recipients, recipient))
+	if err := b.deleteAttemptDeadline(key, recipient, state.attempts[i]); err != nil {
+		return err
+	}
+	state.acknowledge(recipient)
 	return nil
 }
 
@@ -296,7 +328,9 @@ func (b *DeliveryBatch) Acknowledge(acks []DeliveryAck) ([][]byte, error) {
 		if state == nil || !state.Needs(recipient) {
 			continue
 		}
-		state.acknowledge(recipient)
+		if err := b.acknowledgeRecipient(ack.Key, state, recipient); err != nil {
+			return nil, err
+		}
 		if state.complete() {
 			if err := b.Delete(ack.Key); err != nil {
 				return nil, err
@@ -384,7 +418,9 @@ func (b *DeliveryBatch) prepare(prepare DeliveryPrepare) (*DeliveryState, bool, 
 		// vanished ephemeral universal interests are completed on epoch change.
 		for _, recipient := range state.Recipients {
 			if strings.HasPrefix(recipient, "u:") && !active[recipient] {
-				state.acknowledge(recipient)
+				if err := b.acknowledgeRecipient(prepare.Key, state, recipient); err != nil {
+					return nil, false, err
+				}
 			}
 		}
 		state.Epoch = prepare.Epoch

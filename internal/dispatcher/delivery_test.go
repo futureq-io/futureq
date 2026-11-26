@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -136,12 +137,10 @@ func (s *RetryExpirySuite) TestStalledRefundDoesNotBlockUnrelatedExpiry() {
 	s.Require().NoError(err)
 	s.Require().True(allowed)
 	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		ledger.RunRetryExpiry(ctx, time.Millisecond, nil, logger)
-	}()
-	defer func() { close(unblock); cancel(); <-done }()
+	var workers sync.WaitGroup
+	workers.Go(func() { ledger.RunRetryExpiry(ctx, time.Millisecond, nil, logger) })
+	workers.Go(func() { ledger.RunRetryRefunds(ctx, time.Millisecond, logger) })
+	defer func() { close(unblock); cancel(); workers.Wait() }()
 	select {
 	case <-entered:
 	case <-time.After(time.Second):
@@ -151,6 +150,139 @@ func (s *RetryExpirySuite) TestStalledRefundDoesNotBlockUnrelatedExpiry() {
 		page, err := (raft.DeadLetterQuery{Topic: "orders", Limit: 10}).Read(db)
 		return err == nil && len(page.Page.Entries) == 1 && bytes.HasPrefix(page.Page.Entries[0].Id, second.Attempts[0].Key)
 	}, 3*time.Second, 10*time.Millisecond)
+}
+
+func (s *RetryExpirySuite) TestShutdownDrainsRefundFromInFlightAuthorization() {
+	logger := zap.NewNop()
+	db, err := storage.NewPebble(config.Pebble{Mode: "memory"}, logger)
+	s.Require().NoError(err)
+	defer db.Close() //nolint:errcheck
+	local := NewDeliveryLedger(db, nil, nil, nil)
+	shutdown, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	broker, stopBroker := context.WithCancel(shutdown)
+	defer stopBroker()
+	refundStarted := make(chan struct{})
+	ledger := NewDeliveryLedger(db, nil, nil, func(raw []byte) (statemachine.Result, error) {
+		var cmd deliverypb.RetryCommand
+		if err := proto.Unmarshal(raw[1:], &cmd); err != nil {
+			return statemachine.Result{}, err
+		}
+		if cmd.Operation == deliverypb.RetryCommand_CANCEL_RESERVATION {
+			close(refundStarted)
+			<-broker.Done()
+			return statemachine.Result{}, errors.New("transient refund failure")
+		}
+		value, err := local.ApplyRetry(&cmd)
+		return statemachine.Result{Value: value}, err
+	})
+	ledger.ProposeContext = func(ctx context.Context, raw []byte) (statemachine.Result, error) {
+		if err := ctx.Err(); err != nil {
+			return statemachine.Result{}, err
+		}
+		var cmd deliverypb.RetryCommand
+		if err := proto.Unmarshal(raw[1:], &cmd); err != nil {
+			return statemachine.Result{}, err
+		}
+		value, err := local.ApplyRetry(&cmd)
+		return statemachine.Result{Value: value}, err
+	}
+	ledger.ConfigureRetryOutcomes(1)
+	start := s.storeRetryFixture(db, 1, time.Now().Add(time.Minute))
+	var workers sync.WaitGroup
+	workers.Go(func() { ledger.RunRetryRefunds(shutdown, time.Millisecond, logger) })
+	defer func() { stopBroker(); cancel(); workers.Wait() }()
+	authorization := make(chan error, 1)
+	workers.Go(func() {
+		_, err := ledger.AuthorizeRetrySend(start, time.Second,
+			func(uint64) (bool, error) { return true, nil },
+			func() (time.Time, error) { return time.Time{}, nil })
+		authorization <- err
+	})
+	select {
+	case <-refundStarted:
+	case <-shutdown.Done():
+		s.FailNow("authorization did not attempt its refund")
+	}
+	ledger.StopRetryOutcomeAdmission()
+	stopBroker()
+	select {
+	case err := <-authorization:
+		s.Require().NoError(err)
+	case <-shutdown.Done():
+		s.FailNow("authorization did not hand off its failed refund")
+	}
+	drained := make(chan struct{})
+	go func() { workers.Wait(); close(drained) }()
+	select {
+	case <-drained:
+		s.Require().NoError(shutdown.Err())
+	case <-shutdown.Done():
+		s.FailNow("refunds did not drain before the shutdown deadline")
+	}
+
+	s.Require().NoError(local.expireDueRetryAttempts(context.Background(), time.Now().Add(time.Minute).UnixMilli(), nil))
+	page, err := (raft.DeadLetterQuery{Topic: "orders", Limit: 10}).Read(db)
+	s.Require().NoError(err)
+	s.Empty(page.Page.Entries)
+	key := start.Attempts[0].Key
+	state, err := raft.ReadDeliveryState(db, key)
+	s.Require().NoError(err)
+	s.True(state.Ready(start.Attempts[0].Recipient))
+}
+
+func (s *RetryExpirySuite) TestDeletionClearsTransportTimersAndDeadlines() {
+	logger := zap.NewNop()
+	db, err := storage.NewPebble(config.Pebble{Mode: "memory"}, logger)
+	s.Require().NoError(err)
+	defer db.Close() //nolint:errcheck
+	ledger := NewDeliveryLedger(db, nil, NewDirectDeleteBackend(db, logger), nil)
+	deadline := time.Now().Add(time.Hour)
+	prepare := func(uint64) (bool, error) { return true, nil }
+	var keys [][]byte
+	defer func() { ledger.RemoveRetryTransports(keys) }()
+	var timers []*time.Timer
+	for i := range 65 {
+		start := s.storeRetryFixture(db, uint64(i+1), deadline)
+		target := start.Attempts[0]
+		keys = append(keys, target.Key)
+		ok, err := ledger.AuthorizeRetrySend(start, time.Hour, prepare, func() (time.Time, error) { return deadline, nil })
+		s.Require().NoError(err)
+		s.Require().True(ok)
+		timer := ledger.retry.transports[[utils.EventKeySize]byte(target.Key)][identifyRetry(target)].timer
+		s.Require().NotNil(timer)
+		timers = append(timers, timer)
+	}
+	// TTL and explicit deletions use the same deleter path.
+	deleter := NewDeleter(ledger, time.Hour, logger)
+	for _, key := range keys[:64] {
+		deleter.MarkDeleted(key)
+	}
+	deleter.flush()
+	s.Len(ledger.retry.transports, 1)
+	for _, timer := range timers[:64] {
+		s.False(timer.Stop(), "deletion must have stopped the timer")
+	}
+	due, err := raft.DueDeliveryAttempts(db, deadline.Add(time.Second).UnixMilli())
+	s.Require().NoError(err)
+	s.Require().Len(due, 1)
+	s.Equal(keys[64], due[0].Key)
+}
+
+func (s *RetryExpirySuite) TestDeletionDuringAuthorizationCannotInstallTransportTimer() {
+	logger := zap.NewNop()
+	db, err := storage.NewPebble(config.Pebble{Mode: "memory"}, logger)
+	s.Require().NoError(err)
+	defer db.Close() //nolint:errcheck
+	ledger := NewDeliveryLedger(db, nil, NewDirectDeleteBackend(db, logger), nil)
+	start := s.storeRetryFixture(db, 1, time.Now().Add(time.Hour))
+	allowed, err := ledger.AuthorizeRetrySend(start, time.Hour, func(uint64) (bool, error) { return true, nil }, func() (time.Time, error) {
+		err := ledger.DeleteKeys([][]byte{start.Attempts[0].Key})
+		return time.Now().Add(time.Hour), err
+	})
+	s.Require().NoError(err)
+	s.False(allowed)
+	s.Empty(ledger.retry.transports)
 }
 
 func (s *RetryExpirySuite) TestFullOutcomeQueueDoesNotDropAnUnsentRefund() {

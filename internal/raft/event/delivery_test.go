@@ -231,6 +231,23 @@ func (s *DeliveryRetrySuite) TestSentReplacesReservationDeadlineWithoutExtending
 	s.Equal(send.DeadlineMs, due[0].DeadlineMs)
 }
 
+func (s *DeliveryRetrySuite) TestReplicatedDeleteClearsReservedAndSentDeadlines() {
+	key := s.store(&storagepb.StoredMessage{Topic: "orders", EnqueuedAtUnixMs: 100, MaxRetries: new(uint32(0))}, "g:worker", "u:audit")
+	sent := s.attempt(key, "g:worker", 1, 3700)
+	reserved := s.attempt(key, "u:audit", 2, 3800)
+	s.apply(s.retry(deliverypb.RetryCommand_START, 100, sent), s.retry(deliverypb.RetryCommand_SENT, 101, sent))
+	cmd, err := MarshalDeleteBatchCmd([][]byte{key})
+	s.Require().NoError(err)
+	// Deletion must see the reservation made earlier in the same Raft batch.
+	s.apply(s.retry(deliverypb.RetryCommand_START, 102, reserved), cmd)
+	due, err := DueDeliveryAttempts(s.db, 3800)
+	s.Require().NoError(err)
+	s.Empty(due)
+	receipt, err := ReadDeliveryState(s.db, key)
+	s.Require().NoError(err)
+	s.Nil(receipt)
+}
+
 func (s *DeliveryRetrySuite) TestForeignExpiryWaitsForOwnerLease() {
 	key := s.store(&storagepb.StoredMessage{Topic: "orders", EnqueuedAtUnixMs: 100, MaxRetries: new(uint32(0))}, "g:worker")
 	owner := bytes.Repeat([]byte{2}, RetryOwnerSize)
