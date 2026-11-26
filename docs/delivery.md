@@ -150,7 +150,9 @@ no longer eligible.
 
 The broker queues outcomes for asynchronous persistence and releases local
 tracking after commit. While a broker owns an attempt, outcomes it accepts
-into that queue take precedence over expiry. On graceful shutdown, the broker
+into that queue take precedence over expiry. For retry-limited auto-ACK
+deliveries, the broker reserves queue capacity before charging the attempt
+and queues the ACK after transport succeeds. On graceful shutdown, the broker
 stops accepting new authorizations and outcomes. It keeps proposals and lease
 renewal active while it drains accepted outcomes and refunds unsent attempts
 within the shutdown window. Clustered brokers renew

@@ -461,7 +461,7 @@ func (h *ConsumerHandler) beginLimitedSend(consumerID string, init *pb.Subscribe
 	var autoACK *dispatcher.RetryAutoACK
 	if init.AutoAck {
 		autoACK = h.RetryLedger.TryReserveRetryAutoACK(limitedOutcome(consumerID, init, tag, deliverypb.RetryCommand_ACK), func() {
-			h.hub.ReleaseRetrySend(consumerID, message.DeliveryTag, token[:])
+			h.hub.ReleaseRetrySend(consumerID, tag[:utils.EventKeySize], token[:])
 		})
 		if autoACK == nil {
 			return nil, nil

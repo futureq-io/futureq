@@ -94,15 +94,14 @@ func (l *DeliveryLedger) AuthorizeRetrySend(start *deliverypb.RetryCommand, ackW
 		l.retry.mu.Lock()
 		delete(l.retry.authorizing, id)
 		_, stillExists := l.retry.transports[key][id]
-		if !authorized {
-			l.removeRetryTransportLocked(id)
-		}
 		// Receipt cleanup may have completed while the refund was in flight.
 		if refund != nil && stillExists {
 			if l.retry.refunds == nil {
 				l.retry.refunds = make(map[retryIdentity]*retryRefund)
 			}
 			l.retry.refunds[id] = &retryRefund{command: refund}
+		} else if !authorized {
+			l.removeRetryTransportLocked(id)
 		}
 		l.retry.mu.Unlock()
 	}()
@@ -173,6 +172,7 @@ func (l *DeliveryLedger) RemoveRetryTransports(keys [][]byte) {
 				transport.timer.Stop()
 			}
 			l.releaseRetryAutoACKLocked(id)
+			delete(l.retry.refunds, id)
 		}
 		delete(l.retry.transports, eventKey)
 	}
@@ -222,6 +222,7 @@ func (l *DeliveryLedger) applyRetryRefund(ctx context.Context, refund *retryRefu
 		return err
 	}
 	delete(l.retry.refunds, id)
+	l.removeRetryTransportLocked(id)
 	return nil
 }
 

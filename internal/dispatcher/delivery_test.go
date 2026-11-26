@@ -568,6 +568,27 @@ func (s *RetryExpirySuite) TestFullOutcomeQueueDoesNotDropAnUnsentRefund() {
 	s.Equal(uint64(1), attempt, "the unsent delivery must retain its first attempt")
 }
 
+func (s *RetryExpirySuite) TestAutoACKReservationReleasesCapacityOnSendFailure() {
+	ledger := NewDeliveryLedger(nil, nil, nil, nil)
+	ledger.ConfigureRetryOutcomes(1)
+	outcome := func(id uint64) *deliverypb.RetryCommand {
+		return &deliverypb.RetryCommand{
+			Operation: deliverypb.RetryCommand_ACK, NowMs: time.Now().UnixMilli(),
+			Attempts: []*deliverypb.DeliveryAttemptTarget{{
+				Key: utils.EventKey(1, utils.TopicHash("orders"), id), Recipient: "g:workers",
+				Token: bytes.Repeat([]byte{byte(id)}, raft.AttemptTokenSize),
+			}},
+		}
+	}
+	reservation := ledger.TryReserveRetryAutoACK(outcome(1), func() {})
+	s.Require().NotNil(reservation)
+	s.False(ledger.TryRetryOutcome(outcome(2), func() {}), "manual ACKs cannot consume a reserved slot")
+	s.Nil(ledger.TryReserveRetryAutoACK(outcome(2), func() {}))
+	s.False(reservation.Finish(false))
+	s.Empty(ledger.retryOutcomes, "failed sends cannot enqueue an ACK")
+	s.True(ledger.TryRetryOutcome(outcome(2), func() {}))
+}
+
 func (s *RetryExpirySuite) TestOwnerRenewalUsesConfiguredLease() {
 	const lease = 250 * time.Millisecond
 	const maxClockSkew = 1500 * time.Millisecond
