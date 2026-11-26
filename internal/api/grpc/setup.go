@@ -30,6 +30,7 @@ func New(
 	hub *dispatcher.Hub,
 	deleter *dispatcher.Deleter,
 	logger *zap.Logger,
+	standalonePublishLedger *dispatcher.DeliveryLedger,
 ) *Server {
 	log := logger.Named("grpc_server")
 
@@ -53,7 +54,9 @@ func New(
 	)
 
 	// Register all service implementations.
-	pb.RegisterFutureQProducerServer(srv, handlers.NewProducerHandler(log))
+	producer := handlers.NewProducerHandler(log)
+	producer.StandalonePublishLedger = standalonePublishLedger
+	pb.RegisterFutureQProducerServer(srv, producer)
 	pb.RegisterFutureQConsumerServer(srv, handlers.NewConsumerHandler(log, hub, deleter))
 	pb.RegisterFutureQTopicServer(srv, &handlers.TopicHandler{})
 	pb.RegisterFutureQClusterServer(srv, handlers.NewClusterHandler(log))

@@ -19,6 +19,7 @@ import (
 	"github.com/futureq-io/futureq/internal/config"
 	"github.com/futureq-io/futureq/internal/dispatcher"
 	"github.com/futureq-io/futureq/internal/metrics"
+	raft "github.com/futureq-io/futureq/internal/raft/event"
 	"github.com/futureq-io/futureq/pkg/log"
 	pb "github.com/futureq-io/protocol/proto/go"
 	"github.com/futureq-io/stormoar/v4/statemachine"
@@ -128,10 +129,14 @@ func startRun(cmd *cobra.Command, _ []string) {
 	}
 
 	ledger := dispatcher.NewDeliveryLedger(a.DB, recipients, deleteBackend, proposeDelivery)
+	var standalonePublishLedger *dispatcher.DeliveryLedger
 	if cfg.Cluster.Enabled {
 		ledger.ProposeContext = func(ctx context.Context, cmd []byte) (statemachine.Result, error) {
 			return a.NodeHost.SyncPropose(ctx, a.NodeHost.GetNoOPSession(cfg.Cluster.ShardID), cmd)
 		}
+	} else if maxBytes, _ := cfg.Delivery.ReceiptCache.MaxBytes.Bytes(); maxBytes > 0 {
+		ledger.StandaloneReceipts = raft.NewStandaloneReceiptCache(maxBytes, cfg.Delivery.ReceiptCache.MaxEntries)
+		standalonePublishLedger = ledger
 	}
 	deleter := dispatcher.NewDeleter(ledger, deleteInterval, logger)
 	deleter.AckQueueCapacity = cfg.Delivery.AckQueueCapacity
@@ -249,7 +254,7 @@ func startRun(cmd *cobra.Command, _ []string) {
 	}()
 
 	// ── gRPC server ───────────────────────────────────────────────────────────
-	grpcserver.New(cfg.API.GRPC, hub, deleter, logger).
+	grpcserver.New(cfg.API.GRPC, hub, deleter, logger, standalonePublishLedger).
 		Listen().
 		WaitForShutdown(a.Ctx)
 

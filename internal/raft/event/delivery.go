@@ -142,16 +142,17 @@ func MarshalAckDeliveryBatchCmd(acks []DeliveryAck) ([]byte, error) {
 // deletes in one Dragonboat Update see each other, rather than stale DB reads.
 // Call Flush before committing the storage batch to persist final receipts.
 type DeliveryBatch struct {
-	subscriptions map[string]*deliverypb.SubscriptionRecord
-	createdTopics map[string]struct{}
-	db            storage.DB
-	batch         storage.Batch
-	states        map[string]*DeliveryState
-	present       map[string]bool
-	dirty         map[string]bool
-	receipts      *receiptCache
-	receiptHits   int
-	receiptMisses int
+	subscriptions      map[string]*deliverypb.SubscriptionRecord
+	createdTopics      map[string]struct{}
+	db                 storage.DB
+	batch              storage.Batch
+	states             map[string]*DeliveryState
+	present            map[string]bool
+	dirty              map[string]bool
+	receipts           *receiptCache
+	standaloneReceipts *StandaloneReceiptCache
+	receiptHits        int
+	receiptMisses      int
 }
 
 func NewDeliveryBatch(db storage.DB, batch storage.Batch) *DeliveryBatch {
@@ -177,8 +178,14 @@ func (b *DeliveryBatch) load(key []byte) (*DeliveryState, error) {
 	if state, ok := b.states[string(key)]; ok {
 		return state, nil
 	}
-	if b.receipts != nil {
-		if committed := b.receipts.get(string(key)); committed != nil {
+	if b.receipts != nil || b.standaloneReceipts != nil {
+		var committed *DeliveryState
+		if b.receipts != nil {
+			committed = b.receipts.get(string(key))
+		} else {
+			committed = b.standaloneReceipts.get(string(key))
+		}
+		if committed != nil {
 			b.receiptHits++
 			state := *committed
 			// The roster is immutable. ACKs mutate the bitmap in the batch copy.

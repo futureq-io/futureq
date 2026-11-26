@@ -15,6 +15,7 @@ import (
 
 	"github.com/futureq-io/futureq/internal/app"
 	"github.com/futureq-io/futureq/internal/config"
+	"github.com/futureq-io/futureq/internal/dispatcher"
 	"github.com/futureq-io/futureq/internal/metrics"
 	raft "github.com/futureq-io/futureq/internal/raft/event"
 	"github.com/futureq-io/futureq/internal/storage"
@@ -47,8 +48,9 @@ func minProtoAckLevel(min config.AckLevel) pb.AckLevel {
 // ProducerHandler implements pb.FutureQProducerServer.
 type ProducerHandler struct {
 	pb.UnimplementedFutureQProducerServer
-	logger         *zap.Logger
-	timeBucketSize time.Duration
+	logger                  *zap.Logger
+	timeBucketSize          time.Duration
+	StandalonePublishLedger *dispatcher.DeliveryLedger
 }
 
 // NewProducerHandler returns an initialised ProducerHandler.
@@ -371,22 +373,46 @@ func waitForLeaderAck(ctx context.Context, persisted <-chan struct{}, applied <-
 	}
 }
 
-// processStandaloneBatch writes the batch directly to Pebble (non-Raft mode).
+// processStandaloneBatch writes the batch directly to local storage.
 func (ph *ProducerHandler) processStandaloneBatch(batch *pb.PublishBatch, nowMs int64, receipts map[string][]byte) error {
 	b := app.A.DB.NewBatch()
 	defer func() { _ = b.Close() }()
+
+	var published map[string]*raft.DeliveryState
+	var byTopic map[string]*raft.DeliveryState
+	if ph.StandalonePublishLedger != nil {
+		published = make(map[string]*raft.DeliveryState, len(batch.Messages))
+		byTopic = make(map[string]*raft.DeliveryState, len(receipts))
+		for topic, data := range receipts {
+			state, err := raft.UnmarshalDeliveryState(data)
+			if err != nil {
+				ph.logger.Warn("failed to decode published receipt for cache", zap.String("topic", topic), zap.Error(err))
+				continue
+			}
+			byTopic[topic] = state
+		}
+	}
 
 	if err := ph.marshalMessages(batch, nowMs, func(data *storagepb.StoredMessage) error {
 		key, err := app.A.Repositories.Events.StoreWithBatch(b, app.A.Repositories.Events.NextID(), data)
 		if err != nil {
 			return err
 		}
+		if state := byTopic[data.Topic]; state != nil {
+			published[string(key)] = state
+		}
 		return b.Set(raft.DeliveryStateKey(key), receipts[data.Topic])
 	}); err != nil {
 		return err
 	}
 
-	if err := b.Commit(storage.Sync); err != nil {
+	var err error
+	if ph.StandalonePublishLedger != nil {
+		err = ph.StandalonePublishLedger.CommitStandalonePublish(b, published)
+	} else {
+		err = b.Commit(storage.Sync)
+	}
+	if err != nil {
 		ph.logger.Error("failed to commit standalone batch", zap.Error(err))
 		return errBatchSave
 	}
