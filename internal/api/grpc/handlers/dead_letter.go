@@ -27,7 +27,7 @@ func (h *DeadLetterHandler) ListDeadLetters(ctx context.Context, request *pb.Lis
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
 	if len(token) != 0 {
-		if err := raft.ValidateDeadLetterID(topic, token); err != nil {
+		if _, err := raft.ParseDeadLetterPageToken(topic, token); err != nil {
 			return nil, status.Error(codes.InvalidArgument, err.Error())
 		}
 	}

@@ -246,26 +246,26 @@ func (h *ConsumerHandler) sender(
 			errCh <- ctx.Err()
 			return
 		case msg := <-ch:
-			wire := msg
+			var frames *deliveryFrames
+			var err error
 			if msg.MaxRetries != nil {
-				var err error
-				wire, err = h.beginLimitedSend(consumerID, init, msg)
-				if err != nil {
-					errCh <- err
-					return
-				}
-			} else if !h.hub.BeginSend(consumerID, msg) {
-				wire = nil
+				frames, err = h.beginLimitedSend(consumerID, init, msg)
+			} else if h.hub.BeginSend(consumerID, msg) {
+				frames, err = h.prepareDeliveryFrames(msg)
 			}
-			if wire == nil {
+			if err != nil {
+				errCh <- err
+				return
+			}
+			if frames == nil {
 				h.hub.RejectQueuedAttempt(consumerID, msg)
 				continue // expired, ACKed, or fenced buffered delivery
 			}
 			// Observe before Send: consumer backpressure can block this call.
 			// Count attempted sends here, including attempts that fail in Send.
 			metrics.DeliverySendLatenessMs.WithLabelValues(msg.Topic).Observe(float64(time.Now().UnixNano())/1e6 - float64(msg.EnqueuedAtUnixMs+msg.DelayMs))
-			if err := h.sendDelivery(stream, wire, func() error {
-				return h.checkDeliveryChunk(consumerID, recipient, msg, wire)
+			if err := h.sendDelivery(stream, frames, func() error {
+				return h.checkDeliveryChunk(consumerID, recipient, msg, frames.QueueMessage)
 			}); err != nil {
 				errCh <- err
 				return
@@ -273,7 +273,7 @@ func (h *ConsumerHandler) sender(
 			metrics.DeliveryGRPCSendsTotal.WithLabelValues(msg.Topic).Inc()
 			if init.AutoAck {
 				if msg.MaxRetries != nil {
-					if _, err := h.finishLimitedSend(consumerID, init, wire.DeliveryTag, true, false); err != nil {
+					if _, err := h.finishLimitedSend(consumerID, init, frames.DeliveryTag, true, false); err != nil {
 						errCh <- err
 						return
 					}
@@ -311,13 +311,20 @@ func (h *ConsumerHandler) checkDeliveryChunk(consumerID, recipient string, queue
 	return nil
 }
 
-func (h *ConsumerHandler) sendDelivery(stream grpc.BidiStreamingServer[pb.ConsumerFrame, pb.QueueMessage], message *pb.QueueMessage, checkChunk func() error) error {
+type deliveryFrames struct {
+	*pb.QueueMessage
+	encoded      []byte
+	chunkSize    int
+	firstChecked bool
+}
+
+func (h *ConsumerHandler) prepareDeliveryFrames(message *pb.QueueMessage) (*deliveryFrames, error) {
 	if h.MaxSendBytes <= 0 || proto.Size(message) <= h.MaxSendBytes {
-		return stream.Send(message)
+		return &deliveryFrames{QueueMessage: message}, nil
 	}
 	data, err := proto.Marshal(message)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	// Reserve the chunk field tag and the "more chunks" boolean. The bytes
 	// field's length prefix grows with each varint boundary.
@@ -327,13 +334,27 @@ func (h *ConsumerHandler) sendDelivery(stream grpc.BidiStreamingServer[pb.Consum
 		chunkSize--
 	}
 	if chunkSize <= 0 {
-		return status.Error(codes.ResourceExhausted, "gRPC send limit cannot fit a delivery chunk")
+		return nil, status.Error(codes.ResourceExhausted, "gRPC send limit cannot fit a delivery chunk")
 	}
+	return &deliveryFrames{QueueMessage: message, encoded: data, chunkSize: chunkSize}, nil
+}
+
+func (h *ConsumerHandler) sendDelivery(stream grpc.BidiStreamingServer[pb.ConsumerFrame, pb.QueueMessage], frames *deliveryFrames, checkChunk func() error) error {
+	if frames.encoded == nil {
+		return stream.Send(frames.QueueMessage)
+	}
+	// The first check for a limited delivery ran under refund protection.
+	// Every subsequent frame must still verify that the attempt is active.
+	check := !frames.firstChecked
+	data := frames.encoded
 	for len(data) > 0 {
-		if err := checkChunk(); err != nil {
-			return err
+		if check {
+			if err := checkChunk(); err != nil {
+				return err
+			}
 		}
-		size := min(chunkSize, len(data))
+		check = true
+		size := min(frames.chunkSize, len(data))
 		if err := stream.Send(&pb.QueueMessage{ChunkData: data[:size], MoreChunks: size < len(data)}); err != nil {
 			return err
 		}
@@ -415,12 +436,9 @@ func (h *ConsumerHandler) receiver(
 	}
 }
 
-func (h *ConsumerHandler) beginLimitedSend(consumerID string, init *pb.SubscribeInit, message *pb.QueueMessage) (*pb.QueueMessage, error) {
+func (h *ConsumerHandler) beginLimitedSend(consumerID string, init *pb.SubscribeInit, message *pb.QueueMessage) (*deliveryFrames, error) {
 	if !h.hub.CanSend(consumerID, message) {
 		return nil, nil
-	}
-	if h.MaxSendBytes > 0 && h.MaxSendBytes < 5 {
-		return nil, status.Error(codes.ResourceExhausted, "gRPC send limit cannot fit a delivery chunk")
 	}
 	if h.RetryLedger == nil {
 		return nil, status.Error(codes.Unavailable, "delivery retry ledger unavailable")
@@ -429,45 +447,46 @@ func (h *ConsumerHandler) beginLimitedSend(consumerID string, init *pb.Subscribe
 	deadline := max(now.UnixMilli()+1, now.Add(h.hub.AttemptTimeout()).UnixMilli())
 	token := uuid.New()
 	recipient := metadata.DeliveryRecipient(init.GroupId, consumerID)
-	attempt, err := h.RetryLedger.ApplyRetry(&deliverypb.RetryCommand{
+	start := &deliverypb.RetryCommand{
 		Operation: deliverypb.RetryCommand_START, NowMs: now.UnixMilli(),
 		Attempts: []*deliverypb.DeliveryAttemptTarget{{
 			Key: message.DeliveryTag, Recipient: recipient, Token: token[:], DeadlineMs: deadline,
 		}},
+	}
+	var frames *deliveryFrames
+	authorized, err := h.RetryLedger.AuthorizeRetrySend(start, func(attempt uint64) (bool, error) {
+		if !h.hub.BeginRetrySend(consumerID, message, token[:], time.UnixMilli(deadline)) {
+			return false, nil
+		}
+		tag := make([]byte, 0, utils.EventKeySize+raft.AttemptTokenSize)
+		tag = append(tag, message.DeliveryTag...)
+		tag = append(tag, token[:]...)
+		prepared, err := h.prepareDeliveryFrames(&pb.QueueMessage{
+			Topic: message.Topic, Payload: message.Payload, DeliveryTag: tag,
+			EnqueuedAtUnixMs: message.EnqueuedAtUnixMs, DelayMs: message.DelayMs,
+			MaxRetries: message.MaxRetries, Attempt: attempt,
+		})
+		frames = prepared
+		return err == nil, err
+	}, func() (bool, error) {
+		if frames.encoded != nil {
+			err := h.checkDeliveryChunk(consumerID, recipient, message, frames.QueueMessage)
+			frames.firstChecked = err == nil
+			return err == nil, err
+		}
+		return h.hub.CanSend(consumerID, message), nil
 	})
-	if err != nil {
-		return nil, status.Errorf(codes.Unavailable, "reserve delivery attempt: %v", err)
-	}
-	if attempt == 0 {
-		return nil, nil
-	}
-	tag := make([]byte, 0, utils.EventKeySize+raft.AttemptTokenSize)
-	tag = append(tag, message.DeliveryTag...)
-	tag = append(tag, token[:]...)
-	if !h.hub.BeginRetrySend(consumerID, message, token[:], time.UnixMilli(deadline)) {
-		if _, err := h.RetryLedger.ApplyRetry(limitedOutcome(consumerID, init, tag, deliverypb.RetryCommand_CANCEL_RESERVATION)); err != nil {
-			h.logger.Warn("failed to release unsent delivery reservation", zap.Error(err))
+	if !authorized {
+		h.hub.ReleaseRetrySend(consumerID, message.DeliveryTag, token[:])
+		if err != nil {
+			if _, ok := status.FromError(err); ok {
+				return nil, err
+			}
+			return nil, status.Errorf(codes.Unavailable, "authorize delivery send: %v", err)
 		}
 		return nil, nil
 	}
-	// Charge the attempt before exposing it to the transport. Once Send can
-	// observe a token, expiry must never refund or reuse its attempt number.
-	authorized, err := h.RetryLedger.AuthorizeRetrySend(
-		limitedOutcome(consumerID, init, tag, deliverypb.RetryCommand_SENT),
-		func() bool { return h.hub.CanSend(consumerID, message) },
-	)
-	if err != nil {
-		return nil, status.Errorf(codes.Unavailable, "authorize delivery send: %v", err)
-	}
-	if !authorized {
-		h.hub.ReleaseRetrySend(consumerID, message.DeliveryTag, token[:])
-		return nil, nil
-	}
-	return &pb.QueueMessage{
-		Topic: message.Topic, Payload: message.Payload, DeliveryTag: tag,
-		EnqueuedAtUnixMs: message.EnqueuedAtUnixMs, DelayMs: message.DelayMs,
-		MaxRetries: message.MaxRetries, Attempt: attempt,
-	}, nil
+	return frames, nil
 }
 
 func (h *ConsumerHandler) finishLimitedSend(consumerID string, init *pb.SubscribeInit, tag []byte, success, requireTracking bool) (bool, error) {

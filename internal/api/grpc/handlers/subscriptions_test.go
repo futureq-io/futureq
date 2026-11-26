@@ -122,7 +122,7 @@ func (s *DeadLetterDeliverySuite) TestOversizedSummaryStillAllowsListingLaterIDs
 	s.False(full.Entry.GetSummary().GetIdentityOmitted())
 }
 
-func (s *DeadLetterDeliverySuite) TestSummaryAndCursorFit256ByteSendLimit() {
+func (s *DeadLetterDeliverySuite) TestSummaryAndCursorFitSmallSendLimits() {
 	a, _, producer, _ := openPublishTest(s.T(), "pebble")
 	ledger := dispatcher.NewDeliveryLedger(a.DB, nil, nil, nil)
 	ctx := context.Background()
@@ -143,29 +143,48 @@ func (s *DeadLetterDeliverySuite) TestSummaryAndCursorFit256ByteSendLimit() {
 	original, err := (raft.DeadLetterQuery{Topic: topic, Limit: 2}).Read(a.DB)
 	s.Require().NoError(err)
 	s.Require().Len(original.Page.Entries, 2)
-	const sendLimit = 256
 	first := proto.CloneOf(original.Page.Entries[0])
 	first.GroupId = ""
 	first.IdentityOmitted = true
 	s.Require().Greater(proto.Size(&pb.ListDeadLettersResponse{
 		Entries: []*pb.DeadLetterSummary{first}, NextPageToken: first.GetId(),
-	}), sendLimit, "dropping the group name alone does not fit")
+	}), 256, "dropping the group name alone does not fit")
 
-	h := &DeadLetterHandler{Ledger: ledger, MaxSendBytes: sendLimit}
-	request := &pb.ListDeadLettersRequest{Topic: topic, PageSize: 1}
-	for i, entry := range original.Page.Entries {
-		page, err := h.ListDeadLetters(ctx, request)
-		s.Require().NoError(err)
-		s.Require().Len(page.Entries, 1)
-		s.LessOrEqual(proto.Size(page), sendLimit)
-		s.Equal(entry.GetId(), page.Entries[0].GetId())
-		if i == 0 {
-			s.True(page.Entries[0].GetIdentityOmitted())
-			s.Equal(entry.GetId(), page.GetNextPageToken())
-		} else {
-			s.Empty(page.GetNextPageToken())
-		}
-		request.PageToken = page.GetNextPageToken()
+	for _, tc := range []struct {
+		name     string
+		limit    int
+		pageSize uint32
+	}{
+		{"256-byte-frame", 256, 1},
+		{"128-byte-frame", 128, 1},
+		{"128-byte-frame-default-size", 128, 0},
+	} {
+		s.Run(tc.name, func() {
+			h := &DeadLetterHandler{Ledger: ledger, MaxSendBytes: tc.limit}
+			request := &pb.ListDeadLettersRequest{Topic: topic, PageSize: tc.pageSize}
+			for i, entry := range original.Page.Entries {
+				page, err := h.ListDeadLetters(ctx, request)
+				s.Require().NoError(err)
+				s.Require().Len(page.Entries, 1)
+				s.LessOrEqual(proto.Size(page), tc.limit)
+				s.Equal(entry.GetId(), page.Entries[0].GetId())
+				if i == 0 {
+					s.True(page.Entries[0].GetIdentityOmitted())
+					token := page.GetNextPageToken()
+					id, err := raft.ParseDeadLetterPageToken(topic, token)
+					s.Require().NoError(err)
+					s.Equal(entry.GetId(), id)
+					if tc.limit == 128 {
+						s.Less(len(token), len(id))
+						_, err := h.ListDeadLetters(ctx, &pb.ListDeadLettersRequest{Topic: "orders", PageToken: token})
+						s.Equal(codes.InvalidArgument, status.Code(err))
+					}
+				} else {
+					s.Empty(page.GetNextPageToken())
+				}
+				request.PageToken = page.GetNextPageToken()
+			}
+		})
 	}
 }
 

@@ -6,12 +6,14 @@ import (
 	"errors"
 	"io"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/futureq-io/futureq/internal/dispatcher"
 	"github.com/futureq-io/futureq/internal/metrics"
 	raft "github.com/futureq-io/futureq/internal/raft/event"
+	"github.com/futureq-io/futureq/internal/storage"
 	"github.com/futureq-io/futureq/pkg/utils"
 	pb "github.com/futureq-io/protocol/proto/go"
 	deliverypb "github.com/futureq-io/protocol/proto/go/delivery"
@@ -26,10 +28,83 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+type failedChunkReceiptRead struct {
+	storage.DB
+	key  []byte
+	fail atomic.Bool
+}
+
+func (db *failedChunkReceiptRead) Get(key []byte) ([]byte, io.Closer, error) {
+	if bytes.Equal(key, db.key) && db.fail.Swap(false) {
+		return nil, nil, errors.New("injected receipt read failure")
+	}
+	return db.DB.Get(key)
+}
+
 type LimitedConsumerSuite struct{ suite.Suite }
 
 func TestLimitedConsumerSuite(t *testing.T) {
 	suite.Run(t, new(LimitedConsumerSuite))
+}
+
+func (s *LimitedConsumerSuite) TestFailedFirstChunkCheckRefundsBeforeSend() {
+	a, hub, producer, _ := openPublishTest(s.T(), "pebble")
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+	subscription, err := a.Subscriptions.Create(ctx, "orders", "workers", "")
+	s.Require().NoError(err)
+	payload := bytes.Repeat([]byte("chunk"), 500)
+	ack, err := producer.processBatch(ctx, &pb.PublishBatch{Messages: []*pb.PublishMessage{{
+		Topic: "orders", Payload: payload, MaxRetries: new(uint32(0)),
+	}}})
+	s.Require().NoError(err)
+	s.Require().True(ack.GetSuccess())
+	keys := publishedKeys(s.T(), a.DB)
+	s.Require().Len(keys, 1)
+	key := keys[0]
+	group := strings.TrimPrefix(subscription.Recipient, "g:")
+	queue := make(chan *pb.QueueMessage, 1)
+	hub.Register("consumer", "orders", group, queue)
+	defer hub.Unregister("consumer")
+	s.Require().NotEmpty(hub.DispatchToTopic("orders", &pb.QueueMessage{Topic: "orders", Payload: payload, MaxRetries: new(uint32(0))}, key))
+
+	local := dispatcher.NewDeliveryLedger(a.DB, nil, nil, nil)
+	db := &failedChunkReceiptRead{DB: a.DB, key: raft.DeliveryStateKey(key)}
+	handler := NewConsumerHandler(zap.NewNop(), hub, nil)
+	handler.MaxSendBytes = 1024
+	handler.RetryLedger = dispatcher.NewDeliveryLedger(db, nil, nil, func(raw []byte) (statemachine.Result, error) {
+		var cmd deliverypb.RetryCommand
+		if err := proto.Unmarshal(raw[1:], &cmd); err != nil {
+			return statemachine.Result{}, err
+		}
+		value, err := local.ApplyRetry(&cmd)
+		if err == nil && cmd.Operation == deliverypb.RetryCommand_SENT && value != 0 {
+			db.fail.Store(true)
+		}
+		return statemachine.Result{Value: value}, err
+	})
+	stream := &blockedRetrySend{ctx: ctx, sending: make(chan *pb.QueueMessage, 1), unblock: make(chan struct{})}
+	errCh := make(chan error, 1)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		handler.sender(ctx, stream, "consumer", &pb.SubscribeInit{Topic: "orders", GroupId: group}, queue, errCh)
+	}()
+	defer func() { cancel(); <-done }()
+	select {
+	case err := <-errCh:
+		s.Require().ErrorContains(err, "injected receipt read failure")
+	case <-stream.sending:
+		s.FailNow("the first chunk reached the transport")
+	case <-ctx.Done():
+		s.FailNow("sender did not report the receipt error")
+	}
+	due, err := raft.DueDeliveryAttempts(a.DB, time.Now().Add(time.Minute).UnixMilli())
+	s.Require().NoError(err)
+	s.Empty(due)
+	state, err := raft.ReadDeliveryState(a.DB, key)
+	s.Require().NoError(err)
+	s.True(state.Ready(subscription.Recipient), "registration remains eligible for its first attempt")
 }
 
 func (s *LimitedConsumerSuite) TestRebalanceBetweenReservationAndSendDoesNotCharge() {

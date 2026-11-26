@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -25,6 +26,131 @@ type RetryExpirySuite struct{ suite.Suite }
 
 func TestRetryExpirySuite(t *testing.T) {
 	suite.Run(t, new(RetryExpirySuite))
+}
+
+func (s *RetryExpirySuite) storeRetryFixture(db storage.DB, eventID uint64, deadline time.Time) *deliverypb.RetryCommand {
+	topic, recipient := "orders", "g:workers"
+	key := utils.EventKey(1, utils.TopicHash(topic), eventID)
+	receipt, err := raft.MarshalPublishReceipt(0, []string{recipient})
+	s.Require().NoError(err)
+	body, err := proto.Marshal(&storagepb.StoredMessage{Topic: topic, EnqueuedAtUnixMs: 100, MaxRetries: new(uint32(0))})
+	s.Require().NoError(err)
+	batch := db.NewBatch()
+	defer batch.Close() //nolint:errcheck
+	s.Require().NoError(batch.Set(key, body))
+	s.Require().NoError(batch.Set(raft.DeliveryStateKey(key), receipt))
+	s.Require().NoError(batch.Commit(storage.Sync))
+	return &deliverypb.RetryCommand{
+		Operation: deliverypb.RetryCommand_START, NowMs: time.Now().UnixMilli(),
+		Attempts: []*deliverypb.DeliveryAttemptTarget{{
+			Key: key, Recipient: recipient, Token: bytes.Repeat([]byte{byte(eventID)}, raft.AttemptTokenSize),
+			DeadlineMs: deadline.UnixMilli(),
+		}},
+	}
+}
+
+func (s *RetryExpirySuite) TestAuthorizationCapacityIsCheckedBeforeReservation() {
+	db, err := storage.NewPebble(config.Pebble{Mode: "memory"}, zap.NewNop())
+	s.Require().NoError(err)
+	defer db.Close() //nolint:errcheck
+	ledger := NewDeliveryLedger(db, nil, nil, nil)
+	ledger.ConfigureRetryOutcomes(1)
+	deadline := time.Now().Add(time.Minute)
+	first, second := s.storeRetryFixture(db, 1, deadline), s.storeRetryFixture(db, 2, deadline)
+	entered, finish := make(chan struct{}), make(chan struct{})
+	done := make(chan error, 1)
+	ready := func() (bool, error) { return true, nil }
+	go func() {
+		_, err := ledger.AuthorizeRetrySend(first, func(uint64) (bool, error) {
+			close(entered)
+			<-finish
+			return true, nil
+		}, ready)
+		done <- err
+	}()
+	defer func() {
+		if finish != nil {
+			close(finish)
+			s.NoError(<-done)
+		}
+	}()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		s.FailNow("first authorization did not reserve capacity")
+	}
+	allowed, err := ledger.AuthorizeRetrySend(second, func(uint64) (bool, error) {
+		s.Fail("second authorization should not reserve an attempt")
+		return true, nil
+	}, ready)
+	s.Require().NoError(err)
+	s.False(allowed)
+	due, err := raft.DueDeliveryAttempts(db, deadline.UnixMilli())
+	s.Require().NoError(err)
+	s.Require().Len(due, 1)
+	s.Equal(first.Attempts[0].Key, due[0].Key)
+	state, err := raft.ReadDeliveryState(db, second.Attempts[0].Key)
+	s.Require().NoError(err)
+	s.True(state.Ready(second.Attempts[0].Recipient))
+	close(finish)
+	s.NoError(<-done)
+	finish = nil
+	allowed, err = ledger.AuthorizeRetrySend(second, func(attempt uint64) (bool, error) {
+		s.Equal(uint64(1), attempt)
+		return true, nil
+	}, ready)
+	s.Require().NoError(err)
+	s.True(allowed)
+}
+
+func (s *RetryExpirySuite) TestStalledRefundDoesNotBlockUnrelatedExpiry() {
+	logger := zap.NewNop()
+	db, err := storage.NewPebble(config.Pebble{Mode: "memory"}, logger)
+	s.Require().NoError(err)
+	defer db.Close() //nolint:errcheck
+	local := NewDeliveryLedger(db, nil, nil, nil)
+	entered, unblock := make(chan struct{}), make(chan struct{})
+	var cancelCalls atomic.Int32
+	ledger := NewDeliveryLedger(db, nil, nil, func(raw []byte) (statemachine.Result, error) {
+		var cmd deliverypb.RetryCommand
+		if err := proto.Unmarshal(raw[1:], &cmd); err != nil {
+			return statemachine.Result{}, err
+		}
+		if cmd.Operation == deliverypb.RetryCommand_CANCEL_RESERVATION {
+			if cancelCalls.Add(1) == 1 {
+				return statemachine.Result{}, errors.New("initial refund failed")
+			}
+			close(entered)
+			<-unblock
+		}
+		value, err := local.ApplyRetry(&cmd)
+		return statemachine.Result{Value: value}, err
+	})
+	deadline := time.Now().Add(600 * time.Millisecond)
+	first, second := s.storeRetryFixture(db, 1, deadline), s.storeRetryFixture(db, 2, deadline)
+	prepared := func(uint64) (bool, error) { return true, nil }
+	allowed, err := ledger.AuthorizeRetrySend(first, prepared, func() (bool, error) { return false, nil })
+	s.Require().NoError(err)
+	s.False(allowed)
+	allowed, err = ledger.AuthorizeRetrySend(second, prepared, func() (bool, error) { return true, nil })
+	s.Require().NoError(err)
+	s.Require().True(allowed)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ledger.RunRetryExpiry(ctx, time.Millisecond, nil, logger)
+	}()
+	defer func() { close(unblock); cancel(); <-done }()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		s.FailNow("refund worker did not start")
+	}
+	s.Require().Eventually(func() bool {
+		page, err := (raft.DeadLetterQuery{Topic: "orders", Limit: 10}).Read(db)
+		return err == nil && len(page.Page.Entries) == 1 && bytes.HasPrefix(page.Page.Entries[0].Id, second.Attempts[0].Key)
+	}, 3*time.Second, 10*time.Millisecond)
 }
 
 func (s *RetryExpirySuite) TestFullOutcomeQueueDoesNotDropAnUnsentRefund() {
@@ -49,6 +175,7 @@ func (s *RetryExpirySuite) TestFullOutcomeQueueDoesNotDropAnUnsentRefund() {
 	topic, recipient := "orders", "g:workers"
 	key := utils.EventKey(1, utils.TopicHash(topic), 1)
 	token := bytes.Repeat([]byte{1}, raft.AttemptTokenSize)
+	now := time.Now()
 	s.Require().True(ledger.TryRetryOutcome(&deliverypb.RetryCommand{
 		Operation: deliverypb.RetryCommand_ACK, NowMs: 101,
 		Attempts: []*deliverypb.DeliveryAttemptTarget{{
@@ -65,28 +192,27 @@ func (s *RetryExpirySuite) TestFullOutcomeQueueDoesNotDropAnUnsentRefund() {
 	s.Require().NoError(batch.Set(raft.DeliveryStateKey(key), receipt))
 	s.Require().NoError(batch.Commit(storage.Sync))
 	s.Require().NoError(batch.Close())
-	target := &deliverypb.DeliveryAttemptTarget{Key: key, Recipient: recipient, Token: token, DeadlineMs: 110}
-	start := &deliverypb.RetryCommand{Operation: deliverypb.RetryCommand_START, NowMs: 100, Attempts: []*deliverypb.DeliveryAttemptTarget{target}}
-	attempt, err := ledger.ApplyRetry(start)
-	s.Require().NoError(err)
-	s.Require().Equal(uint64(1), attempt)
-	target.DeadlineMs = 0
-	sent := &deliverypb.RetryCommand{Operation: deliverypb.RetryCommand_SENT, NowMs: 101, Attempts: []*deliverypb.DeliveryAttemptTarget{target}}
-	allowed, err := ledger.AuthorizeRetrySend(sent, func() bool { return false })
+	deadline := now.Add(time.Second).UnixMilli()
+	target := &deliverypb.DeliveryAttemptTarget{Key: key, Recipient: recipient, Token: token, DeadlineMs: deadline}
+	start := &deliverypb.RetryCommand{Operation: deliverypb.RetryCommand_START, NowMs: now.UnixMilli(), Attempts: []*deliverypb.DeliveryAttemptTarget{target}}
+	allowed, err := ledger.AuthorizeRetrySend(start, func(attempt uint64) (bool, error) {
+		s.Equal(uint64(1), attempt)
+		return true, nil
+	}, func() (bool, error) { return false, nil })
 	s.False(allowed)
 	s.NoError(err)
 
 	ctx := context.Background()
 	s.Require().ErrorContains(ledger.flushRetryRefunds(ctx), "transient cancellation failure")
-	s.Require().NoError(ledger.expireDueRetryAttempts(ctx, 110, nil))
+	s.Require().NoError(ledger.expireDueRetryAttempts(ctx, deadline, nil))
 	page, err := (raft.DeadLetterQuery{Topic: topic, Limit: 10}).Read(db)
 	s.Require().NoError(err)
 	s.Empty(page.Page.Entries)
 	s.Require().NoError(ledger.flushRetryRefunds(ctx))
 	s.Len(ledger.retryOutcomes, 1, "refund does not require a slot in the outcome queue")
-	target.DeadlineMs, target.Token = 125, bytes.Repeat([]byte{2}, raft.AttemptTokenSize)
-	start.NowMs = 112
-	attempt, err = ledger.ApplyRetry(start)
+	target.DeadlineMs, target.Token = deadline+10, bytes.Repeat([]byte{2}, raft.AttemptTokenSize)
+	start.NowMs = deadline + 1
+	attempt, err := ledger.ApplyRetry(start)
 	s.Require().NoError(err)
 	s.Equal(uint64(1), attempt, "the unsent delivery must retain its first attempt")
 }

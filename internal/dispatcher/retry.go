@@ -30,10 +30,11 @@ type retryCoordination struct {
 	until       atomic.Int64
 }
 
-// AuthorizeRetrySend protects the reservation from expiry until the caller can
-// recheck its fence after the Raft wait. Refund it if transport will not run.
-func (l *DeliveryLedger) AuthorizeRetrySend(command *deliverypb.RetryCommand, canSend func() bool) (bool, error) {
-	id := identifyRetry(command.Attempts[0])
+// AuthorizeRetrySend holds capacity before reserving the attempt and protects
+// it from expiry until preparation and the final transport check have passed.
+func (l *DeliveryLedger) AuthorizeRetrySend(start *deliverypb.RetryCommand, prepare func(uint64) (bool, error), checkTransport func() (bool, error)) (authorized bool, err error) {
+	target := start.Attempts[0]
+	id := identifyRetry(target)
 	capacity := cap(l.retryOutcomes)
 	if capacity == 0 {
 		capacity = MaxPendingCompletions
@@ -48,8 +49,24 @@ func (l *DeliveryLedger) AuthorizeRetrySend(command *deliverypb.RetryCommand, ca
 	}
 	l.retry.authorizing[id] = struct{}{}
 	l.retry.mu.Unlock()
-	var refund *deliverypb.RetryCommand
+	needsRefund := true
 	defer func() {
+		var refund *deliverypb.RetryCommand
+		if needsRefund && !authorized {
+			cancel := &deliverypb.RetryCommand{
+				Operation: deliverypb.RetryCommand_CANCEL_RESERVATION,
+				NowMs:     time.Now().UnixMilli(),
+				Attempts: []*deliverypb.DeliveryAttemptTarget{{
+					Key: target.Key, Recipient: target.Recipient, Token: target.Token,
+				}},
+			}
+			// Hold the protection until this commits or is transferred to
+			// the refund worker. Refunds bypass the consumer outcome queue.
+			if _, err := l.ApplyRetry(cancel); err != nil {
+				refund = cancel
+			}
+		}
+
 		l.retry.mu.Lock()
 		delete(l.retry.authorizing, id)
 		if refund != nil {
@@ -61,23 +78,29 @@ func (l *DeliveryLedger) AuthorizeRetrySend(command *deliverypb.RetryCommand, ca
 		l.retry.mu.Unlock()
 	}()
 
-	authorized, err := l.ApplyRetry(command)
-	if err == nil && authorized != 0 && canSend() &&
-		(len(l.retry.owner) == 0 || time.Now().UnixMilli() < l.retry.until.Load()) {
-		return true, nil
+	attempt, err := l.ApplyRetry(start)
+	if err != nil {
+		return false, err
 	}
-
-	cancel := &deliverypb.RetryCommand{
-		Operation: deliverypb.RetryCommand_CANCEL_RESERVATION,
-		NowMs:     time.Now().UnixMilli(),
-		Attempts:  command.Attempts,
+	if attempt == 0 {
+		needsRefund = false
+		return false, nil
 	}
-	if _, cancelErr := l.ApplyRetry(cancel); cancelErr != nil {
-		// Keep the protection reserved before charging. A failed refund
-		// cannot compete for space in the consumer outcome queue.
-		refund = cancel
+	prepared, err := prepare(attempt)
+	if !prepared || err != nil {
+		return false, err
 	}
-	return false, err
+	result, err := l.ApplyRetry(&deliverypb.RetryCommand{
+		Operation: deliverypb.RetryCommand_SENT, NowMs: time.Now().UnixMilli(),
+		Attempts: []*deliverypb.DeliveryAttemptTarget{{
+			Key: target.Key, Recipient: target.Recipient, Token: target.Token,
+		}},
+	})
+	if err != nil || result == 0 {
+		return false, err
+	}
+	ready, err := checkTransport()
+	return err == nil && ready && (len(l.retry.owner) == 0 || time.Now().UnixMilli() < l.retry.until.Load()), err
 }
 
 func (l *DeliveryLedger) flushRetryRefunds(ctx context.Context) error {
@@ -281,18 +304,34 @@ func (l *DeliveryLedger) ApplyRetry(command *deliverypb.RetryCommand) (uint64, e
 // that originally delivered them is gone. An active broker expires its own
 // attempts. The leader also recovers attempts whose owner lease has lapsed.
 func (l *DeliveryLedger) RunRetryExpiry(ctx context.Context, interval time.Duration, isLeader func() bool, logger *zap.Logger) {
-	ticker := time.NewTicker(min(max(interval, 25*time.Millisecond), 250*time.Millisecond))
+	interval = min(max(interval, 25*time.Millisecond), 250*time.Millisecond)
+	var refunds sync.WaitGroup
+	refunds.Go(func() { l.runRetryRefunds(ctx, interval, logger) })
+	defer refunds.Wait()
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case now := <-ticker.C:
-			if err := l.flushRetryRefunds(ctx); err != nil && ctx.Err() == nil {
-				logger.Warn("failed to refund unsent delivery attempts", zap.Error(err))
-			}
 			if err := l.expireDueRetryAttempts(ctx, now.UnixMilli(), isLeader); err != nil && ctx.Err() == nil {
 				logger.Warn("failed to expire delivery attempts", zap.Error(err))
+			}
+		}
+	}
+}
+
+func (l *DeliveryLedger) runRetryRefunds(ctx context.Context, interval time.Duration, logger *zap.Logger) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := l.flushRetryRefunds(ctx); err != nil && ctx.Err() == nil {
+				logger.Warn("failed to refund unsent delivery attempts", zap.Error(err))
 			}
 		}
 	}

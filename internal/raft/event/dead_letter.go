@@ -12,6 +12,7 @@ import (
 	pb "github.com/futureq-io/protocol/proto/go"
 	deliverypb "github.com/futureq-io/protocol/proto/go/delivery"
 	storagepb "github.com/futureq-io/protocol/proto/go/storage"
+	"github.com/google/uuid"
 	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/proto"
 )
@@ -19,10 +20,11 @@ import (
 var ErrDeadLetterPageTooSmall = errors.New("gRPC send limit cannot fit one dead letter summary and its page token")
 
 const (
-	deadLetterEntries   = "metadata/dead-letter/entries/"
-	deadLetterPayload   = "metadata/dead-letter/payload/"
-	deadLetterRefs      = "metadata/dead-letter/refs/"
-	deadLetterPageBytes = 32 << 10
+	deadLetterEntries          = "metadata/dead-letter/entries/"
+	deadLetterPayload          = "metadata/dead-letter/payload/"
+	deadLetterRefs             = "metadata/dead-letter/refs/"
+	deadLetterPageBytes        = 32 << 10
+	compactDeadLetterTokenSize = utils.EventKeySize + 1 + 16
 )
 
 func ValidateDeadLetterID(topic string, id []byte) error {
@@ -34,6 +36,37 @@ func ValidateDeadLetterID(topic string, id []byte) error {
 		return fmt.Errorf("invalid dead letter ID for topic")
 	}
 	return nil
+}
+
+// ParseDeadLetterPageToken resolves a full ID or a compact cursor to the same
+// storage position. Compact tokens still carry the topic hash in the event key.
+func ParseDeadLetterPageToken(topic string, token []byte) ([]byte, error) {
+	if len(token) == compactDeadLetterTokenSize && token[utils.EventKeySize] == 0 {
+		generation := uuid.UUID(token[utils.EventKeySize+1:])
+		token = append(bytes.Clone(token[:utils.EventKeySize]), subscriptionRecipientPrefix+generation.String()...)
+	}
+	if err := ValidateDeadLetterID(topic, token); err != nil {
+		return nil, err
+	}
+	return token, nil
+}
+
+func compactDeadLetterToken(id []byte) []byte {
+	if len(id) <= utils.EventKeySize {
+		return id
+	}
+	generation, found := strings.CutPrefix(string(id[utils.EventKeySize:]), subscriptionRecipientPrefix)
+	if !found {
+		return id
+	}
+	parsed, err := uuid.Parse(generation)
+	if err != nil || parsed.String() != generation {
+		return id
+	}
+	token := make([]byte, 0, compactDeadLetterTokenSize)
+	token = append(token, id[:utils.EventKeySize]...)
+	token = append(token, 0)
+	return append(token, parsed[:]...)
 }
 
 func deadLetterEntryPrefix(topic string) []byte {
@@ -229,10 +262,11 @@ func (q DeadLetterQuery) list(db storage.DB) (*pb.ListDeadLettersResponse, error
 	prefix := deadLetterEntryPrefix(q.Topic)
 	lower := prefix
 	if len(q.After) > 0 {
-		if err := ValidateDeadLetterID(q.Topic, q.After); err != nil {
+		after, err := ParseDeadLetterPageToken(q.Topic, q.After)
+		if err != nil {
 			return nil, err
 		}
-		lower = append(append(bytes.Clone(prefix), q.After...), 0)
+		lower = append(append(bytes.Clone(prefix), after...), 0)
 	}
 	upper := bytes.Clone(prefix)
 	upper[len(upper)-1] = 1
@@ -247,6 +281,7 @@ func (q DeadLetterQuery) list(db storage.DB) (*pb.ListDeadLettersResponse, error
 		budget = min(budget, q.MaxBytes)
 	}
 	var size int
+	var lastToken []byte
 	for ok := iter.First(); ok; {
 		summary := new(pb.DeadLetterSummary)
 		if err := deliveryUnmarshal.Unmarshal(iter.Value(), summary); err != nil {
@@ -254,9 +289,20 @@ func (q DeadLetterQuery) list(db storage.DB) (*pb.ListDeadLettersResponse, error
 		}
 		ok = iter.Next()
 		entrySize := protowire.SizeTag(1) + protowire.SizeBytes(proto.Size(summary))
+		var token []byte
 		tokenSize := 0
 		if ok {
-			tokenSize = protowire.SizeTag(2) + protowire.SizeBytes(len(summary.Id))
+			token = summary.Id
+			tokenSize = protowire.SizeTag(2) + protowire.SizeBytes(len(token))
+			if entrySize+tokenSize > budget {
+				minimalSize := protowire.SizeTag(1) + protowire.SizeBytes(proto.Size(&pb.DeadLetterSummary{
+					Id: summary.Id, IdentityOmitted: true,
+				}))
+				if minimalSize+tokenSize > budget {
+					token = compactDeadLetterToken(token)
+					tokenSize = protowire.SizeTag(2) + protowire.SizeBytes(len(token))
+				}
+			}
 		}
 		if entrySize+tokenSize > budget {
 			summary.GroupId, summary.SubscriberId = "", ""
@@ -277,13 +323,14 @@ func (q DeadLetterQuery) list(db storage.DB) (*pb.ListDeadLettersResponse, error
 			if len(page.Entries) == 0 {
 				return nil, ErrDeadLetterPageTooSmall
 			}
-			page.NextPageToken = page.Entries[len(page.Entries)-1].Id
+			page.NextPageToken = lastToken
 			break
 		}
 		page.Entries = append(page.Entries, summary)
+		lastToken = token
 		size += entrySize
 		if ok && len(page.Entries) == q.Limit {
-			page.NextPageToken = summary.Id
+			page.NextPageToken = token
 			break
 		}
 	}

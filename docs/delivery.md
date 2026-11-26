@@ -138,11 +138,13 @@ authorization commits. If either check fails before entering transport, it
 refunds the unsent attempt. Once the sender enters transport, the attempt
 retains its number through stalls, failures, and broker crashes. Each attempt
 has a distinct tag, so a delayed ACK or NACK cannot settle a later attempt.
-A failed refund stays protected from expiry while the owner retries it. The
-broker bounds authorizations and refunds separately from the ACK queue, using
-`delivery.ackQueueCapacity` for both. During a chunked send the broker checks
-the permit and attempt before each frame and ends the stream if the delivery
-is no longer eligible.
+A failed refund stays protected from expiry while the owner retries it in a
+separate worker. The broker reserves capacity for authorization and refunds
+before creating an attempt, using `delivery.ackQueueCapacity` as the bound
+for this work and independently for the ACK queue. Chunked sends prepare and
+validate the first frame while the attempt is still protected for a refund.
+The broker checks every later frame and ends the stream if the delivery is
+no longer eligible.
 
 The broker queues outcomes for asynchronous persistence and releases local
 tracking after commit. While a broker owns an attempt, outcomes it accepts
