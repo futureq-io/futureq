@@ -157,6 +157,9 @@ allocate on demand and use up to about 20 MiB at the default entry limit on a
 64-bit broker, in addition to the estimated receipt byte budget. The cache
 evicts the oldest admitted receipts to fit new ones within the byte budget.
 Storage supplies receipts on cache misses, after restart, and after Raft snapshot recovery.
+Standalone also bounds tracking of in-flight publishes using both limits. A
+publish batch still commits if it exceeds the available tracking capacity and
+skips warming the cache in that case.
 
 To compare delivery heaps, change only `delivery.heapType` between runs, or set
 `FUTUREQ_DELIVERY_HEAPTYPE=8ary`. The heap is local to each broker and does not

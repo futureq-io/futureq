@@ -19,14 +19,18 @@ import (
 
 type standaloneReceiptDB struct {
 	storage.DB
-	receiptReads atomic.Int64
-	committed    chan struct{}
-	finish       chan struct{}
+	receiptReads      atomic.Int64
+	beforeReceiptRead func([]byte)
+	committed         chan struct{}
+	finish            chan struct{}
 }
 
 func (db *standaloneReceiptDB) Get(key []byte) ([]byte, io.Closer, error) {
 	if bytes.HasPrefix(key, []byte("metadata/delivery/")) {
 		db.receiptReads.Add(1)
+		if db.beforeReceiptRead != nil {
+			db.beforeReceiptRead(key)
+		}
 	}
 	return db.DB.Get(key)
 }
@@ -158,4 +162,79 @@ func TestStandalonePublishCachePreservesConcurrentReceiptChanges(t *testing.T) {
 			require.Nil(t, state, "delayed cache admission must not restore ACKed or deleted state")
 		})
 	}
+}
+
+func TestStandalonePublishCacheCommitsWhileUnrelatedAckReadsReceipt(t *testing.T) {
+	ctx := context.Background()
+	a, _, producer, _ := openPublishTest(t, "pebble")
+	first, err := a.Subscriptions.Create(ctx, "orders", "workers", "")
+	require.NoError(t, err)
+	require.NoError(t, a.Subscriptions.CreateTopic(ctx, "other", nil))
+	second, err := a.Subscriptions.Create(ctx, "other", "workers", "")
+	require.NoError(t, err)
+
+	// Seed a receipt in storage before installing the cache.
+	_, err = producer.processBatch(ctx, &pb.PublishBatch{Messages: []*pb.PublishMessage{{Topic: "orders"}}})
+	require.NoError(t, err)
+	keys := publishedKeys(t, a.DB)
+	require.Len(t, keys, 1)
+	blockedKey := raft.DeliveryStateKey(keys[0])
+	readStarted := make(chan struct{})
+	resumeRead := make(chan struct{})
+	db := &standaloneReceiptDB{
+		DB: a.DB,
+		beforeReceiptRead: func(key []byte) {
+			if bytes.Equal(key, blockedKey) {
+				close(readStarted)
+				<-resumeRead
+			}
+		},
+	}
+	a.DB = db
+	ledger := dispatcher.NewDeliveryLedger(db, nil, nil, nil)
+	ledger.StandaloneReceipts = raft.NewStandaloneReceiptCache(1<<20, 16)
+	producer.StandalonePublishLedger = ledger
+
+	ackDone := make(chan struct{})
+	var ackErr error
+	go func() {
+		defer close(ackDone)
+		ackErr = ledger.Acknowledge([]raft.DeliveryAck{{Key: keys[0], Recipient: first.Recipient}})
+	}()
+	release := sync.OnceFunc(func() { close(resumeRead) })
+	defer func() {
+		release()
+		<-ackDone
+	}()
+	select {
+	case <-readStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("ACK did not reach its receipt read")
+	}
+
+	publishDone := make(chan struct{})
+	var publishErr error
+	go func() {
+		defer close(publishDone)
+		_, publishErr = producer.processBatch(ctx, &pb.PublishBatch{Messages: []*pb.PublishMessage{{Topic: "other"}}})
+	}()
+	defer func() {
+		release()
+		<-publishDone
+	}()
+	select {
+	case <-publishDone:
+		require.NoError(t, publishErr)
+		require.Len(t, publishedKeys(t, db), 2)
+	case <-time.After(5 * time.Second):
+		t.Fatal("publish waited for an unrelated ACK receipt read")
+	}
+
+	release()
+	<-ackDone
+	require.NoError(t, ackErr)
+	keys = publishedKeys(t, db)
+	require.Len(t, keys, 1)
+	require.NoError(t, ledger.Acknowledge([]raft.DeliveryAck{{Key: keys[0], Recipient: second.Recipient}}))
+	require.EqualValues(t, 1, db.receiptReads.Load(), "the unrelated publish still warms the cache")
 }

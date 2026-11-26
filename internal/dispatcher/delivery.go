@@ -293,18 +293,11 @@ func (l *DeliveryLedger) DeleteKeys(keys [][]byte) error {
 
 // CommitStandalonePublish uses the normal sync commit outside the ledger lock.
 func (l *DeliveryLedger) CommitStandalonePublish(batch storage.Batch, states map[string]*raft.DeliveryState) error {
-	if l.StandaloneReceipts == nil || len(states) == 0 {
-		return batch.Commit(storage.Sync)
-	}
-	l.mu.Lock()
-	l.StandaloneReceipts.BeginPublish(states)
-	l.mu.Unlock()
-
+	tracked := l.StandaloneReceipts != nil && len(states) > 0 && l.StandaloneReceipts.BeginPublish(states)
 	err := batch.Commit(storage.Sync)
-
-	l.mu.Lock()
-	l.StandaloneReceipts.FinishPublish(states, err == nil)
-	l.mu.Unlock()
+	if tracked {
+		l.StandaloneReceipts.FinishPublish(states, err == nil)
+	}
 	return err
 }
 
