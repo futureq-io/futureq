@@ -23,6 +23,7 @@ type retryIdentity [utils.EventKeySize + raft.AttemptTokenSize]byte
 type retryCoordination struct {
 	mu          sync.Mutex
 	outcomes    map[retryIdentity]struct{}
+	autoACKs    map[retryIdentity]*RetryAutoACK
 	authorizing map[retryIdentity]struct{}
 	refunds     map[retryIdentity]*retryRefund
 	expiring    map[retryIdentity]struct{}
@@ -92,10 +93,12 @@ func (l *DeliveryLedger) AuthorizeRetrySend(start *deliverypb.RetryCommand, ackW
 
 		l.retry.mu.Lock()
 		delete(l.retry.authorizing, id)
+		_, stillExists := l.retry.transports[key][id]
 		if !authorized {
 			l.removeRetryTransportLocked(id)
 		}
-		if refund != nil {
+		// Receipt cleanup may have completed while the refund was in flight.
+		if refund != nil && stillExists {
 			if l.retry.refunds == nil {
 				l.retry.refunds = make(map[retryIdentity]*retryRefund)
 			}
@@ -165,10 +168,11 @@ func (l *DeliveryLedger) RemoveRetryTransports(keys [][]byte) {
 			continue
 		}
 		eventKey := [utils.EventKeySize]byte(key)
-		for _, transport := range l.retry.transports[eventKey] {
+		for id, transport := range l.retry.transports[eventKey] {
 			if transport.timer != nil {
 				transport.timer.Stop()
 			}
+			l.releaseRetryAutoACKLocked(id)
 		}
 		delete(l.retry.transports, eventKey)
 	}
@@ -186,6 +190,8 @@ func (l *DeliveryLedger) CompleteRetryAttempts(attempts []raft.CompletedAttempt)
 		copy(id[:utils.EventKeySize], attempt.Key[:])
 		copy(id[utils.EventKeySize:], attempt.Token[:])
 		l.removeRetryTransportLocked(id)
+		l.releaseRetryAutoACKLocked(id)
+		delete(l.retry.refunds, id)
 	}
 }
 
@@ -204,14 +210,18 @@ func (l *DeliveryLedger) claimRetryRefund() (refund *retryRefund, drained bool) 
 
 func (l *DeliveryLedger) applyRetryRefund(ctx context.Context, refund *retryRefund, retryDelay time.Duration) error {
 	_, err := l.applyRetry(ctx, refund.command)
+	id := identifyRetry(refund.command.Attempts[0])
 	l.retry.mu.Lock()
 	defer l.retry.mu.Unlock()
+	if l.retry.refunds[id] != refund {
+		return nil
+	}
 	if err != nil {
 		refund.inFlight = false
 		refund.retryAt = time.Now().Add(retryDelay)
 		return err
 	}
-	delete(l.retry.refunds, identifyRetry(refund.command.Attempts[0]))
+	delete(l.retry.refunds, id)
 	return nil
 }
 
@@ -285,6 +295,67 @@ type retryOutcome struct {
 	onCommitted func()
 }
 
+// RetryAutoACK reserves an outcome queue slot until transport reports its result.
+type RetryAutoACK struct {
+	ledger  *DeliveryLedger
+	id      retryIdentity
+	outcome retryOutcome
+}
+
+func (l *DeliveryLedger) TryReserveRetryAutoACK(command *deliverypb.RetryCommand, onCommitted func()) *RetryAutoACK {
+	id := identifyRetry(command.Attempts[0])
+	l.retry.mu.Lock()
+	defer l.retry.mu.Unlock()
+	if l.retry.draining || !l.retryOwnerActive() || l.retry.autoACKs[id] != nil ||
+		len(l.retryOutcomes)+len(l.retry.autoACKs) >= cap(l.retryOutcomes) {
+		return nil
+	}
+	if l.retry.autoACKs == nil {
+		l.retry.autoACKs = make(map[retryIdentity]*RetryAutoACK)
+	}
+	reservation := &RetryAutoACK{ledger: l, id: id, outcome: retryOutcome{command: command, onCommitted: onCommitted}}
+	l.retry.autoACKs[id] = reservation
+	return reservation
+}
+
+// Finish releases the slot or queues the ACK after a successful send. The
+// reservation remains usable when the broker stops admitting new outcomes.
+func (a *RetryAutoACK) Finish(sent bool) bool {
+	l := a.ledger
+	l.retry.mu.Lock()
+	defer l.retry.mu.Unlock()
+	if l.retry.autoACKs[a.id] != a {
+		return false
+	}
+	defer l.releaseRetryAutoACKLocked(a.id)
+	if _, expiring := l.retry.expiring[a.id]; !sent || expiring || !l.retryOwnerActive() {
+		return false
+	}
+	a.outcome.command.NowMs = time.Now().UnixMilli()
+	// Manual outcomes cannot use the reserved slot, and the channel stays
+	// open during shutdown until all reservations are released.
+	l.retryOutcomes <- a.outcome
+	l.trackRetryOutcomeLocked(a.id)
+	return true
+}
+
+func (l *DeliveryLedger) releaseRetryAutoACKLocked(id retryIdentity) {
+	if _, exists := l.retry.autoACKs[id]; !exists {
+		return
+	}
+	delete(l.retry.autoACKs, id)
+	if l.retry.draining && len(l.retry.autoACKs) == 0 {
+		close(l.retryOutcomes)
+	}
+}
+
+func (l *DeliveryLedger) trackRetryOutcomeLocked(id retryIdentity) {
+	if l.retry.outcomes == nil {
+		l.retry.outcomes = make(map[retryIdentity]struct{})
+	}
+	l.retry.outcomes[id] = struct{}{}
+}
+
 // ConfigureRetryOutcomes initializes the bounded queue before serving consumers.
 func (l *DeliveryLedger) ConfigureRetryOutcomes(capacity int) {
 	l.retryOutcomes = make(chan retryOutcome, capacity)
@@ -300,12 +371,15 @@ func (l *DeliveryLedger) TryRetryOutcome(command *deliverypb.RetryCommand, onCom
 	if _, pending := l.retry.outcomes[id]; pending {
 		return true
 	}
+	if l.retry.autoACKs[id] != nil {
+		return false
+	}
+	if reserved := len(l.retry.autoACKs); reserved != 0 && len(l.retryOutcomes)+reserved >= cap(l.retryOutcomes) {
+		return false
+	}
 	select {
 	case l.retryOutcomes <- retryOutcome{command: command, onCommitted: onCommitted}:
-		if l.retry.outcomes == nil {
-			l.retry.outcomes = make(map[retryIdentity]struct{})
-		}
-		l.retry.outcomes[id] = struct{}{}
+		l.trackRetryOutcomeLocked(id)
 		return true
 	default:
 		return false
@@ -318,7 +392,7 @@ func (l *DeliveryLedger) StopRetryOutcomeAdmission() {
 	defer l.retry.mu.Unlock()
 	if !l.retry.draining {
 		l.retry.draining = true
-		if l.retryOutcomes != nil {
+		if l.retryOutcomes != nil && len(l.retry.autoACKs) == 0 {
 			close(l.retryOutcomes)
 		}
 	}
@@ -543,7 +617,11 @@ func (l *DeliveryLedger) expireRetryPage(attempts []*deliverypb.DeliveryAttemptT
 	})
 	l.retry.mu.Lock()
 	for _, target := range expiring {
-		delete(l.retry.expiring, identifyRetry(target))
+		id := identifyRetry(target)
+		if err == nil {
+			l.releaseRetryAutoACKLocked(id)
+		}
+		delete(l.retry.expiring, id)
 	}
 	l.retry.mu.Unlock()
 	return err

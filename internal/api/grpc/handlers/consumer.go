@@ -267,18 +267,22 @@ func (h *ConsumerHandler) sender(
 			if err := h.sendDelivery(stream, frames, func() error {
 				return h.checkDeliveryChunk(consumerID, recipient, msg, frames.QueueMessage)
 			}); err != nil {
+				if frames.autoACK != nil {
+					frames.autoACK.Finish(false)
+				}
 				errCh <- err
 				return
 			}
 			metrics.DeliveryGRPCSendsTotal.WithLabelValues(msg.Topic).Inc()
-			if init.AutoAck {
-				if msg.MaxRetries != nil {
-					if _, err := h.finishLimitedSend(consumerID, init, frames.DeliveryTag, true, false); err != nil {
-						errCh <- err
-						return
-					}
-					continue
+			if frames.autoACK != nil {
+				h.hub.MarkRetryOutcome(consumerID, msg.DeliveryTag, frames.DeliveryTag[utils.EventKeySize:])
+				if !frames.autoACK.Finish(true) {
+					errCh <- status.Error(codes.Unavailable, "automatic delivery ACK no longer active")
+					return
 				}
+				continue
+			}
+			if init.AutoAck {
 				// Expiry or disconnect may remove local tracking while Send is
 				// blocked. A successful send still completes this generation's
 				// recipient; local tracking is only a duplicate-send guard.
@@ -316,6 +320,7 @@ type deliveryFrames struct {
 	encoded      []byte
 	chunkSize    int
 	firstChecked bool
+	autoACK      *dispatcher.RetryAutoACK
 }
 
 func (h *ConsumerHandler) prepareDeliveryFrames(message *pb.QueueMessage) (*deliveryFrames, error) {
@@ -400,7 +405,7 @@ func (h *ConsumerHandler) receiver(
 		).Inc()
 
 		if len(ackReq.DeliveryTag) == utils.EventKeySize+raft.AttemptTokenSize {
-			accepted, err := h.finishLimitedSend(consumerID, init, ackReq.DeliveryTag, success, true)
+			accepted, err := h.finishLimitedSend(consumerID, init, ackReq.DeliveryTag, success)
 			if err != nil {
 				errCh <- err
 				return
@@ -450,7 +455,22 @@ func (h *ConsumerHandler) beginLimitedSend(consumerID string, init *pb.Subscribe
 	// abandoned reservation recoverable.
 	reservationDeadline := now.Add(proposalTimeout).Add(proposalTimeout).Add(ackWindow)
 	token := uuid.New()
+	tag := make([]byte, 0, utils.EventKeySize+raft.AttemptTokenSize)
+	tag = append(tag, message.DeliveryTag...)
+	tag = append(tag, token[:]...)
+	var autoACK *dispatcher.RetryAutoACK
+	if init.AutoAck {
+		autoACK = h.RetryLedger.TryReserveRetryAutoACK(limitedOutcome(consumerID, init, tag, deliverypb.RetryCommand_ACK), func() {
+			h.hub.ReleaseRetrySend(consumerID, message.DeliveryTag, token[:])
+		})
+		if autoACK == nil {
+			return nil, nil
+		}
+	}
 	if !h.hub.BeginRetrySend(consumerID, message, token[:], reservationDeadline) {
+		if autoACK != nil {
+			autoACK.Finish(false)
+		}
 		return nil, nil
 	}
 	recipient := metadata.DeliveryRecipient(init.GroupId, consumerID)
@@ -466,9 +486,6 @@ func (h *ConsumerHandler) beginLimitedSend(consumerID string, init *pb.Subscribe
 		if !h.hub.CanSend(consumerID, message) {
 			return false, nil
 		}
-		tag := make([]byte, 0, utils.EventKeySize+raft.AttemptTokenSize)
-		tag = append(tag, message.DeliveryTag...)
-		tag = append(tag, token[:]...)
 		prepared, err := h.prepareDeliveryFrames(&pb.QueueMessage{
 			Topic: message.Topic, Payload: message.Payload, DeliveryTag: tag,
 			EnqueuedAtUnixMs: message.EnqueuedAtUnixMs, DelayMs: message.DelayMs,
@@ -490,6 +507,9 @@ func (h *ConsumerHandler) beginLimitedSend(consumerID string, init *pb.Subscribe
 		return deadline, nil
 	})
 	if !authorized {
+		if autoACK != nil {
+			autoACK.Finish(false)
+		}
 		h.hub.ReleaseRetrySend(consumerID, message.DeliveryTag, token[:])
 		if err != nil {
 			if _, ok := status.FromError(err); ok {
@@ -499,12 +519,13 @@ func (h *ConsumerHandler) beginLimitedSend(consumerID string, init *pb.Subscribe
 		}
 		return nil, nil
 	}
+	frames.autoACK = autoACK
 	return frames, nil
 }
 
-func (h *ConsumerHandler) finishLimitedSend(consumerID string, init *pb.SubscribeInit, tag []byte, success, requireTracking bool) (bool, error) {
+func (h *ConsumerHandler) finishLimitedSend(consumerID string, init *pb.SubscribeInit, tag []byte, success bool) (bool, error) {
 	key, token := tag[:utils.EventKeySize], tag[utils.EventKeySize:]
-	if !h.hub.MarkRetryOutcome(consumerID, key, token) && requireTracking {
+	if !h.hub.MarkRetryOutcome(consumerID, key, token) {
 		return false, nil
 	}
 	op := deliverypb.RetryCommand_ACK

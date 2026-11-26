@@ -261,7 +261,7 @@ func (s *LimitedConsumerSuite) TestSlowRaftProposalsLeaveAFullACKWindow() {
 	due, err := raft.DueDeliveryAttempts(a.DB, time.Now().UnixMilli())
 	s.Require().NoError(err)
 	s.Require().Len(due, 1)
-	accepted, err := handler.finishLimitedSend("consumer", init, wire.DeliveryTag, true, true)
+	accepted, err := handler.finishLimitedSend("consumer", init, wire.DeliveryTag, true)
 	s.Require().NoError(err)
 	s.Require().True(accepted)
 	close(stream.unblock)
@@ -340,6 +340,96 @@ func (s *LimitedConsumerSuite) TestLaterACKCommitsWhileFirstOutcomeIsStalled() {
 		s.FailNow("the second outcome did not commit while the first was blocked")
 	}
 	close(releaseFirst)
+}
+
+func (s *LimitedConsumerSuite) TestAutoACKReservesOutcomeSpaceBeforeTransport() {
+	a, hub, producer, _ := openPublishTest(s.T(), "pebble")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	subscription, err := a.Subscriptions.Create(ctx, "orders", "workers", "")
+	s.Require().NoError(err)
+	message := &pb.PublishMessage{Topic: "orders", MaxRetries: new(uint32(0))}
+	ack, err := producer.processBatch(ctx, &pb.PublishBatch{Messages: []*pb.PublishMessage{message, message}})
+	s.Require().NoError(err)
+	s.Require().True(ack.GetSuccess())
+	keys := publishedKeys(s.T(), a.DB)
+	s.Require().Len(keys, 2)
+	const consumerID = "consumer"
+	group := strings.TrimPrefix(subscription.Recipient, "g:")
+	queue := make(chan *pb.QueueMessage, 2)
+	hub.Register(consumerID, "orders", group, queue)
+	defer hub.Unregister(consumerID)
+	for _, key := range keys {
+		s.Require().NotEmpty(hub.DispatchToTopic("orders", &pb.QueueMessage{Topic: "orders", MaxRetries: new(uint32(0))}, key))
+	}
+
+	logger := zap.NewNop()
+	ledger := dispatcher.NewDeliveryLedger(a.DB, nil, nil, nil)
+	ledger.ConfigureRetryOutcomes(1)
+	handler := NewConsumerHandler(logger, hub, nil)
+	handler.RetryLedger = ledger
+	sent := make(chan *pb.QueueMessage, 2)
+	stream := &autoAckSendStream{send: func(msg *pb.QueueMessage) error {
+		// The second send should still be able to enqueue its pre-reserved
+		// ACK if graceful shutdown starts before Send returns.
+		if bytes.HasPrefix(msg.DeliveryTag, keys[1]) {
+			ledger.StopRetryOutcomeAdmission()
+		}
+		sent <- msg
+		return nil
+	}}
+	errCh := make(chan error, 1)
+	var workers sync.WaitGroup
+	workers.Go(func() {
+		handler.sender(ctx, stream, consumerID, &pb.SubscribeInit{Topic: "orders", GroupId: group, AutoAck: true}, queue, errCh)
+	})
+	defer func() { cancel(); workers.Wait() }()
+	nextSend := func() *pb.QueueMessage {
+		select {
+		case msg := <-sent:
+			return msg
+		case err := <-errCh:
+			s.Require().NoError(err)
+			s.FailNow("sender stopped before delivery")
+		case <-ctx.Done():
+			s.FailNow("delivery did not reach transport")
+		}
+		return nil
+	}
+	s.True(bytes.HasPrefix(nextSend().DeliveryTag, keys[0]))
+	s.Require().Eventually(func() bool {
+		return len(queue) == 0 && hub.GroupInFlightCount() == 1
+	}, time.Second, time.Millisecond)
+	s.Empty(sent, "the second delivery must wait for a completion slot")
+	state, err := raft.ReadDeliveryState(a.DB, keys[1])
+	s.Require().NoError(err)
+	s.True(state.Ready(subscription.Recipient), "backpressure must leave the attempt uncharged")
+
+	outcomesDone := make(chan struct{})
+	workers.Go(func() {
+		defer close(outcomesDone)
+		ledger.RunRetryOutcomes(ctx, 1, logger)
+	})
+	s.Require().Eventually(func() bool {
+		state, err := raft.ReadDeliveryState(a.DB, keys[0])
+		return err == nil && state == nil
+	}, time.Second, time.Millisecond)
+	s.Require().NotEmpty(hub.DispatchToTopic("orders", &pb.QueueMessage{Topic: "orders", MaxRetries: new(uint32(0))}, keys[1]))
+	second := nextSend()
+	s.True(bytes.HasPrefix(second.DeliveryTag, keys[1]))
+	s.Equal(uint64(1), second.Attempt)
+	select {
+	case <-outcomesDone:
+	case <-ctx.Done():
+		s.FailNow("automatic ACK did not drain during shutdown")
+	}
+	for _, key := range keys {
+		_, _, err := a.DB.Get(key)
+		s.ErrorIs(err, storage.ErrNotFound)
+	}
+	page, err := (raft.DeadLetterQuery{Topic: "orders", Limit: 10}).Read(a.DB)
+	s.Require().NoError(err)
+	s.Empty(page.Page.Entries)
 }
 
 func (s *LimitedConsumerSuite) TestBlockedSendCannotRefundItsAttempt() {
