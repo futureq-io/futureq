@@ -41,6 +41,16 @@ func validatePublishReceipt(data []byte) error {
 // StoreDeliveryBatchCmd embeds the existing store encoding, then one receipt
 // per item. Message keys and frozen receipts share one atomic storage commit.
 func MarshalStoreDeliveryBatchCmd(items []StoreBatchItem) ([]byte, error) {
+	frame, err := MarshalPublishFrame(items, true)
+	if err != nil {
+		return nil, err
+	}
+	return append([]byte{byte(StoreDeliveryBatchCmd)}, frame...), nil
+}
+
+// MarshalPublishFrame encodes a client batch. Quorum frames carry empty
+// receipt fields so apply can bind destinations in log order.
+func MarshalPublishFrame(items []StoreBatchItem, frozen bool) ([]byte, error) {
 	store, err := MarshalStoreBatchCmd(items)
 	if err != nil {
 		return nil, err
@@ -48,11 +58,10 @@ func MarshalStoreDeliveryBatchCmd(items []StoreBatchItem) ([]byte, error) {
 	if uint64(len(store)) > uint64(^uint32(0)) {
 		return nil, fmt.Errorf("store batch exceeds uint32 size")
 	}
-	out := []byte{byte(StoreDeliveryBatchCmd)}
-	out = binary.BigEndian.AppendUint32(out, uint32(len(store)))
+	out := binary.BigEndian.AppendUint32(nil, uint32(len(store)))
 	out = append(out, store...)
 	for _, item := range items {
-		if err := validatePublishReceipt(item.Receipt); err != nil {
+		if err := validateFrameReceipt(item.Receipt, frozen); err != nil {
 			return nil, err
 		}
 		if uint64(len(item.Receipt)) > uint64(^uint32(0)) {
@@ -68,15 +77,23 @@ func UnmarshalStoreDeliveryBatchCmd(cmd []byte) ([]StoreBatchItem, error) {
 	if len(cmd) < 5 || CommandType(cmd[0]) != StoreDeliveryBatchCmd {
 		return nil, fmt.Errorf("invalid store delivery command")
 	}
-	n := uint64(binary.BigEndian.Uint32(cmd[1:5]))
-	if n > uint64(len(cmd)-5) {
+	return unmarshalPublishFrame(cmd[1:], true)
+}
+
+func unmarshalPublishFrame(frame []byte, frozen bool) ([]StoreBatchItem, error) {
+	if len(frame) < 4 {
+		return nil, fmt.Errorf("truncated publish frame")
+	}
+	n := uint64(binary.BigEndian.Uint32(frame))
+	data := frame[4:]
+	if n > uint64(len(data)) {
 		return nil, fmt.Errorf("truncated store delivery command")
 	}
-	items, err := UnmarshalStoreBatchCmd(cmd[5 : 5+int(n)])
+	items, err := UnmarshalStoreBatchCmd(data[:int(n)])
 	if err != nil {
 		return nil, err
 	}
-	data := cmd[5+int(n):]
+	data = data[int(n):]
 	for i := range items {
 		if len(data) < 4 {
 			return nil, fmt.Errorf("missing publish receipt")
@@ -87,7 +104,7 @@ func UnmarshalStoreDeliveryBatchCmd(cmd []byte) ([]StoreBatchItem, error) {
 			return nil, fmt.Errorf("truncated publish receipt")
 		}
 		items[i].Receipt = data[:int(n)]
-		if err := validatePublishReceipt(items[i].Receipt); err != nil {
+		if err := validateFrameReceipt(items[i].Receipt, frozen); err != nil {
 			return nil, err
 		}
 		data = data[int(n):]
@@ -96,4 +113,14 @@ func UnmarshalStoreDeliveryBatchCmd(cmd []byte) ([]StoreBatchItem, error) {
 		return nil, fmt.Errorf("trailing store delivery bytes")
 	}
 	return items, nil
+}
+
+func validateFrameReceipt(data []byte, frozen bool) error {
+	if frozen {
+		return validatePublishReceipt(data)
+	}
+	if len(data) != 0 {
+		return fmt.Errorf("quorum publish cannot contain frozen receipts")
+	}
+	return nil
 }

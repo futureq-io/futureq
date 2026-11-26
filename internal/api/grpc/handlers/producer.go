@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sync"
 	"time"
 
 	"go.uber.org/zap"
@@ -51,15 +52,23 @@ type ProducerHandler struct {
 	pb.UnimplementedFutureQProducerServer
 	logger                  *zap.Logger
 	batcher                 *publishBatcher
+	pending                 chan struct{}
+	maxPublishBytes         int
+	standaloneWriter        sync.Mutex
 	StandalonePublishLedger *dispatcher.DeliveryLedger
 }
 
-// NewProducerHandler returns an initialised ProducerHandler.
-// In Raft mode the handler never writes directly to Pebble; all writes go
-// through SyncPropose → state machine → Pebble.
+// NewProducerHandler initializes publish admission and optional flush workers.
+// Clustered publishes write through the event Raft state machine.
 func NewProducerHandler(logger *zap.Logger) *ProducerHandler {
-	h := &ProducerHandler{logger: logger.Named("producer")}
-	if cfg := app.A.Config().Publish; cfg.BatchMaxRequests > 1 {
+	cfg := app.A.Config().Publish
+	maxBytes, _ := cfg.BatchMaxBytes.Bytes() // validated at startup
+	h := &ProducerHandler{
+		logger:          logger.Named("producer"),
+		pending:         make(chan struct{}, cfg.MaxPendingRequests),
+		maxPublishBytes: int(maxBytes),
+	}
+	if cfg.BatchMaxRequests > 1 {
 		h.batcher = newPublishBatcher(cfg, app.A.NodeHost != nil, h.flushPublishGroup)
 	}
 	return h
@@ -70,6 +79,7 @@ func (ph *ProducerHandler) Close() {
 	if ph.batcher != nil {
 		ph.batcher.cancel()
 		ph.batcher.workers.Wait()
+		ph.batcher.flushes.Wait()
 	}
 }
 
@@ -108,6 +118,20 @@ func (ph *ProducerHandler) processBatch(ctx context.Context, batch *pb.PublishBa
 	if len(batch.Messages) == 0 {
 		return &pb.PublishBatchAck{}, nil
 	}
+	if err := ctx.Err(); err != nil {
+		return &pb.PublishBatchAck{}, status.FromContextError(err).Err()
+	}
+	select {
+	case ph.pending <- struct{}{}:
+	default:
+		return &pb.PublishBatchAck{}, status.Error(codes.ResourceExhausted, "broker publish admission is full")
+	}
+	transferred := false
+	defer func() {
+		if !transferred {
+			<-ph.pending
+		}
+	}()
 	for _, message := range batch.Messages {
 		if err := raft.ValidateTopicName(message.GetTopic()); err != nil {
 			return &pb.PublishBatchAck{Success: false}, status.Error(codes.InvalidArgument, err.Error())
@@ -127,18 +151,6 @@ func (ph *ProducerHandler) processBatch(ctx context.Context, batch *pb.PublishBa
 			"ack level %s is below the broker minimum %s", ackLevel, app.A.Config().Publish.MinAckLevel)
 	}
 
-	nowMs := time.Now().UnixMilli()
-	lane := ackLevel
-	if ph.batcher != nil {
-		if app.A.NodeHost == nil {
-			lane = pb.AckLevel_ACK_LEVEL_QUORUM
-		}
-		release, err := ph.batcher.reserve(ctx, lane)
-		if err != nil {
-			return &pb.PublishBatchAck{Success: false}, err
-		}
-		defer release()
-	}
 	var receipts map[string][]byte
 	// Quorum publishes decide admission in the ordered event state machine.
 	// Standalone and early ACKs must bind destinations before storing/submitting.
@@ -151,13 +163,15 @@ func (ph *ProducerHandler) processBatch(ctx context.Context, batch *pb.PublishBa
 		}
 	}
 
-	var processErr error
-	if ph.batcher != nil {
-		processErr = ph.queuePublish(ctx, batch, nowMs, ackLevel, lane, receipts)
-	} else if app.A.NodeHost != nil {
-		processErr = ph.processRaftBatch(ctx, batch, nowMs, ackLevel, receipts)
-	} else {
-		processErr = ph.processStandaloneBatch(batch, nowMs, receipts)
+	req, processErr := ph.preparePublish(ctx, batch, start.UnixMilli(), ackLevel, receipts)
+	if processErr == nil {
+		if ph.batcher == nil {
+			ph.flushPublishGroup(ctx, ackLevel, []*queuedPublish{req})
+			processErr = <-req.done
+		} else {
+			req.release = func() { <-ph.pending }
+			transferred, processErr = ph.batcher.queue(req, ackLevel)
+		}
 	}
 
 	if processErr != nil {
@@ -240,27 +254,6 @@ func (ph *ProducerHandler) marshalMessages(
 	return nil
 }
 
-func (ph *ProducerHandler) processRaftBatch(
-	ctx context.Context,
-	batch *pb.PublishBatch,
-	nowMs int64,
-	ackLevel pb.AckLevel,
-	receipts map[string][]byte,
-) error {
-	if err := checkPublishLeader(); err != nil {
-		return err
-	}
-	cmd, err := ph.buildPublishCommand(batch, nowMs, ackLevel, receipts)
-	if err != nil {
-		return err
-	}
-	result, err := ph.proposePublish(ctx, ackLevel, cmd)
-	if err == nil && ackLevel == pb.AckLevel_ACK_LEVEL_QUORUM {
-		err = raft.CheckPublishResult(result, len(batch.Messages))
-	}
-	return publishProposalError(err)
-}
-
 func checkPublishLeader() error {
 	cfg := app.A.Config()
 	id, _, valid, err := app.A.NodeHost.GetLeaderID(cfg.Cluster.ShardID)
@@ -300,7 +293,7 @@ func (ph *ProducerHandler) buildStoreItems(batch *pb.PublishBatch, nowMs int64, 
 			if err != nil {
 				return fmt.Errorf("failed to marshal index: %w", err)
 			}
-			if ph.batcher != nil && cfg.Storage.Engine == "bolt" && (len(idxBytes) == 0 || len(idxBytes) > bolt.MaxKeySize) {
+			if (clustered || cfg.Storage.Engine == "bolt") && (len(idxBytes) == 0 || len(idxBytes) > bolt.MaxKeySize) {
 				return status.Error(codes.InvalidArgument, "publish index exceeds Bolt key limits or is empty")
 			}
 
@@ -313,23 +306,6 @@ func (ph *ProducerHandler) buildStoreItems(batch *pb.PublishBatch, nowMs int64, 
 		return nil, fmt.Errorf("failed to build store batch: %w", err)
 	}
 	return items, nil
-}
-
-func (ph *ProducerHandler) buildPublishCommand(batch *pb.PublishBatch, nowMs int64, ackLevel pb.AckLevel, receipts map[string][]byte) ([]byte, error) {
-	items, err := ph.buildStoreItems(batch, nowMs, receipts, true)
-	if err != nil {
-		return nil, err
-	}
-	var cmdBytes []byte
-	if ackLevel == pb.AckLevel_ACK_LEVEL_QUORUM {
-		cmdBytes, err = raft.MarshalPublishBatchCmd(items)
-	} else {
-		cmdBytes, err = raft.MarshalStoreDeliveryBatchCmd(items)
-	}
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal store batch: %w", err)
-	}
-	return cmdBytes, nil
 }
 
 func (ph *ProducerHandler) proposePublish(ctx context.Context, ackLevel pb.AckLevel, cmdBytes []byte) (statemachine.Result, error) {
@@ -398,7 +374,7 @@ func publishRejectionStatus(rejection *raft.PublishRejectedError) error {
 	switch rejection.Reason {
 	case raft.PublishTopicNotFound:
 		code = codes.NotFound
-	case raft.PublishTooManyDestinations:
+	case raft.PublishTooManyDestinations, raft.PublishStorageBudgetExceeded:
 		code = codes.ResourceExhausted
 	}
 	return status.Error(code, rejection.Error())
@@ -428,47 +404,6 @@ func waitForLeaderAck(ctx context.Context, persisted <-chan struct{}, applied <-
 	default:
 		return waitErr
 	}
-}
-
-// processStandaloneBatch writes the batch directly to local storage.
-func (ph *ProducerHandler) processStandaloneBatch(batch *pb.PublishBatch, nowMs int64, receipts map[string][]byte) error {
-	b := app.A.DB.NewBatch()
-	defer func() { _ = b.Close() }()
-
-	var published map[string]*raft.DeliveryState
-	var byTopic map[string]*raft.DeliveryState
-	if ph.StandalonePublishLedger != nil {
-		published = make(map[string]*raft.DeliveryState, len(batch.Messages))
-		byTopic = make(map[string]*raft.DeliveryState, len(receipts))
-		for topic, data := range receipts {
-			state, err := raft.UnmarshalDeliveryState(data)
-			if err != nil {
-				ph.logger.Warn("failed to decode published receipt for cache", zap.String("topic", topic), zap.Error(err))
-				continue
-			}
-			byTopic[topic] = state
-		}
-	}
-
-	if err := ph.marshalMessages(batch, nowMs, func(data *storagepb.StoredMessage) error {
-		key, err := app.A.Repositories.Events.StoreWithBatch(b, app.A.Repositories.Events.NextID(), data)
-		if err != nil {
-			return err
-		}
-		if state := byTopic[data.Topic]; state != nil {
-			published[string(key)] = state
-		}
-		return b.Set(raft.DeliveryStateKey(key), receipts[data.Topic])
-	}); err != nil {
-		return err
-	}
-
-	if err := ph.commitStandalonePublish(b, published); err != nil {
-		ph.logger.Error("failed to commit standalone batch", zap.Error(err))
-		return errBatchSave
-	}
-
-	return nil
 }
 
 func (ph *ProducerHandler) commitStandalonePublish(batch storage.Batch, published map[string]*raft.DeliveryState) error {

@@ -137,36 +137,8 @@ func (s *EventStateMachine) applyEntry(batch storage.Batch, delivery *DeliveryBa
 				return result, nil, 0, err
 			}
 		}
-		var maxID uint64
-		for _, it := range items {
-			// A former leader may submit a reserved ID after the new leader has
-			// committed it. Preserve both publications under distinct keys, even
-			// if the earlier message has already been ACKed or expired.
-			if it.ID <= lastID {
-				if lastID == ^uint64(0) {
-					return statemachine.Result{}, nil, 0, fmt.Errorf("raft: event ID space exhausted")
-				}
-				it.ID = lastID + 1
-			}
-			lastID = it.ID
-			bucket := utils.ShardStorageBucket(it.ShardSlot, it.Bucket)
-			key, err := s.repo.StoreRawWithBatch(batch, it.ID, bucket, it.TopicHash, it.Indexes, it.Msg)
-			if err != nil {
-				return statemachine.Result{}, nil, 0, fmt.Errorf("raft: StoreRawWithBatch: %w", err)
-			}
-			delivery.ObserveStore(key)
-			if len(it.Receipt) > 0 {
-				state, err := UnmarshalDeliveryState(it.Receipt)
-				if err != nil {
-					return statemachine.Result{}, nil, 0, err
-				}
-				delivery.save(key, state)
-			}
-			if it.ID > maxID {
-				maxID = it.ID
-			}
-		}
-		return statemachine.Result{Value: uint64(len(items))}, nil, maxID, nil
+		result, maxID, err := s.applyStoreItems(batch, delivery, items, lastID)
+		return result, nil, maxID, err
 
 	case DeleteBatchCmd:
 		keys, err := UnmarshalDeleteBatchCmd(cmd)
@@ -193,7 +165,70 @@ func (s *EventStateMachine) applyEntry(batch storage.Batch, delivery *DeliveryBa
 	}
 }
 
+func (s *EventStateMachine) applyStoreItems(batch storage.Batch, delivery *DeliveryBatch, items []StoreBatchItem, lastID uint64) (statemachine.Result, uint64, error) {
+	var maxID uint64
+	for _, it := range items {
+		// A former leader may submit a reserved ID after the new leader has
+		// committed it. Preserve both publications under distinct keys, even
+		// if the earlier message has already been ACKed or expired.
+		if it.ID <= lastID {
+			if lastID == ^uint64(0) {
+				return statemachine.Result{}, 0, fmt.Errorf("raft: event ID space exhausted")
+			}
+			it.ID = lastID + 1
+		}
+		lastID = it.ID
+		bucket := utils.ShardStorageBucket(it.ShardSlot, it.Bucket)
+		key, err := s.repo.StoreRawWithBatch(batch, it.ID, bucket, it.TopicHash, it.Indexes, it.Msg)
+		if err != nil {
+			return statemachine.Result{}, 0, fmt.Errorf("raft: StoreRawWithBatch: %w", err)
+		}
+		delivery.ObserveStore(key)
+		if len(it.Receipt) > 0 {
+			state, err := UnmarshalDeliveryState(it.Receipt)
+			if err != nil {
+				return statemachine.Result{}, 0, err
+			}
+			delivery.save(key, state)
+		}
+		if it.ID > maxID {
+			maxID = it.ID
+		}
+	}
+	return statemachine.Result{Value: uint64(len(items))}, maxID, nil
+}
+
 func (s *EventStateMachine) Update(entries []statemachine.Entry) ([]statemachine.Entry, error) {
+	// Stormoar may deliver several entries in one Update. Group publish-only
+	// transactions by their declared budgets to bound the physical write too.
+	// Each storage commit persists its matching Raft index.
+	start, reserved := 0, 0
+	for i, entry := range entries {
+		budget := 0
+		if len(entry.Cmd) != 0 && CommandType(entry.Cmd[0]) == PublishGroupCmd {
+			var err error
+			budget, err = publishGroupBudget(entry.Cmd)
+			if err != nil {
+				return nil, err
+			}
+		}
+		if i > start && ((budget == 0) != (reserved == 0) || budget > config.MaxPublishBatchBytes-reserved) {
+			if err := s.updateEntries(entries[start:i]); err != nil {
+				return nil, err
+			}
+			start, reserved = i, 0
+		}
+		reserved += budget
+	}
+	if start < len(entries) {
+		if err := s.updateEntries(entries[start:]); err != nil {
+			return nil, err
+		}
+	}
+	return entries, nil
+}
+
+func (s *EventStateMachine) updateEntries(entries []statemachine.Entry) error {
 	batch := s.db.NewBatch()
 	delivery := NewDeliveryBatch(s.db, batch)
 	delivery.receipts = &s.receipts
@@ -207,7 +242,7 @@ func (s *EventStateMachine) Update(entries []statemachine.Entry) ([]statemachine
 	for i := range entries {
 		result, deletedKeys, entryMaxID, err := s.applyEntry(batch, delivery, entries[i].Cmd, lastID)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		entries[i].Result = result
 		if len(deletedKeys) > 0 {
@@ -220,21 +255,21 @@ func (s *EventStateMachine) Update(entries []statemachine.Entry) ([]statemachine
 	}
 
 	if err := delivery.Flush(); err != nil {
-		return nil, err
+		return err
 	}
 	if lastID > s.lastPersistedID {
 		if err := s.repo.PersistLastID(batch, lastID); err != nil {
-			return nil, fmt.Errorf("raft: PersistLastID: %w", err)
+			return fmt.Errorf("raft: PersistLastID: %w", err)
 		}
 	}
 	idxBytes := make([]byte, 8)
 	binary.BigEndian.PutUint64(idxBytes, lastApplied)
 	if err := batch.Set(appliedIndexKey, idxBytes); err != nil {
-		return nil, err
+		return err
 	}
 
 	if err := batch.Commit(storage.NoSync); err != nil {
-		return nil, err
+		return err
 	}
 	s.receipts.commit(delivery)
 	s.lastApplied = lastApplied
@@ -245,7 +280,7 @@ func (s *EventStateMachine) Update(entries []statemachine.Entry) ([]statemachine
 		s.OnDeleteKeys(allDeletedKeys)
 	}
 
-	return entries, nil
+	return nil
 }
 
 func (s *EventStateMachine) Sync() error {

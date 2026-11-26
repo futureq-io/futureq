@@ -62,6 +62,10 @@ maximum is 256.
   publications.
 - If any topic in a batch is undeclared, the whole batch fails with `NotFound`.
   A declared topic with no durable destinations fails with `FailedPrecondition`.
+- A client batch that exceeds its publish byte budget fails with `ResourceExhausted`.
+  Quorum apply includes the expanded delivery receipts in the budget for the
+  proposal. The broker also returns `ResourceExhausted` when its pending publish
+  limit is full.
 - Quorum admission uses subscription state at the publish entry in Raft order;
   it needs no separate admission read. Leader and no-ACK modes select destinations
   before proposal using a fresh registry read. An unroutable batch writes no

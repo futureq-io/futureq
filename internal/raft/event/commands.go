@@ -53,7 +53,7 @@ type StoreBatchItem struct {
 	// Msg is the already-serialised storagepb.StoredMessage proto bytes.
 	// This slice aliases the original command buffer — do not mutate.
 	Msg []byte
-	// Receipt is used by StoreDeliveryBatchCmd only and is atomic with Msg.
+	// Receipt holds publish-bound destinations and is stored atomically with Msg.
 	Receipt []byte
 }
 

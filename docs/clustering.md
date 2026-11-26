@@ -22,18 +22,17 @@ and publish-bound delivery in `internal/raft/event/published_delivery.go`:
 
 | Command             | Payload |
 | ------------------- | ------- |
-| `StoreBatchCmd (0)` | Each item carries a proposed `u64 id`, a 9-byte shard slot and time bucket, a `u64 topicHash`, index entries, and a `u32 len` followed by the serialized `StoredMessage`. Ordered apply advances stale IDs past the applied watermark so keys converge. Each publish batch forms one log entry. |
+| `StoreBatchCmd (0)` | Each item carries a proposed `u64 id`, a 9-byte shard slot and time bucket, a `u64 topicHash`, index entries, and a `u32 len` followed by the serialized `StoredMessage`. Ordered apply advances stale IDs past the applied watermark so keys converge. |
 | `DeleteBatchCmd (1)`| Count and fixed 25-byte message keys for ACK-driven deletes and TTL expirations. |
-| `StoreDeliveryBatchCmd (8)` | Leader/no-ACK publish: encoded store batch followed by a length-prefixed frozen receipt per message; payload and destinations commit atomically. |
+| `StoreDeliveryBatchCmd (8)` | Legacy leader/no-ACK publish. Encoded store batch followed by a length-prefixed frozen receipt per message; payload and destinations commit atomically. |
 | `SubscriptionCmd (9)` | Protobuf subscription create/remove, worker connect/disconnect, batched session renewal, conditional idle expiry, and bounded retired-recipient cleanup. |
-| `PublishBatchCmd (10)` | Quorum publish: encoded store batch without receipts. Apply selects destinations from subscription state at this log position and writes payload plus receipt atomically. |
-| `PublishGroupCmd (11)` | Optional internal publish batching. One Raft entry carries an ordered sequence of length-prefixed publish commands of the same kind. Apply evaluates each client batch independently and returns its result in the same order. |
+| `PublishBatchCmd (10)` | Legacy quorum publish. Encoded store batch without receipts. Apply selects destinations from subscription state at this log position and writes payload plus receipt atomically. |
+| `PublishGroupCmd (11)` | One or more client batches in a single ordered Raft entry. The header specifies the byte budget and whether destinations are frozen. Each client batch gets an independent apply result. |
 
-Quorum publishers use one proposal with no admission quorum read. Apply merges
-persisted subscriptions with earlier subscription commands in the same Update,
-so every replica chooses the same recipients. A missing or over-capacity destination
-set rejects the entire publish through the proposal result, without stopping the
-state machine or writing any messages. Leader and no-ACK publishers catch up the
+Quorum publishers use one proposal with no admission quorum read. Apply uses
+subscription state at the publish entry's log position so every replica chooses
+the same recipients. A client batch with an invalid destination set or whose
+expanded writes exceed the remaining proposal budget is rejected atomically. Leader and no-ACK publishers catch up the
 event view and freeze durable destinations before proposal, preserving early ACKs. The
 event group stores group and universal subscriptions independently of the metadata
 group's live worker assignments. Subscription records, session leases and retired
@@ -43,7 +42,13 @@ preparation proposal or post-preparation read barrier. Periodic quorum reads
 still renew the bounded ownership permit, and receipt reads observe locally
 applied committed state. Lag in observing an ACK can produce duplicate delivery.
 
-`Update` applies all entries in a log batch into one Pebble batch (nothing partial on error), persists the max applied event ID and `metadata/raft/applied-index`, and fires the `OnDeleteKeys` hook so every replica clears dispatcher in-flight entries for deleted keys. Snapshots stream the whole DB as length-prefixed records; recovery clears the DB first and validates the applied index.
+Each event storage transaction commits the matching applied Raft index and
+event ID watermark. When Stormoar delivers several publish entries together,
+the state machine keeps their combined declared write budgets within 16 MiB per
+transaction and commits other event commands separately. The `OnDeleteKeys`
+hook clears dispatcher in-flight entries on each replica. Snapshots stream the
+whole database as length-prefixed records. Recovery clears the database first
+and validates the applied index.
 
 ## Metadata group
 

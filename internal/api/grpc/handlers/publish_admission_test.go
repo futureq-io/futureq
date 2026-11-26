@@ -3,6 +3,7 @@ package handlers
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"net"
 	"path/filepath"
@@ -20,6 +21,8 @@ import (
 	pb "github.com/futureq-io/protocol/proto/go"
 	"github.com/futureq-io/stormoar/v4"
 	raftconfig "github.com/futureq-io/stormoar/v4/config"
+	"github.com/futureq-io/stormoar/v4/raftio"
+	"github.com/futureq-io/stormoar/v4/raftpb"
 	"github.com/futureq-io/stormoar/v4/statemachine"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
@@ -45,8 +48,10 @@ type observedAdmissionSM struct {
 	admissionUnavailable atomic.Bool
 	mu                   sync.Mutex
 	commands             [][]byte
-	block                <-chan struct{}
-	entered              chan struct{}
+	capture              bool
+	proposals            atomic.Int64
+	applyGate            atomic.Pointer[publishGate]
+	logGate              atomic.Pointer[publishGate]
 }
 
 func (sm *observedAdmissionSM) Lookup(query interface{}) (interface{}, error) {
@@ -56,66 +61,131 @@ func (sm *observedAdmissionSM) Lookup(query interface{}) (interface{}, error) {
 	}
 	return sm.IOnDiskStateMachine.Lookup(query)
 }
+
+type publishGate struct {
+	release chan struct{}
+	entered chan struct{}
+}
+
+func holdPublish(t testing.TB, hook *atomic.Pointer[publishGate]) (func(), <-chan struct{}) {
+	gate := &publishGate{release: make(chan struct{}), entered: make(chan struct{}, 1)}
+	hook.Store(gate)
+	release := sync.OnceFunc(func() {
+		hook.Store(nil)
+		close(gate.release)
+	})
+	t.Cleanup(release)
+	return release, gate.entered
+}
+
+func (g *publishGate) wait() {
+	select {
+	case g.entered <- struct{}{}:
+	default:
+	}
+	<-g.release
+}
+
 func (sm *observedAdmissionSM) Update(entries []statemachine.Entry) ([]statemachine.Entry, error) {
 	for _, entry := range entries {
-		if len(entry.Cmd) == 0 {
+		if len(entry.Cmd) == 0 || raft.CommandType(entry.Cmd[0]) != raft.PublishGroupCmd {
 			continue
 		}
-		sm.mu.Lock()
-		sm.commands = append(sm.commands, append([]byte(nil), entry.Cmd...))
-		block, entered := sm.block, sm.entered
-		sm.mu.Unlock()
-		if raft.CommandType(entry.Cmd[0]) == raft.StoreDeliveryBatchCmd && block != nil {
-			select {
-			case entered <- struct{}{}:
-			default:
-			}
-			<-block
+		sm.proposals.Add(1)
+		if sm.capture {
+			sm.mu.Lock()
+			sm.commands = append(sm.commands, append([]byte(nil), entry.Cmd...))
+			sm.mu.Unlock()
+		}
+		if gate := sm.applyGate.Load(); gate != nil {
+			gate.wait()
 		}
 	}
 	return sm.IOnDiskStateMachine.Update(entries)
 }
-func (sm *observedAdmissionSM) holdEarlyApply() (chan struct{}, chan struct{}) {
-	release, entered := make(chan struct{}), make(chan struct{}, 1)
-	sm.mu.Lock()
-	sm.block = release
-	sm.entered = entered
-	sm.mu.Unlock()
-	return release, entered
-}
+
 func (sm *observedAdmissionSM) publishedCommands() [][]byte {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
-	var commands [][]byte
-	for _, cmd := range sm.commands {
-		if raft.CommandType(cmd[0]) == raft.PublishBatchCmd || raft.CommandType(cmd[0]) == raft.StoreDeliveryBatchCmd {
-			commands = append(commands, cmd)
+	return append([][]byte(nil), sm.commands...)
+}
+
+type observedPublishLogFactory struct {
+	raftconfig.LogDBFactory
+	gate *atomic.Pointer[publishGate]
+}
+
+func (f observedPublishLogFactory) Create(cfg raftconfig.NodeHostConfig, cb raftconfig.LogDBCallback, dirs, wals []string) (raftio.ILogDB, error) {
+	db, err := f.LogDBFactory.Create(cfg, cb, dirs, wals)
+	if err != nil {
+		return nil, err
+	}
+	return observedPublishLogDB{ILogDB: db, gate: f.gate}, nil
+}
+
+type observedPublishLogDB struct {
+	raftio.ILogDB
+	gate *atomic.Pointer[publishGate]
+}
+
+func (db observedPublishLogDB) SaveRaftState(updates []raftpb.Update, shardID uint64) error {
+	if gate := db.gate.Load(); gate != nil {
+		for _, update := range updates {
+			for _, entry := range update.EntriesToSave {
+				cmd := entry.Cmd
+				if entry.Type == raftpb.EncodedEntry && len(cmd) > 0 && cmd[0] == 0 {
+					cmd = cmd[1:]
+				}
+				if len(cmd) > 0 && raft.CommandType(cmd[0]) == raft.PublishGroupCmd {
+					gate.wait()
+				}
+			}
 		}
 	}
-	return commands
+	return db.ILogDB.SaveRaftState(updates, shardID)
 }
+
+func publishFrameCount(t testing.TB, cmd []byte) int {
+	t.Helper()
+	count := 0
+	for data := cmd[raft.PublishGroupHeaderSize:]; len(data) > 0; {
+		require.GreaterOrEqual(t, len(data), raft.PublishGroupFrameOverhead)
+		length := int(binary.BigEndian.Uint32(data))
+		require.Positive(t, length)
+		require.LessOrEqual(t, length, len(data)-raft.PublishGroupFrameOverhead)
+		data = data[raft.PublishGroupFrameOverhead+length:]
+		count++
+	}
+	return count
+}
+
 func openRaftAdmissionTest(t *testing.T) (*app.App, *ProducerHandler, *observedAdmissionSM, *admissionReadDB) {
+	return openRaftPublishFixture(t, config.DefaultPublish(), true)
+}
+
+func openRaftPublishFixture(t testing.TB, publish config.Publish, capture bool) (*app.App, *ProducerHandler, *observedAdmissionSM, *admissionReadDB) {
 	t.Helper()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
 	address := listener.Addr().String()
 	require.NoError(t, listener.Close())
 	root := t.TempDir()
-	cfg := &config.Config{Cluster: config.Cluster{Enabled: true, NodeID: 1, ShardID: 1}, Storage: config.Storage{Engine: "pebble", VirtualShards: 1, Pebble: config.Pebble{Mode: "disk", DataDir: filepath.Join(root, "events"), WALEnabled: false}}, Delivery: config.DefaultDelivery(), Publish: config.Publish{MinAckLevel: config.NoAck, ProposalTimeout: 3 * time.Second}}
+	publish.MinAckLevel, publish.ProposalTimeout = config.NoAck, 3*time.Second
+	cfg := &config.Config{Cluster: config.Cluster{Enabled: true, NodeID: 1, ShardID: 1}, Storage: config.Storage{Engine: "pebble", VirtualShards: 1, Pebble: config.Pebble{Mode: "disk", DataDir: filepath.Join(root, "events"), WALEnabled: false}}, Delivery: config.DefaultDelivery(), Publish: publish}
 	previous := app.A
 	a, err := app.Init(cfg, zap.NewNop())
 	require.NoError(t, err)
 	require.NoError(t, a.WithRepositories())
 	tracker := leaderpersist.NewTracker()
 	nhc := raftconfig.NodeHostConfig{NodeHostDir: filepath.Join(root, "raft"), RaftAddress: address, RTTMillisecond: 10}
-	nhc.Expert.LogDBFactory = leaderpersist.NewFactory(tracker)
+	sm := &observedAdmissionSM{capture: capture, IOnDiskStateMachine: raft.NewEventStateMachineFactory(a.DB, a.Repositories.Events, nil, zap.NewNop())(1, 1)}
+	nhc.Expert.LogDBFactory = observedPublishLogFactory{LogDBFactory: leaderpersist.NewFactory(tracker), gate: &sm.logGate}
 	nhc.Expert.Engine = raftconfig.EngineConfig{ExecShards: 1, CommitShards: 1, ApplyShards: 1, SnapshotShards: 1, CloseShards: 1}
 	nh, err := dragonboat.NewNodeHost(nhc)
 	require.NoError(t, err)
 	a.NodeHost = nh
 	a.LeaderTracker = tracker
-	sm := &observedAdmissionSM{IOnDiskStateMachine: raft.NewEventStateMachineFactory(a.DB, a.Repositories.Events, nil, zap.NewNop())(1, 1)}
-	rc := raftconfig.Config{ShardID: 1, ReplicaID: 1, ElectionRTT: 10, HeartbeatRTT: 1, CheckQuorum: true, SnapshotEntries: 20, CompactionOverhead: 5}
+	rc := raftconfig.Config{ShardID: 1, ReplicaID: 1, ElectionRTT: 10, HeartbeatRTT: 1, CheckQuorum: true, SnapshotEntries: 100000, CompactionOverhead: 5}
 	require.NoError(t, nh.StartOnDiskReplica(map[uint64]string{1: address}, false, func(uint64, uint64) statemachine.IOnDiskStateMachine { return sm }, rc))
 	t.Cleanup(func() { nh.Close(); require.NoError(t, a.DB.Close()); app.A = previous })
 	require.Eventually(t, func() bool { id, _, valid, err := nh.GetLeaderID(1); return err == nil && valid && id == 1 }, 5*time.Second, 10*time.Millisecond)
@@ -124,7 +194,9 @@ func openRaftAdmissionTest(t *testing.T) (*app.App, *ProducerHandler, *observedA
 	observed := &admissionReadDB{DB: a.DB}
 	a.DB = observed
 	require.NoError(t, a.Subscriptions.CreateTopic(context.Background(), "orders", nil))
-	return a, NewProducerHandler(zap.NewNop()), sm, observed
+	producer := NewProducerHandler(zap.NewNop())
+	t.Cleanup(producer.Close)
+	return a, producer, sm, observed
 }
 
 func TestRaftPublishPersistsEachVirtualShardLayout(t *testing.T) {
@@ -181,11 +253,9 @@ func TestRaftPublishAdmissionReadCountsAndAllAckModes(t *testing.T) {
 	require.Eventually(t, func() bool { return len(publishedKeys(t, a.DB)) == 3 }, time.Second, time.Millisecond)
 	commands := sm.publishedCommands()
 	require.Len(t, commands, 3)
-	require.Equal(t, byte(raft.PublishBatchCmd), commands[0][0])
-	for _, cmd := range commands[1:] {
-		items, err := raft.UnmarshalStoreDeliveryBatchCmd(cmd)
-		require.NoError(t, err)
-		require.NotEmpty(t, items[0].Receipt, "early ACKs persist frozen destinations in the log")
+	for i, cmd := range commands {
+		require.Equal(t, 1, publishFrameCount(t, cmd))
+		require.Equal(t, i != 0, cmd[1] == 1, "only early ACKs freeze destinations in the log")
 	}
 	for _, key := range publishedKeys(t, a.DB) {
 		state, err := raft.ReadDeliveryState(a.DB, key)
@@ -246,35 +316,54 @@ func TestRaftEarlyAckRejectsUnavailableAdmissionBeforeProposal(t *testing.T) {
 	require.Eventually(t, func() bool { return len(publishedKeys(t, a.DB)) == len(modes) }, time.Second, time.Millisecond)
 }
 
-func TestRaftEarlyAcksStillReturnBeforeApply(t *testing.T) {
-	a, producer, sm, _ := openRaftAdmissionTest(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	_, err := a.Subscriptions.Create(ctx, "orders", "workers", "")
-	require.NoError(t, err)
-	for _, mode := range []pb.AckLevel{pb.AckLevel_ACK_LEVEL_LEADER, pb.AckLevel_ACK_LEVEL_NO_ACK} {
+func TestRaftGroupedPublishAckGuarantees(t *testing.T) {
+	for _, mode := range []pb.AckLevel{pb.AckLevel_ACK_LEVEL_QUORUM, pb.AckLevel_ACK_LEVEL_LEADER, pb.AckLevel_ACK_LEVEL_NO_ACK} {
 		t.Run(mode.String(), func(t *testing.T) {
-			release, entered := sm.holdEarlyApply()
-			defer close(release)
-			returned := make(chan error, 1)
-			go func() {
-				ack, err := producer.processBatch(ctx, &pb.PublishBatch{AckLevel: mode, Messages: []*pb.PublishMessage{{Topic: "orders"}}})
-				if err == nil && !ack.Success {
-					err = context.Canceled
-				}
-				returned <- err
-			}()
-			select {
-			case err := <-returned:
-				require.NoError(t, err)
-			case <-time.After(time.Second):
-				t.Fatal("early ACK waited for state-machine application")
+			publish := config.DefaultPublish()
+			publish.BatchMaxRequests, publish.BatchMaxWait = 2, 500*time.Millisecond
+			a, producer, sm, _ := openRaftPublishFixture(t, publish, true)
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			_, err := a.Subscriptions.Create(ctx, "orders", "workers", "")
+			require.NoError(t, err)
+
+			releaseLog, logged := holdPublish(t, &sm.logGate)
+			releaseApply, applying := holdPublish(t, &sm.applyGate)
+			returned := make(chan error, 2)
+			for range 2 {
+				go func() {
+					ack, err := producer.processBatch(ctx, &pb.PublishBatch{AckLevel: mode, Messages: []*pb.PublishMessage{{Topic: "orders"}}})
+					if err == nil && !ack.Success {
+						err = errors.New("publish was not acknowledged")
+					}
+					returned <- err
+				}()
 			}
-			select {
-			case <-entered:
-			case <-time.After(time.Second):
-				t.Fatal("store command never reached blocked apply")
+			awaitPublishSignal(t, logged)
+			if mode == pb.AckLevel_ACK_LEVEL_NO_ACK {
+				require.NoError(t, awaitPublishError(t, returned))
+				require.NoError(t, awaitPublishError(t, returned))
+			} else {
+				assertPublishWaiting(t, returned)
 			}
+			releaseLog()
+			awaitPublishSignal(t, applying)
+			require.Empty(t, publishedKeys(t, a.DB))
+			if mode == pb.AckLevel_ACK_LEVEL_LEADER {
+				require.NoError(t, awaitPublishError(t, returned))
+				require.NoError(t, awaitPublishError(t, returned))
+			} else if mode == pb.AckLevel_ACK_LEVEL_QUORUM {
+				assertPublishWaiting(t, returned)
+			}
+			releaseApply()
+			if mode == pb.AckLevel_ACK_LEVEL_QUORUM {
+				require.NoError(t, awaitPublishError(t, returned))
+				require.NoError(t, awaitPublishError(t, returned))
+				require.Len(t, publishedKeys(t, a.DB), 2)
+			}
+			commands := sm.publishedCommands()
+			require.Len(t, commands, 1)
+			require.Equal(t, 2, publishFrameCount(t, commands[0]))
 		})
 	}
 }

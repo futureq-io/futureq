@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"time"
 
@@ -17,28 +18,29 @@ import (
 
 type queuedPublish struct {
 	ctx     context.Context
-	done    chan error // buffered so cancellation never blocks a worker
+	done    chan error
+	release func() // admission belongs to the worker after handoff
 	bytes   int
 	count   int
-	command []byte
+	frame   []byte
 	items   []raft.StoreBatchItem
 }
 
-var deliveryStateKeyOverhead = len(raft.DeliveryStateKey(nil))
-
 type publishBatcher struct {
-	ctx     context.Context
-	cancel  context.CancelFunc
-	workers sync.WaitGroup
-	// The lane is the requested ACK level in a cluster. Standalone flushes
-	// share a lane because every ACK mode uses the same synchronous commit.
-	lanes [3]chan *queuedPublish
-	slots [3]chan struct{} // bound receipt reads and encoded commands awaiting handoff
+	ctx      context.Context
+	cancel   context.CancelFunc
+	workers  sync.WaitGroup
+	flushes  sync.WaitGroup
+	inFlight chan struct{} // shared across Raft ACK lanes
+	lanes    [3]chan *queuedPublish
 }
 
 func newPublishBatcher(cfg config.Publish, clustered bool, flush func(context.Context, pb.AckLevel, []*queuedPublish)) *publishBatcher {
 	ctx, cancel := context.WithCancel(context.Background())
 	b := &publishBatcher{ctx: ctx, cancel: cancel}
+	if clustered {
+		b.inFlight = make(chan struct{}, cfg.BatchMaxInFlight)
+	}
 	maxBytes, _ := cfg.BatchMaxBytes.Bytes() // configuration validated at startup
 	for i := range b.lanes {
 		if i > 0 && !clustered {
@@ -46,7 +48,6 @@ func newPublishBatcher(cfg config.Publish, clustered bool, flush func(context.Co
 		}
 		lane := make(chan *queuedPublish)
 		b.lanes[i] = lane
-		b.slots[i] = make(chan struct{}, cfg.BatchMaxRequests)
 		b.workers.Go(func() {
 			b.runLane(lane, pb.AckLevel(i), cfg.BatchMaxRequests, int(maxBytes), cfg.BatchMaxWait, flush)
 		})
@@ -54,23 +55,34 @@ func newPublishBatcher(cfg config.Publish, clustered bool, flush func(context.Co
 	return b
 }
 
-// reserve leaves requests waiting for capacity in their own gRPC handler,
-// before allocating encoded commands or reading subscription receipts.
-func (b *publishBatcher) reserve(ctx context.Context, level pb.AckLevel) (func(), error) {
-	slots := b.slots[level]
+func (b *publishBatcher) queue(req *queuedPublish, level pb.AckLevel) (bool, error) {
+	if b.inFlight == nil {
+		level = pb.AckLevel_ACK_LEVEL_QUORUM
+	}
 	select {
-	case slots <- struct{}{}:
-		return func() { <-slots }, nil
-	case <-ctx.Done():
-		return nil, status.FromContextError(ctx.Err()).Err()
+	case b.lanes[level] <- req:
+	case <-req.ctx.Done():
+		return false, status.FromContextError(req.ctx.Err()).Err()
 	case <-b.ctx.Done():
-		return nil, status.Error(codes.Unavailable, "publish batcher stopping")
+		return false, status.Error(codes.Unavailable, "publish batcher stopping")
+	}
+	select {
+	case err := <-req.done:
+		return true, err
+	case <-req.ctx.Done():
+		return true, status.FromContextError(req.ctx.Err()).Err()
+	case <-b.ctx.Done():
+		return true, status.Error(codes.Unavailable, "publish batcher stopping")
 	}
 }
 
 func (b *publishBatcher) runLane(lane <-chan *queuedPublish, level pb.AckLevel, maxRequests, maxBytes int, maxWait time.Duration, flush func(context.Context, pb.AckLevel, []*queuedPublish)) {
-	group := make([]*queuedPublish, 0, maxRequests)
 	var next *queuedPublish
+	defer func() {
+		if next != nil {
+			next.releaseAdmission()
+		}
+	}()
 	for b.ctx.Err() == nil {
 		if next == nil {
 			select {
@@ -79,96 +91,133 @@ func (b *publishBatcher) runLane(lane <-chan *queuedPublish, level pb.AckLevel, 
 				return
 			}
 		}
-		if next.ctx.Err() != nil {
-			next = nil
+		first := next
+		next = nil
+		if first.ctx.Err() != nil {
+			first.releaseAdmission()
 			continue
 		}
-		group = append(group[:0], next)
-		bytes := 1 + next.bytes // includes the Raft group tag when encoded
-		next = nil
-		if bytes < maxBytes {
+		group := []*queuedPublish{first}
+		size := first.bytes
+		if b.inFlight != nil {
+			size += raft.PublishGroupHeaderSize
+		}
+		if size < maxBytes {
 			timer := time.NewTimer(maxWait)
 		collect:
-			for len(group) < maxRequests && bytes < maxBytes {
+			for len(group) < maxRequests && size < maxBytes {
 				select {
 				case req := <-lane:
 					if req.ctx.Err() != nil {
+						req.releaseAdmission()
 						continue
 					}
-					if req.bytes > maxBytes-bytes {
+					if req.bytes > maxBytes-size {
 						next = req
 						break collect
 					}
 					group = append(group, req)
-					bytes += req.bytes
+					size += req.bytes
 				case <-timer.C:
 					break collect
 				case <-b.ctx.Done():
-					timer.Stop()
-					return
+					break collect
 				}
 			}
 			timer.Stop()
 		}
-		active := group[:0]
-		for _, req := range group {
-			if req.ctx.Err() == nil {
-				active = append(active, req)
+
+		run := func() {
+			defer releasePublishGroup(group)
+			active := make([]*queuedPublish, 0, len(group))
+			for _, req := range group {
+				if req.ctx.Err() == nil {
+					active = append(active, req)
+				}
+			}
+			if len(active) > 0 && b.ctx.Err() == nil {
+				flush(b.ctx, level, active)
 			}
 		}
-		if len(active) > 0 && b.ctx.Err() == nil {
-			flush(b.ctx, level, active)
+		if b.inFlight == nil {
+			run()
+			continue
 		}
-		clear(group)
+		select {
+		case b.inFlight <- struct{}{}:
+			b.flushes.Go(func() {
+				defer func() { <-b.inFlight }()
+				run()
+			})
+		case <-b.ctx.Done():
+			releasePublishGroup(group)
+			return
+		}
 	}
 }
 
-func (ph *ProducerHandler) queuePublish(ctx context.Context, batch *pb.PublishBatch, nowMs int64, level, lane pb.AckLevel, receipts map[string][]byte) error {
-	req := &queuedPublish{ctx: ctx, done: make(chan error, 1), count: len(batch.Messages)}
-	var err error
-	if app.A.NodeHost != nil {
-		if err := checkPublishLeader(); err != nil {
-			return err
-		}
-		req.command, err = ph.buildPublishCommand(batch, nowMs, level, receipts)
-		req.bytes = len(req.command) + raft.PublishGroupFrameOverhead
-	} else {
-		req.items, err = ph.buildStoreItems(batch, nowMs, receipts, false)
-		for _, item := range req.items {
-			req.bytes += len(item.Msg) + len(item.Receipt) + 2*utils.EventKeySize + deliveryStateKeyOverhead
-			for _, index := range item.Indexes {
-				req.bytes += len(index) + utils.EventKeySize
-			}
-		}
+func releasePublishGroup(group []*queuedPublish) {
+	for _, req := range group {
+		req.releaseAdmission()
 	}
+}
+
+func (req *queuedPublish) releaseAdmission() {
+	if req.release != nil {
+		req.release()
+		req.release = nil
+	}
+}
+
+func (req *queuedPublish) finish(err error) {
+	req.releaseAdmission()
+	req.done <- err
+}
+
+func (ph *ProducerHandler) preparePublish(ctx context.Context, batch *pb.PublishBatch, nowMs int64, level pb.AckLevel, receipts map[string][]byte) (*queuedPublish, error) {
+	clustered := app.A.NodeHost != nil
+	items, err := ph.buildStoreItems(batch, nowMs, receipts, clustered)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	b := ph.batcher
-	select {
-	case b.lanes[lane] <- req:
-	case <-ctx.Done():
-		return status.FromContextError(ctx.Err()).Err()
-	case <-b.ctx.Done():
-		return status.Error(codes.Unavailable, "publish batcher stopping")
+	req := &queuedPublish{ctx: ctx, done: make(chan error, 1), count: len(items)}
+	var size int
+	for _, item := range items {
+		itemBytes := raft.PublishItemStorageBytes(item)
+		if itemBytes > ph.maxPublishBytes-size {
+			return nil, status.Error(codes.ResourceExhausted, "publish batch exceeds storage byte budget")
+		}
+		size += itemBytes
 	}
-	select {
-	case err := <-req.done:
-		return err
-	case <-ctx.Done():
-		return status.FromContextError(ctx.Err()).Err()
-	case <-b.ctx.Done():
-		return status.Error(codes.Unavailable, "publish batcher stopping")
+	req.bytes = size
+	if clustered {
+		req.frame, err = raft.MarshalPublishFrame(items, level != pb.AckLevel_ACK_LEVEL_QUORUM)
+		if err != nil {
+			return nil, fmt.Errorf("failed to marshal publish batch: %w", err)
+		}
+		req.bytes = max(req.bytes, len(req.frame)+raft.PublishGroupFrameOverhead)
+		if raft.PublishGroupHeaderSize+req.bytes > ph.maxPublishBytes {
+			return nil, status.Error(codes.ResourceExhausted, "publish batch exceeds byte limit")
+		}
+	} else {
+		req.items = items
 	}
+	return req, nil
 }
 
 func (ph *ProducerHandler) flushPublishGroup(ctx context.Context, level pb.AckLevel, group []*queuedPublish) {
 	replyAll := func(err error) {
 		for _, req := range group {
-			req.done <- err
+			req.finish(err)
 		}
 	}
 	if app.A.NodeHost == nil {
+		ph.standaloneWriter.Lock()
+		defer ph.standaloneWriter.Unlock()
+		if err := ctx.Err(); err != nil {
+			replyAll(status.FromContextError(err).Err())
+			return
+		}
 		replyAll(ph.commitPublishGroup(group))
 		return
 	}
@@ -177,26 +226,23 @@ func (ph *ProducerHandler) flushPublishGroup(ctx context.Context, level pb.AckLe
 		return
 	}
 
-	command := group[0].command
-	if len(group) > 1 {
-		commands := make([][]byte, len(group))
-		for i, req := range group {
-			commands[i] = req.command
-		}
-		var err error
-		command, err = raft.MarshalPublishGroupCmd(commands)
-		if err != nil {
-			replyAll(err)
-			return
-		}
+	frames := make([][]byte, len(group))
+	for i, req := range group {
+		frames[i] = req.frame
 	}
-	result, err := ph.proposePublish(ctx, level, command)
-	if err != nil || level != pb.AckLevel_ACK_LEVEL_QUORUM {
-		replyAll(publishProposalError(err))
+	frozen := level != pb.AckLevel_ACK_LEVEL_QUORUM
+	command, err := raft.MarshalPublishGroupCmd(frames, frozen, ph.maxPublishBytes)
+	if err != nil {
+		replyAll(err)
 		return
 	}
-	if len(group) == 1 {
-		replyAll(publishProposalError(raft.CheckPublishResult(result, group[0].count)))
+	if err := ctx.Err(); err != nil {
+		replyAll(status.FromContextError(err).Err())
+		return
+	}
+	result, err := ph.proposePublish(ctx, level, command)
+	if err != nil || frozen {
+		replyAll(publishProposalError(err))
 		return
 	}
 	results, err := raft.UnmarshalPublishGroupResults(result, len(group))
@@ -205,7 +251,7 @@ func (ph *ProducerHandler) flushPublishGroup(ctx context.Context, level pb.AckLe
 		return
 	}
 	for i, req := range group {
-		req.done <- publishProposalError(raft.CheckPublishResult(results[i], req.count))
+		req.finish(publishProposalError(raft.CheckPublishResult(results[i], req.count)))
 	}
 }
 

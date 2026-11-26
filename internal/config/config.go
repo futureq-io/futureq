@@ -184,11 +184,13 @@ type Bolt struct {
 }
 
 type Publish struct {
-	MinAckLevel      AckLevel      `mapstructure:"minAckLevel" yaml:"minAckLevel"`
-	ProposalTimeout  time.Duration `mapstructure:"proposalTimeout" yaml:"proposalTimeout"`
-	BatchMaxRequests int           `mapstructure:"batchMaxRequests" yaml:"batchMaxRequests"`
-	BatchMaxBytes    Size          `mapstructure:"batchMaxBytes" yaml:"batchMaxBytes"`
-	BatchMaxWait     time.Duration `mapstructure:"batchMaxWait" yaml:"batchMaxWait"`
+	MinAckLevel        AckLevel      `mapstructure:"minAckLevel" yaml:"minAckLevel"`
+	ProposalTimeout    time.Duration `mapstructure:"proposalTimeout" yaml:"proposalTimeout"`
+	BatchMaxRequests   int           `mapstructure:"batchMaxRequests" yaml:"batchMaxRequests"`
+	BatchMaxBytes      Size          `mapstructure:"batchMaxBytes" yaml:"batchMaxBytes"`
+	BatchMaxWait       time.Duration `mapstructure:"batchMaxWait" yaml:"batchMaxWait"`
+	BatchMaxInFlight   int           `mapstructure:"batchMaxInFlight" yaml:"batchMaxInFlight"`
+	MaxPendingRequests int           `mapstructure:"maxPendingRequests" yaml:"maxPendingRequests"`
 }
 
 type ReceiptCache struct {
@@ -207,6 +209,8 @@ func (c ReceiptCache) Bytes() (int64, error) {
 const (
 	MaxPublishBatchRequests = 256
 	MaxPublishBatchBytes    = 16 << 20
+	MaxPublishInFlight      = 64
+	MaxPendingPublishes     = 4096
 )
 
 type Delivery struct {
@@ -501,6 +505,12 @@ func (c *Config) validatePublishAndDelivery() error {
 	}
 	if c.Publish.BatchMaxWait <= 0 || c.Publish.BatchMaxWait > time.Second {
 		return fmt.Errorf("publish.batchMaxWait must be in (0, 1s]")
+	}
+	if c.Publish.BatchMaxInFlight < 1 || c.Publish.BatchMaxInFlight > MaxPublishInFlight {
+		return fmt.Errorf("publish.batchMaxInFlight must be 1..%d", MaxPublishInFlight)
+	}
+	if c.Publish.MaxPendingRequests < 1 || c.Publish.MaxPendingRequests > MaxPendingPublishes {
+		return fmt.Errorf("publish.maxPendingRequests must be 1..%d", MaxPendingPublishes)
 	}
 
 	d := c.Delivery

@@ -85,6 +85,8 @@ publish:
   batchMaxRequests: 1 # 1 disables server-side grouping
   batchMaxBytes: 1MiB
   batchMaxWait: 1ms
+  batchMaxInFlight: 16
+  maxPendingRequests: 256
 
 delivery:
   # consumerCount weights by workers. replicaCount gives each serving replica equal weight.

@@ -121,17 +121,19 @@ are separate from application storage under `storage.pebble`.
 | `publish.minAckLevel`        | `quorum` | Broker-wide minimum acknowledgement durability. One of `quorum`, `leader`, `noAck`. Publish batches requesting a weaker level are rejected with `InvalidArgument`. See [ack levels](clustering.md#publish-ack-levels). |
 | `publish.proposalTimeout`    | `5s`     | Upper bound for each Raft propose / leader-ack wait. Must be positive. |
 | `publish.batchMaxRequests`   | `1`      | Maximum client batches in one flush (1–256). Use a value above 1 to enable server-side batching. |
-| `publish.batchMaxBytes`      | `1MiB`   | Maximum bytes in a combined flush, up to 16 MiB. Larger client batches flush alone. Standalone counts encoded message, receipt, and index bytes including their keys. |
+| `publish.batchMaxBytes`      | `1MiB`   | Maximum bytes per flush, up to 16 MiB. This caps the encoded Raft command and the message, receipt, and index keys and values written by the flush. It also applies to single client batches. |
 | `publish.batchMaxWait`       | `1ms`    | Maximum time to collect more client batches once a flush starts collecting (positive, at most 1s). |
+| `publish.batchMaxInFlight`   | `16`     | Maximum concurrent grouped Raft submissions across ACK modes (1–64). Standalone uses one writer. |
+| `publish.maxPendingRequests` | `256`    | Maximum admitted publish requests across all streams and ACK modes (1–4096). Additional requests receive `ResourceExhausted`. |
 
-For example, set `publish.batchMaxRequests: 32` to allow concurrent producers to
-share a flush. Environment overrides are `FUTUREQ_PUBLISH_BATCHMAXREQUESTS`,
-`FUTUREQ_PUBLISH_BATCHMAXBYTES`, and `FUTUREQ_PUBLISH_BATCHMAXWAIT`.
-Publishers can also wait for a previous flush to finish. Each gRPC stream
-preserves request and response order. In a cluster, upgrade all event replicas
-before enabling server-side batching because grouped publishes use a new Raft
-log entry. Keep replicas on a version that understands grouped entries while
-those entries can still be replayed.
+For example, set `publish.batchMaxRequests: 32` to let concurrent producers
+share a flush. The environment overrides are `FUTUREQ_PUBLISH_BATCHMAXREQUESTS`,
+`FUTUREQ_PUBLISH_BATCHMAXBYTES`, `FUTUREQ_PUBLISH_BATCHMAXWAIT`,
+`FUTUREQ_PUBLISH_BATCHMAXINFLIGHT`, and `FUTUREQ_PUBLISH_MAXPENDINGREQUESTS`.
+Each gRPC stream preserves request and response order. Upgrade all event replicas
+before resuming clustered publishes. Single and grouped publishes use the same
+Raft command, including when grouping is disabled.
+
 
 ## delivery
 

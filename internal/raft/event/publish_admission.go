@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"maps"
 	"sort"
 
 	"github.com/futureq-io/futureq/internal/storage"
@@ -51,6 +52,7 @@ const (
 	PublishNoDestinations PublishRejectionReason = iota + 1
 	PublishTooManyDestinations
 	PublishTopicNotFound
+	PublishStorageBudgetExceeded
 )
 
 // PublishRejectedError is a business rejection, not an Update failure. Raft
@@ -62,6 +64,8 @@ type PublishRejectedError struct {
 
 func (e *PublishRejectedError) Error() string {
 	switch e.Reason {
+	case PublishStorageBudgetExceeded:
+		return "publish batch exceeds the remaining storage byte budget"
 	case PublishTopicNotFound:
 		return fmt.Sprintf("topic %q does not exist", e.Topic)
 	case PublishTooManyDestinations:
@@ -80,10 +84,17 @@ func CheckPublishResult(result statemachine.Result, expected int) error {
 	if expected > 0 && result.Value == uint64(expected) && len(result.Data) == 0 {
 		return nil
 	}
-	if result.Value == 0 && len(result.Data) > 1 {
+	if result.Value == 0 && len(result.Data) > 0 {
 		reason := PublishRejectionReason(result.Data[0])
-		if reason == PublishNoDestinations || reason == PublishTooManyDestinations || reason == PublishTopicNotFound {
-			return &PublishRejectedError{Reason: reason, Topic: string(result.Data[1:])}
+		switch reason {
+		case PublishStorageBudgetExceeded:
+			if len(result.Data) == 1 {
+				return &PublishRejectedError{Reason: reason}
+			}
+		case PublishNoDestinations, PublishTooManyDestinations, PublishTopicNotFound:
+			if len(result.Data) > 1 {
+				return &PublishRejectedError{Reason: reason, Topic: string(result.Data[1:])}
+			}
 		}
 	}
 	return fmt.Errorf("unexpected publish admission result")
@@ -170,41 +181,73 @@ func (b *DeliveryBatch) subscriptionRecipients(topic string) ([]string, error) {
 // mutations. Later subscription entries cannot change an admitted message's
 // receipt; all messages on a topic share its view at this publish log entry.
 func (b *DeliveryBatch) bindPublishRecipients(items []StoreBatchItem) (statemachine.Result, bool, error) {
+	_, result, err := b.measurePublish(items, false, int(^uint(0)>>1), nil)
+	return result, len(result.Data) == 0 && err == nil, err
+}
+
+// measurePublish binds any unresolved receipts and counts the expanded writes
+// before the client batch can modify storage or advance the last event ID.
+func (b *DeliveryBatch) measurePublish(items []StoreBatchItem, frozen bool, budget int, groupReceipts map[string][]byte) (int, statemachine.Result, error) {
+	var size int
 	receipts := make(map[string][]byte)
 	for i := range items {
-		var message deliverypb.StoredMessageMetadata
-		if err := (proto.UnmarshalOptions{DiscardUnknown: true}).Unmarshal(items[i].Msg, &message); err != nil {
-			return statemachine.Result{}, false, fmt.Errorf("invalid publish message: %w", err)
+		if !frozen {
+			result, err := b.bindPublishItem(&items[i], receipts, groupReceipts)
+			if err != nil || len(result.Data) != 0 {
+				return 0, result, err
+			}
 		}
-		if message.Topic == "" {
-			return statemachine.Result{}, false, fmt.Errorf("publish message lacks topic")
+		itemBytes := PublishItemStorageBytes(items[i])
+		if itemBytes > budget-size {
+			return 0, rejectPublish(PublishStorageBudgetExceeded, ""), nil
 		}
-		receipt, exists := receipts[message.Topic]
-		if !exists {
-			registered, err := b.topicExists(message.Topic)
-			if err != nil {
-				return statemachine.Result{}, false, err
-			}
-			if !registered {
-				return rejectPublish(PublishTopicNotFound, message.Topic), false, nil
-			}
-			names, err := b.subscriptionRecipients(message.Topic)
-			if err != nil {
-				return statemachine.Result{}, false, err
-			}
-			if len(names) == 0 {
-				return rejectPublish(PublishNoDestinations, message.Topic), false, nil
-			}
-			if len(names) > MaxDeliveryRecipients {
-				return rejectPublish(PublishTooManyDestinations, message.Topic), false, nil
-			}
-			receipt, err = MarshalPublishReceipt(0, names)
-			if err != nil {
-				return statemachine.Result{}, false, err
-			}
-			receipts[message.Topic] = receipt
-		}
-		items[i].Receipt = receipt
+		size += itemBytes
 	}
-	return statemachine.Result{}, true, nil
+	// Reuse a topic's receipt across client frames at this log position.
+	// Only admitted receipts are retained, so the cache fits the write budget.
+	if groupReceipts != nil {
+		maps.Copy(groupReceipts, receipts)
+	}
+	return size, statemachine.Result{}, nil
+}
+
+func (b *DeliveryBatch) bindPublishItem(item *StoreBatchItem, receipts, groupReceipts map[string][]byte) (statemachine.Result, error) {
+	var message deliverypb.StoredMessageMetadata
+	if err := (proto.UnmarshalOptions{DiscardUnknown: true}).Unmarshal(item.Msg, &message); err != nil {
+		return statemachine.Result{}, fmt.Errorf("invalid publish message: %w", err)
+	}
+	if message.Topic == "" {
+		return statemachine.Result{}, fmt.Errorf("publish message lacks topic")
+	}
+	if receipt, exists := groupReceipts[message.Topic]; exists {
+		item.Receipt = receipt
+		return statemachine.Result{}, nil
+	}
+	receipt, exists := receipts[message.Topic]
+	if !exists {
+		registered, err := b.topicExists(message.Topic)
+		if err != nil {
+			return statemachine.Result{}, err
+		}
+		if !registered {
+			return rejectPublish(PublishTopicNotFound, message.Topic), nil
+		}
+		names, err := b.subscriptionRecipients(message.Topic)
+		if err != nil {
+			return statemachine.Result{}, err
+		}
+		if len(names) == 0 {
+			return rejectPublish(PublishNoDestinations, message.Topic), nil
+		}
+		if len(names) > MaxDeliveryRecipients {
+			return rejectPublish(PublishTooManyDestinations, message.Topic), nil
+		}
+		receipt, err = MarshalPublishReceipt(0, names)
+		if err != nil {
+			return statemachine.Result{}, err
+		}
+		receipts[message.Topic] = receipt
+	}
+	item.Receipt = receipt
+	return statemachine.Result{}, nil
 }

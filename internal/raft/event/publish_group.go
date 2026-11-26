@@ -6,41 +6,65 @@ import (
 
 	"github.com/futureq-io/futureq/internal/config"
 	"github.com/futureq-io/futureq/internal/storage"
+	"github.com/futureq-io/futureq/pkg/utils"
 	"github.com/futureq-io/stormoar/v4/statemachine"
 )
 
-const PublishGroupFrameOverhead = 4 // uint32 big-endian command length
+const (
+	PublishGroupHeaderSize    = 6 // command tag, frozen-receipt flag, uint32 byte budget
+	PublishGroupFrameOverhead = 4 // uint32 frame length
+)
 
-// MarshalPublishGroupCmd wraps existing commands in order. The command tag is
-// followed by length-prefixed frames. A group cannot mix ACK modes at the caller,
-// and only matching publish command types are allowed in the replicated entry.
-func MarshalPublishGroupCmd(commands [][]byte) ([]byte, error) {
-	if len(commands) < 2 || len(commands) > config.MaxPublishBatchRequests {
-		return nil, fmt.Errorf("invalid publish group count %d", len(commands))
+var publishReceiptKeySize = len(DeliveryStateKey(nil)) + utils.EventKeySize
+
+// PublishItemStorageBytes counts the keys and values written for one message.
+// A shared receipt still occupies space under each individual event key.
+func PublishItemStorageBytes(item StoreBatchItem) int {
+	size := utils.EventKeySize + len(item.Msg) + publishReceiptKeySize + len(item.Receipt)
+	for _, index := range item.Indexes {
+		size += len(index) + utils.EventKeySize
 	}
-	size := 1
-	var kind byte
-	for i, command := range commands {
-		if len(command) == 0 || !isPublishGroupCommand(command[0]) || (i > 0 && command[0] != kind) {
-			return nil, fmt.Errorf("invalid publish group command %d", i)
-		}
-		kind = command[0]
-		if len(command) > config.MaxPublishBatchBytes-size-PublishGroupFrameOverhead {
+	return size
+}
+
+// MarshalPublishGroupCmd encodes every publish, including a single client
+// batch. The leader records the budget so all replicas apply the same limit.
+func MarshalPublishGroupCmd(frames [][]byte, frozen bool, budget int) ([]byte, error) {
+	if len(frames) < 1 || len(frames) > config.MaxPublishBatchRequests {
+		return nil, fmt.Errorf("invalid publish group count %d", len(frames))
+	}
+	if budget < 1 || budget > config.MaxPublishBatchBytes {
+		return nil, fmt.Errorf("invalid publish group budget")
+	}
+	size := PublishGroupHeaderSize
+	for _, frame := range frames {
+		if len(frame) == 0 || len(frame) > budget-size-PublishGroupFrameOverhead {
 			return nil, fmt.Errorf("publish group exceeds byte limit")
 		}
-		size += PublishGroupFrameOverhead + len(command)
+		size += PublishGroupFrameOverhead + len(frame)
 	}
-	group := make([]byte, 1, size)
+	group := make([]byte, PublishGroupHeaderSize, size)
 	group[0] = byte(PublishGroupCmd)
-	for _, cmd := range commands {
-		group = binary.BigEndian.AppendUint32(group, uint32(len(cmd)))
-		group = append(group, cmd...)
+	if frozen {
+		group[1] = 1
+	}
+	binary.BigEndian.PutUint32(group[2:], uint32(budget))
+	for _, frame := range frames {
+		group = binary.BigEndian.AppendUint32(group, uint32(len(frame)))
+		group = append(group, frame...)
 	}
 	return group, nil
 }
 
-func isPublishGroupCommand(kind byte) bool {
-	return CommandType(kind) == PublishBatchCmd || CommandType(kind) == StoreDeliveryBatchCmd
+func publishGroupBudget(cmd []byte) (int, error) {
+	if len(cmd) < PublishGroupHeaderSize || cmd[1] > 1 {
+		return 0, fmt.Errorf("invalid publish group header")
+	}
+	n := binary.BigEndian.Uint32(cmd[2:])
+	if n > config.MaxPublishBatchBytes || uint64(n) < uint64(len(cmd)) {
+		return 0, fmt.Errorf("invalid publish group budget")
+	}
+	return int(n), nil
 }
 
 func readPublishGroupFrame(data []byte) (frame, rest []byte, err error) {
@@ -56,27 +80,43 @@ func readPublishGroupFrame(data []byte) (frame, rest []byte, err error) {
 }
 
 func (s *EventStateMachine) applyPublishGroup(batch storage.Batch, delivery *DeliveryBatch, cmd []byte, lastID uint64) (statemachine.Result, uint64, error) {
-	if len(cmd) > config.MaxPublishBatchBytes {
-		return statemachine.Result{}, 0, fmt.Errorf("publish group exceeds byte limit")
+	remaining, err := publishGroupBudget(cmd)
+	if err != nil {
+		return statemachine.Result{}, 0, err
+	}
+	frozen := cmd[1] == 1
+	var groupReceipts map[string][]byte
+	if !frozen {
+		groupReceipts = make(map[string][]byte)
 	}
 	var grouped statemachine.Result
-	var kind byte
 	var maxID uint64
-	for data := cmd[1:]; len(data) > 0; {
+	for data := cmd[PublishGroupHeaderSize:]; len(data) > 0; {
 		frame, rest, err := readPublishGroupFrame(data)
 		if err != nil {
 			return statemachine.Result{}, 0, err
 		}
-		if grouped.Value >= config.MaxPublishBatchRequests || !isPublishGroupCommand(frame[0]) || (grouped.Value > 0 && frame[0] != kind) {
-			return statemachine.Result{}, 0, fmt.Errorf("invalid publish group command %d", grouped.Value)
+		if grouped.Value >= config.MaxPublishBatchRequests {
+			return statemachine.Result{}, 0, fmt.Errorf("too many publish group frames")
 		}
-		kind = frame[0]
-		result, _, id, err := s.applyEntry(batch, delivery, frame, lastID)
+		items, err := unmarshalPublishFrame(frame, frozen)
+		if err != nil {
+			return statemachine.Result{}, 0, fmt.Errorf("invalid publish group frame %d: %w", grouped.Value, err)
+		}
+		if len(items) == 0 {
+			return statemachine.Result{}, 0, fmt.Errorf("empty publish group frame %d", grouped.Value)
+		}
+		size, result, err := delivery.measurePublish(items, frozen, remaining, groupReceipts)
 		if err != nil {
 			return statemachine.Result{}, 0, err
 		}
-		if id > lastID {
-			lastID, maxID = id, id
+		if len(result.Data) == 0 {
+			result, maxID, err = s.applyStoreItems(batch, delivery, items, lastID)
+			if err != nil {
+				return statemachine.Result{}, 0, err
+			}
+			lastID = maxID
+			remaining -= size
 		}
 		grouped.Value++
 		grouped.Data = binary.BigEndian.AppendUint32(grouped.Data, uint32(8+len(result.Data)))
@@ -84,8 +124,8 @@ func (s *EventStateMachine) applyPublishGroup(batch storage.Batch, delivery *Del
 		grouped.Data = append(grouped.Data, result.Data...)
 		data = rest
 	}
-	if grouped.Value < 2 {
-		return statemachine.Result{}, 0, fmt.Errorf("publish group must contain multiple commands")
+	if grouped.Value == 0 {
+		return statemachine.Result{}, 0, fmt.Errorf("empty publish group")
 	}
 	return grouped, maxID, nil
 }
@@ -93,7 +133,7 @@ func (s *EventStateMachine) applyPublishGroup(batch storage.Batch, delivery *Del
 // UnmarshalPublishGroupResults returns the individual apply results in command
 // order. Validate the entire envelope before a caller acknowledges any request.
 func UnmarshalPublishGroupResults(result statemachine.Result, expected int) ([]statemachine.Result, error) {
-	if expected < 2 || expected > config.MaxPublishBatchRequests || result.Value != uint64(expected) {
+	if expected < 1 || expected > config.MaxPublishBatchRequests || result.Value != uint64(expected) {
 		return nil, fmt.Errorf("unexpected publish group result count")
 	}
 	results := make([]statemachine.Result, 0, expected)

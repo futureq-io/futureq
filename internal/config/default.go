@@ -39,7 +39,8 @@ var defaultConfig = Config{
 		Bolt:   Bolt{File: "./data/futureq.db", Bucket: "futureq"},
 	},
 	Publish: Publish{MinAckLevel: Quorum, ProposalTimeout: 5 * time.Second,
-		BatchMaxRequests: 1, BatchMaxBytes: "1MiB", BatchMaxWait: time.Millisecond},
+		BatchMaxRequests: 1, BatchMaxBytes: "1MiB", BatchMaxWait: time.Millisecond,
+		BatchMaxInFlight: 16, MaxPendingRequests: 256},
 	Delivery: Delivery{
 		ShardDistribution:          metadata.ShardDistributionConsumerCount,
 		HeapType:                   HeapBinary,
@@ -73,3 +74,6 @@ var defaultConfig = Config{
 // DefaultDelivery returns a copy of the built-in delivery settings for direct
 // constructors. Application startup overrides these with the loaded config.
 func DefaultDelivery() Delivery { return defaultConfig.Delivery }
+
+// DefaultPublish returns the broker defaults for publishing.
+func DefaultPublish() Publish { return defaultConfig.Publish }
