@@ -108,7 +108,7 @@ delivery:
   deleteWorkers: 16 # 1..256 concurrent ACK/delete flushes in Raft mode; standalone stays serial
   ackQueueCapacity: 8192 # 1..1048576 unique pending recipient ACKs per broker, including proposals in progress
   receiptCache:
-    maxBytes: 64MiB # Per replica in Raft mode. Use 0B to disable the receipt cache.
+    maxBytes: 64MiB # Per broker in standalone mode or per Raft replica. Use 0B to disable.
     maxEntries: 524288 # Power of two. Slot table memory is additional.
   consumerRemovalWorkers: 1 # 1..16 concurrent Raft consumer membership removals
   ttlSweepInterval: 1m0s

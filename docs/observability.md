@@ -42,8 +42,8 @@ lateness histograms use milliseconds.
 | `delivery_ownership_filtered_total` | counter | — | Event-key observations rejected for having no local owner, in live or speculative preload storage scans. |
 | `delivery_candidates_total` | counter | source (`scan\|preload`) | Due candidates selected for preparation, including retries. Excludes future loads and maintenance. `source="preload"` counts cached candidate hits, not successful deliveries. |
 | `delivery_preload_capacity` | gauge | — | Configured maximum future-message entries on this node. Due work has a separate bounded allowance. Zero when preloading is disabled or the scheduler stops. |
-| `delivery_apply_receipt_lookups_total` | counter | source (`cache`, `pebble`) | Receipt lookups during successful Raft apply, excluding lookups satisfied by the current batch. |
-| `delivery_apply_receipt_cache_entries` | gauge | — | Receipts retained in the Raft apply cache. |
+| `delivery_apply_receipt_lookups_total` | counter | source (`cache`, `pebble`) | Receipt lookups during successful delivery apply in standalone or Raft mode. The `pebble` label counts storage reads on either backend. Reads served by the current batch are excluded. |
+| `delivery_apply_receipt_cache_entries` | gauge | — | Receipts retained in the delivery apply cache. |
 | `delivery_apply_receipt_cache_retained_bytes` | gauge | — | Estimated bytes of retained receipts, excluding the slot table. |
 | `delivery_apply_receipt_cache_evictions_total` | counter | reason (`slot_collision`, `byte_limit`) | A slot replacement evicted a different receipt, or a receipt was evicted to enforce the byte budget. |
 | `delivery_apply_receipt_cache_budget_rejections_total` | counter | — | Receipts individually larger than the entire byte budget. |

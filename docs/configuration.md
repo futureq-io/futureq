@@ -138,8 +138,8 @@ are separate from application storage under `storage.pebble`.
 | `delivery.deleteBatchInterval`      | `500ms` | How often the deleter flushes its batch of keys to delete (one Raft proposal per batch in clustered mode). |
 | `delivery.deleteWorkers`            | `16` | Maximum concurrent ACK/delete flushes in Raft mode (1..256). Pending and in-progress completions share the existing queue bound. Standalone flushes remain serial. |
 | `delivery.ackQueueCapacity`         | `8192` | Maximum unique pending message/recipient ACKs per broker (1..1048576), including in-progress persistence. Full queues reject new ACKs and close the consumer stream for retry. Explicit/TTL delete queue capacity is unchanged. |
-| `delivery.receiptCache.maxBytes`     | `64MiB` | Estimated retained receipt bytes per Raft replica, excluding the slot table. `0B` disables the receipt cache. |
-| `delivery.receiptCache.maxEntries`   | `524288` | Number of receipt slots per Raft replica. Accepts powers of two from 1 through 16,777,216. |
+| `delivery.receiptCache.maxBytes`     | `64MiB` | Estimated retained receipt bytes per standalone broker or Raft replica, excluding the slot table. `0B` disables the receipt cache. |
+| `delivery.receiptCache.maxEntries`   | `524288` | Number of receipt slots per standalone broker or Raft replica. Accepts powers of two from 1 through 16,777,216. |
 | `delivery.subscriptions.renewalWorkers` | `4` | Concurrent session renewal batches (1..16), at most 256 sessions per batch. |
 | `delivery.subscriptions.allowAutoAck` | `false` | Allow workers to request `SubscribeInit.auto_ack`; otherwise reject them with `PermissionDenied` before binding. Manual ACK/NACK streams remain available. |
 | `delivery.subscriptions.disconnectWorkers` | `1` | Concurrent session disconnect batches (1..16), at most 256 sessions per batch. |
@@ -150,13 +150,13 @@ are separate from application storage under `storage.pebble`.
 
 All four intervals and the in-flight timeout must be greater than zero.
 
-Receipt cache settings take effect at broker startup in clustered mode. Set
+Receipt cache settings take effect at broker startup in standalone and clustered modes. Set
 `FUTUREQ_DELIVERY_RECEIPTCACHE_MAXBYTES` and
 `FUTUREQ_DELIVERY_RECEIPTCACHE_MAXENTRIES` for environment overrides. Slot blocks
 allocate on demand and use up to about 20 MiB at the default entry limit on a
 64-bit broker, in addition to the estimated receipt byte budget. The cache
 evicts the oldest admitted receipts to fit new ones within the byte budget.
-Pebble supplies receipts on cache misses and after snapshot recovery.
+Storage supplies receipts on cache misses, after restart, and after Raft snapshot recovery.
 
 To compare delivery heaps, change only `delivery.heapType` between runs, or set
 `FUTUREQ_DELIVERY_HEAPTYPE=8ary`. The heap is local to each broker and does not

@@ -188,20 +188,20 @@ var (
 
 	DeliveryApplyReceiptLookupsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "futureq_delivery_apply_receipt_lookups_total",
-		Help: "Receipt lookups during successful Raft apply, by source: cache or pebble. Excludes reads served by the current batch.",
+		Help: "Receipt lookups during successful delivery apply, by source: cache or pebble. Excludes reads served by the current batch.",
 	}, []string{"source"})
 
 	DeliveryApplyReceiptCacheRetainedBytes = promauto.NewGauge(prometheus.GaugeOpts{
 		Name: "futureq_delivery_apply_receipt_cache_retained_bytes",
-		Help: "Estimated bytes of retained receipts in the Raft apply cache, excluding its slot table.",
+		Help: "Estimated bytes of retained receipts in the delivery apply cache, excluding its slot table.",
 	})
 	DeliveryApplyReceiptCacheEntries = promauto.NewGauge(prometheus.GaugeOpts{
 		Name: "futureq_delivery_apply_receipt_cache_entries",
-		Help: "Number of receipts retained in the Raft apply cache.",
+		Help: "Number of receipts retained in the delivery apply cache.",
 	})
 	DeliveryApplyReceiptCacheEvictionsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "futureq_delivery_apply_receipt_cache_evictions_total",
-		Help: "Receipts evicted from the Raft apply cache by slot collision or byte limit.",
+		Help: "Receipts evicted from the delivery apply cache by slot collision or byte limit.",
 	}, []string{"reason"})
 	DeliveryApplyReceiptCacheBudgetRejectionsTotal = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "futureq_delivery_apply_receipt_cache_budget_rejections_total",

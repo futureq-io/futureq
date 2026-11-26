@@ -22,6 +22,8 @@ type DeliveryLedger struct {
 	backend    DeleteBackend
 	mu         sync.Mutex // serializes standalone prepare/ACK/explicit delete
 	OnDelete   func([][]byte)
+	// Installed before Run in standalone mode, shared with publishing.
+	StandaloneReceipts *raft.StandaloneReceiptCache
 	// Installed before Run; allows a bounded preparation job to cancel its
 	// Raft wait without changing the asynchronous ACK retry path.
 	ProposeContext func(context.Context, []byte) (statemachine.Result, error)
@@ -240,7 +242,12 @@ func (l *DeliveryLedger) applyLocal(mode storage.SyncMode, apply func(*raft.Deli
 	batch := l.db.NewBatch()
 	defer batch.Close() //nolint:errcheck
 	applyStarted := time.Now()
-	delivery := raft.NewDeliveryBatch(l.db, batch)
+	var delivery *raft.DeliveryBatch
+	if l.StandaloneReceipts != nil {
+		delivery = l.StandaloneReceipts.NewBatch(l.db, batch)
+	} else {
+		delivery = raft.NewDeliveryBatch(l.db, batch)
+	}
 	deleted, err := apply(delivery)
 	if err == nil {
 		err = delivery.Flush()
@@ -258,6 +265,9 @@ func (l *DeliveryLedger) applyLocal(mode storage.SyncMode, apply func(*raft.Deli
 	if commitErr != nil {
 		return commitErr
 	}
+	if l.StandaloneReceipts != nil {
+		l.StandaloneReceipts.CommitBatch(delivery)
+	}
 	if len(deleted) > 0 && l.OnDelete != nil {
 		l.OnDelete(deleted)
 	}
@@ -272,7 +282,30 @@ func (l *DeliveryLedger) DeleteKeys(keys [][]byte) error {
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return l.backend.DeleteKeys(keys)
+	if err := l.backend.DeleteKeys(keys); err != nil {
+		return err
+	}
+	if l.StandaloneReceipts != nil {
+		l.StandaloneReceipts.Delete(keys)
+	}
+	return nil
+}
+
+// CommitStandalonePublish uses the normal sync commit outside the ledger lock.
+func (l *DeliveryLedger) CommitStandalonePublish(batch storage.Batch, states map[string]*raft.DeliveryState) error {
+	if l.StandaloneReceipts == nil || len(states) == 0 {
+		return batch.Commit(storage.Sync)
+	}
+	l.mu.Lock()
+	l.StandaloneReceipts.BeginPublish(states)
+	l.mu.Unlock()
+
+	err := batch.Commit(storage.Sync)
+
+	l.mu.Lock()
+	l.StandaloneReceipts.FinishPublish(states, err == nil)
+	l.mu.Unlock()
+	return err
 }
 
 // ApplySubscription shares the standalone receipt lock with ACK and deletion.
