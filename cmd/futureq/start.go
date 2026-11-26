@@ -130,6 +130,7 @@ func startRun(cmd *cobra.Command, _ []string) {
 
 	ledger := dispatcher.NewDeliveryLedger(a.DB, recipients, deleteBackend, proposeDelivery)
 	if cfg.Cluster.Enabled {
+		ledger.SetRetryOwner(cfg.Cluster.NodeID)
 		ledger.ProposeContext = func(ctx context.Context, cmd []byte) (statemachine.Result, error) {
 			return a.NodeHost.SyncPropose(ctx, a.NodeHost.GetNoOPSession(cfg.Cluster.ShardID), cmd)
 		}
@@ -138,6 +139,7 @@ func startRun(cmd *cobra.Command, _ []string) {
 	}
 	deleter := dispatcher.NewDeleter(ledger, deleteInterval, logger)
 	deleter.AckQueueCapacity = cfg.Delivery.AckQueueCapacity
+	ledger.ConfigureRetryOutcomes(cfg.Delivery.AckQueueCapacity)
 	if cfg.Cluster.Enabled {
 		// Overlap consensus waits without releasing tracking before commit
 		// or accumulating unbounded proposal goroutines during quorum loss.
@@ -256,6 +258,19 @@ func startRun(cmd *cobra.Command, _ []string) {
 		defer a.ComponentShutdownDone()
 		ledger.RunRetryExpiry(a.Ctx, dispatchInterval, a.Subscriptions.IsLeader, logger)
 	}()
+
+	a.RegisterComponentWithShutdown()
+	go func() {
+		defer a.ComponentShutdownDone()
+		ledger.RunRetryOutcomes(a.Ctx, max(2, deleter.MaxConcurrentFlushes), logger)
+	}()
+	if cfg.Cluster.Enabled {
+		a.RegisterComponentWithShutdown()
+		go func() {
+			defer a.ComponentShutdownDone()
+			ledger.RunRetryOwner(a.Ctx, logger)
+		}()
+	}
 
 	// ── gRPC server ───────────────────────────────────────────────────────────
 	grpcserver.New(cfg.API.GRPC, hub, deleter, logger, ledger).

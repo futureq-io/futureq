@@ -52,6 +52,9 @@ maximum is 256.
 - `max_retries` counts redeliveries independently for each durable subscription.
   Omit it for unlimited retries. Set it to `0` for one attempt or `3` for up to
   four attempts. Exhausted deliveries are retained in the topic's dead-letter queue.
+- A batch fails with `ResourceExhausted` if any message would exceed the
+  broker's configured gRPC send limit as a delivery frame. The size check
+  includes the largest attempt number and the full delivery tag.
 - Each accepted batch receives one `PublishBatchAck`. A rejected batch writes no
   messages and closes the stream with a gRPC error.
 - An empty batch returns a default (unsuccessful) ack and performs no write.
@@ -133,12 +136,12 @@ cause duplicates.
 
 ## Dead-letter queue
 
-`futureq.FutureQDeadLetter` provides three unary RPCs for retained failures.
+`futureq.FutureQDeadLetter` provides three RPCs for retained failures.
 
 | RPC | Request and result |
 | --- | --- |
-| `ListDeadLetters` | Provide a topic and optional page size and token. Returns summaries ordered by storage key, with a token when more records are available. The default is 100 summaries, the maximum is 256, and the response may end earlier at its byte budget. |
-| `GetDeadLetter` | Provide the topic and an opaque ID from the list. Returns the summary and original publish fields, including payload and indexes. A missing record returns `NotFound`. |
+| `ListDeadLetters` | Provide a topic and optional page size and token. Returns summaries ordered by storage key, with a token when more records are available. The default is 100 summaries and the maximum is 256. Each page, including its token, fits the configured gRPC send limit. |
+| `GetDeadLetter` | Provide the topic and an opaque ID from the list. Concatenate the streamed chunk bytes and decode them as a `DeadLetter` with the summary and original publish fields. A missing record returns `NotFound`. |
 | `DeleteDeadLetter` | Provide the topic and ID. Deletion is idempotent. |
 
 A summary identifies the failed subscription and generation, attempt count,

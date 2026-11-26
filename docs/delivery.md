@@ -131,17 +131,21 @@ Consumer registration and rebalance activation retain their completion checks.
 
 ## Retry limits and dead letters
 
-For a publish with `max_retries`, the broker commits a recipient-specific
-attempt before sending. Its lease uses `delivery.inFlightTimeout`. Time in the
-buffered sender queue does not consume a retry. If the broker loses the worker,
-cannot complete the send, or receives no acknowledgement by the deadline, the
-attempt can expire. A crash between committing the attempt and sending can
-also consume it. Each attempt has a distinct tag, so a delayed ACK or NACK
-cannot settle a later attempt. ACK and NACK outcomes for these deliveries
-are also committed before the broker releases the local reservation.
+For a publish with `max_retries`, the broker reserves a recipient-specific
+attempt and durably charges it before calling gRPC Send. Its deadline uses
+`delivery.inFlightTimeout`. An uncharged reservation can expire and reuse
+its attempt number. A charged attempt retains its number through transport
+stalls, failures, and broker crashes. Each attempt has a distinct tag, so a
+delayed ACK or NACK cannot settle a later attempt.
 
-A bounded deadline scan on the event-shard leader (or on the standalone broker)
-resolves expired attempts, including after restart or failover and when no
+The broker queues outcomes for asynchronous persistence and releases local
+tracking after commit. While a broker owns an attempt, outcomes it accepts
+into that queue take precedence over expiry. Clustered brokers renew a
+15-second Raft lease to keep ownership. If the owner crashes or loses its
+lease, the leader can recover expired attempts and any outcomes that failed
+to commit can be lost.
+
+Deadline scans drain expired attempts in bounded batches, including when no
 workers are connected. A final NACK or timeout atomically archives the payload
 and marks that subscription's delivery complete. Other subscriptions keep
 their independent retry budgets. Message TTL and unsubscribing can discard

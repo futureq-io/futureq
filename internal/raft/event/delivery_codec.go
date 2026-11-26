@@ -61,6 +61,7 @@ func receiptState(p *deliverypb.DeliveryReceipt) (*DeliveryState, error) {
 	for i, attempt := range p.Attempts {
 		if i >= uint32(len(p.Recipients)) || p.Acknowledged[i/8]&(1<<uint(i%8)) != 0 ||
 			attempt.GetNumber() == 0 || (len(attempt.GetToken()) != 0 && len(attempt.GetToken()) != AttemptTokenSize) ||
+			(len(attempt.GetOwner()) != 0 && (len(attempt.GetOwner()) != RetryOwnerSize || len(attempt.GetToken()) == 0)) ||
 			(len(attempt.GetToken()) == 0 && attempt.GetDeadlineMs() != 0) ||
 			(len(attempt.GetToken()) == AttemptTokenSize && attempt.GetDeadlineMs() <= 0) {
 			return nil, fmt.Errorf("invalid receipt attempt")

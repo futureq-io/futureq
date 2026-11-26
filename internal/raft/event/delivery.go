@@ -163,6 +163,7 @@ type DeliveryBatch struct {
 	receiptMisses      int
 	archiveRefs        map[string]uint32
 	archiveEntries     map[string]bool
+	retryOwners        map[uint64]retryOwnerLease
 }
 
 func NewDeliveryBatch(db storage.DB, batch storage.Batch) *DeliveryBatch {

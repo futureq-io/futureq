@@ -12,8 +12,11 @@ import (
 	pb "github.com/futureq-io/protocol/proto/go"
 	deliverypb "github.com/futureq-io/protocol/proto/go/delivery"
 	storagepb "github.com/futureq-io/protocol/proto/go/storage"
+	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/proto"
 )
+
+var ErrDeadLetterPageTooSmall = errors.New("gRPC send limit cannot fit one dead letter summary and its page token")
 
 const (
 	deadLetterEntries   = "metadata/dead-letter/entries/"
@@ -158,10 +161,11 @@ func (b *DeliveryBatch) deleteDeadLetter(topic string, id []byte) error {
 }
 
 type DeadLetterQuery struct {
-	Topic string
-	ID    []byte // exact lookup when set
-	After []byte // exclusive cursor when listing
-	Limit int
+	Topic    string
+	ID       []byte // exact lookup when set
+	After    []byte // exclusive cursor when listing
+	Limit    int
+	MaxBytes int
 }
 
 type DeadLetterResult struct {
@@ -238,19 +242,35 @@ func (q DeadLetterQuery) list(db storage.DB) (*pb.ListDeadLettersResponse, error
 	}
 	defer iter.Close() //nolint:errcheck
 	page := new(pb.ListDeadLettersResponse)
+	budget := deadLetterPageBytes
+	if q.MaxBytes > 0 {
+		budget = min(budget, q.MaxBytes)
+	}
 	var size int
-	for ok := iter.First(); ok; ok = iter.Next() {
-		value := iter.Value()
-		if len(page.Entries) == q.Limit || (len(page.Entries) > 0 && size+len(value) > deadLetterPageBytes) {
+	for ok := iter.First(); ok; {
+		summary := new(pb.DeadLetterSummary)
+		if err := deliveryUnmarshal.Unmarshal(iter.Value(), summary); err != nil {
+			return nil, err
+		}
+		ok = iter.Next()
+		entrySize := protowire.SizeTag(1) + protowire.SizeBytes(proto.Size(summary))
+		tokenSize := 0
+		if ok {
+			tokenSize = protowire.SizeTag(2) + protowire.SizeBytes(len(summary.Id))
+		}
+		if size+entrySize+tokenSize > budget {
+			if len(page.Entries) == 0 {
+				return nil, ErrDeadLetterPageTooSmall
+			}
 			page.NextPageToken = page.Entries[len(page.Entries)-1].Id
 			break
 		}
-		summary := new(pb.DeadLetterSummary)
-		if err := deliveryUnmarshal.Unmarshal(value, summary); err != nil {
-			return nil, err
-		}
 		page.Entries = append(page.Entries, summary)
-		size += len(value) + 8
+		size += entrySize
+		if ok && len(page.Entries) == q.Limit {
+			page.NextPageToken = summary.Id
+			break
+		}
 	}
 	return page, iter.Error()
 }

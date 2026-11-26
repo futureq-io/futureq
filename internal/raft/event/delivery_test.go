@@ -87,6 +87,7 @@ func (s *DeliveryRetrySuite) TestTimeoutAndStaleOutcomesAfterSnapshotRecovery() 
 	results := s.apply(s.retry(deliverypb.RetryCommand_START, 100, first), s.retry(deliverypb.RetryCommand_START, 100, rival))
 	s.Equal(uint64(1), results[0].Result.Value)
 	s.Zero(results[1].Result.Value)
+	s.apply(s.retry(deliverypb.RetryCommand_SENT, 100, s.attempt(key, "g:worker", 1, 0)))
 	snapshot, err := s.sm.PrepareSnapshot()
 	s.Require().NoError(err)
 	var encoded bytes.Buffer
@@ -104,6 +105,7 @@ func (s *DeliveryRetrySuite) TestTimeoutAndStaleOutcomesAfterSnapshotRecovery() 
 
 	second := s.attempt(key, "g:worker", 3, 120)
 	s.Equal(uint64(2), s.apply(s.retry(deliverypb.RetryCommand_START, 111, second))[0].Result.Value)
+	s.apply(s.retry(deliverypb.RetryCommand_SENT, 111, s.attempt(key, "g:worker", 3, 0)))
 	stale := s.attempt(key, "g:worker", 1, 0)
 	s.apply(s.retry(deliverypb.RetryCommand_ACK, 112, stale), expire)
 	receipt, err := ReadDeliveryState(s.db, key)
@@ -140,6 +142,7 @@ func (s *DeliveryRetrySuite) TestFanoutArchivesSharePayloadAndDeleteIndependentl
 	audit := s.attempt(key, "u:audit", 2, 120)
 	s.apply(s.retry(deliverypb.RetryCommand_START, 105, worker), s.retry(deliverypb.RetryCommand_START, 105, audit))
 	worker.DeadlineMs, audit.DeadlineMs = 0, 0
+	s.apply(s.retry(deliverypb.RetryCommand_SENT, 105, worker), s.retry(deliverypb.RetryCommand_SENT, 105, audit))
 	results := s.apply(s.retry(deliverypb.RetryCommand_NACK, 110, worker), s.retry(deliverypb.RetryCommand_NACK, 111, audit))
 	s.Equal(uint64(1), results[0].Result.Value)
 	s.Equal(uint64(1), results[1].Result.Value)
@@ -183,6 +186,7 @@ func (s *DeliveryRetrySuite) TestTTLAndUnlimitedMessagesDoNotArchive() {
 	)
 	s.Zero(results[0].Result.Value)
 	s.Equal(uint64(1), results[1].Result.Value)
+	s.apply(s.retry(deliverypb.RetryCommand_SENT, 102, s.attempt(expiring, "g:worker", 2, 0)))
 	due, err := DueDeliveryAttempts(s.db, 110)
 	s.Require().NoError(err)
 	s.Require().Len(due, 1)
@@ -190,6 +194,52 @@ func (s *DeliveryRetrySuite) TestTTLAndUnlimitedMessagesDoNotArchive() {
 	page, err := (DeadLetterQuery{Topic: "orders", Limit: 2}).Read(s.db)
 	s.Require().NoError(err)
 	s.Empty(page.Page.Entries)
+}
+
+func (s *DeliveryRetrySuite) TestExpiredReservationPreservesTheFirstAttempt() {
+	key := s.store(&storagepb.StoredMessage{Topic: "orders", EnqueuedAtUnixMs: 100, MaxRetries: new(uint32(0))}, "g:worker")
+	first := s.attempt(key, "g:worker", 1, 110)
+	s.Require().Equal(uint64(1), s.apply(s.retry(deliverypb.RetryCommand_START, 100, first))[0].Result.Value)
+	s.Zero(s.apply(s.retry(deliverypb.RetryCommand_EXPIRE, 110, first))[0].Result.Value)
+	receipt, err := ReadDeliveryState(s.db, key)
+	s.Require().NoError(err)
+	s.True(receipt.Ready("g:worker"))
+	second := s.attempt(key, "g:worker", 2, 120)
+	s.Equal(uint64(1), s.apply(s.retry(deliverypb.RetryCommand_START, 111, second))[0].Result.Value)
+	commands := s.apply(
+		s.retry(deliverypb.RetryCommand_SENT, 101, s.attempt(key, "g:worker", 1, 0)),
+		s.retry(deliverypb.RetryCommand_SENT, 111, s.attempt(key, "g:worker", 2, 0)),
+	)
+	s.Zero(commands[0].Result.Value, "a stalled authorization cannot expose an expired reservation")
+	s.Equal(uint64(1), commands[1].Result.Value)
+	s.Equal(uint64(1), s.apply(s.retry(deliverypb.RetryCommand_EXPIRE, 120, second))[0].Result.Value)
+}
+
+func (s *DeliveryRetrySuite) TestForeignExpiryWaitsForOwnerLease() {
+	key := s.store(&storagepb.StoredMessage{Topic: "orders", EnqueuedAtUnixMs: 100, MaxRetries: new(uint32(0))}, "g:worker")
+	owner := bytes.Repeat([]byte{2}, RetryOwnerSize)
+	foreign := bytes.Repeat([]byte{3}, RetryOwnerSize)
+	marshal := func(cmd *deliverypb.RetryCommand) []byte {
+		data, err := MarshalRetryCommand(cmd)
+		s.Require().NoError(err)
+		return data
+	}
+	target := s.attempt(key, "g:worker", 1, 110)
+	authorize := s.attempt(key, "g:worker", 1, 0)
+	results := s.apply(
+		marshal(&deliverypb.RetryCommand{Operation: deliverypb.RetryCommand_RENEW_OWNER, Owner: owner, NowMs: 100, LeaseUntilMs: 150}),
+		marshal(&deliverypb.RetryCommand{Operation: deliverypb.RetryCommand_START, Owner: owner, NowMs: 100, Attempts: []*deliverypb.DeliveryAttemptTarget{target}}),
+		marshal(&deliverypb.RetryCommand{Operation: deliverypb.RetryCommand_SENT, Owner: owner, NowMs: 101, Attempts: []*deliverypb.DeliveryAttemptTarget{authorize}}),
+	)
+	s.Require().Equal(uint64(1), results[2].Result.Value)
+	expire := &deliverypb.RetryCommand{Operation: deliverypb.RetryCommand_EXPIRE, Owner: foreign, NowMs: 110, Attempts: []*deliverypb.DeliveryAttemptTarget{target}}
+	s.Zero(s.apply(marshal(expire))[0].Result.Value)
+	due, err := DueDeliveryAttempts(s.db, 110)
+	s.Require().NoError(err)
+	s.Require().Len(due, 1)
+	s.Equal(owner, due[0].GetOwner())
+	expire.NowMs = 150
+	s.Equal(uint64(1), s.apply(marshal(expire))[0].Result.Value)
 }
 
 func TestDeliveryReceiptsSurviveSnapshotAndAckBatch(t *testing.T) {

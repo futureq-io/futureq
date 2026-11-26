@@ -33,11 +33,12 @@ func New(
 	ledger *dispatcher.DeliveryLedger,
 ) *Server {
 	log := logger.Named("grpc_server")
+	maxSendBytes := int(mustSize(cfg.MaxSendMessageSize))
 
 	srv := grpc.NewServer(
 		grpc.MaxConcurrentStreams(cfg.MaxConcurrentStreams),
 		grpc.MaxRecvMsgSize(int(mustSize(cfg.MaxReceiveMessageSize))),
-		grpc.MaxSendMsgSize(int(mustSize(cfg.MaxSendMessageSize))),
+		grpc.MaxSendMsgSize(maxSendBytes),
 
 		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
 			MinTime:             5 * time.Second,
@@ -61,8 +62,11 @@ func New(
 	pb.RegisterFutureQProducerServer(srv, producer)
 	consumer := handlers.NewConsumerHandler(log, hub, deleter)
 	consumer.RetryLedger = ledger
+	consumer.MaxSendBytes = maxSendBytes
 	pb.RegisterFutureQConsumerServer(srv, consumer)
-	pb.RegisterFutureQDeadLetterServer(srv, &handlers.DeadLetterHandler{Ledger: ledger})
+	pb.RegisterFutureQDeadLetterServer(srv, &handlers.DeadLetterHandler{
+		Ledger: ledger, MaxSendBytes: maxSendBytes,
+	})
 	pb.RegisterFutureQTopicServer(srv, &handlers.TopicHandler{})
 	pb.RegisterFutureQClusterServer(srv, handlers.NewClusterHandler(log))
 

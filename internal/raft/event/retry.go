@@ -50,10 +50,25 @@ func validateRetryCommand(cmd *deliverypb.RetryCommand) error {
 		}
 		return ValidateDeadLetterID(cmd.GetTopic(), cmd.GetDeadLetterId())
 	}
-	if op < deliverypb.RetryCommand_START || op > deliverypb.RetryCommand_EXPIRE || cmd.GetNowMs() <= 0 ||
+	if op == deliverypb.RetryCommand_RENEW_OWNER {
+		if len(cmd.GetOwner()) != RetryOwnerSize || cmd.GetNowMs() <= 0 ||
+			cmd.GetLeaseUntilMs() <= cmd.GetNowMs() || len(cmd.GetAttempts()) != 0 ||
+			cmd.GetTopic() != "" || len(cmd.GetDeadLetterId()) != 0 {
+			return fmt.Errorf("invalid retry owner renewal")
+		}
+		return nil
+	}
+	switch op {
+	case deliverypb.RetryCommand_START, deliverypb.RetryCommand_SENT, deliverypb.RetryCommand_ACK,
+		deliverypb.RetryCommand_NACK, deliverypb.RetryCommand_EXPIRE, deliverypb.RetryCommand_CANCEL_RESERVATION:
+	default:
+		return fmt.Errorf("invalid retry operation")
+	}
+	if cmd.GetNowMs() <= 0 ||
 		len(cmd.GetAttempts()) == 0 || len(cmd.GetAttempts()) > maxRetryExpiryBatch ||
 		(op != deliverypb.RetryCommand_EXPIRE && len(cmd.GetAttempts()) != 1) ||
-		cmd.GetTopic() != "" || len(cmd.GetDeadLetterId()) != 0 {
+		cmd.GetTopic() != "" || len(cmd.GetDeadLetterId()) != 0 || cmd.GetLeaseUntilMs() != 0 ||
+		(len(cmd.GetOwner()) != 0 && len(cmd.GetOwner()) != RetryOwnerSize) {
 		return fmt.Errorf("invalid retry command")
 	}
 	for _, attempt := range cmd.GetAttempts() {
@@ -94,12 +109,23 @@ func retryExpiryKey(target *deliverypb.DeliveryAttemptTarget) []byte {
 // DueDeliveryAttempts scans only the due portion of the durable deadline index.
 // The proposal rechecks each token against the receipt, including after failover.
 func DueDeliveryAttempts(db storage.DB, nowMs int64) ([]*deliverypb.DeliveryAttemptTarget, error) {
+	attempts, _, err := ScanDueDeliveryAttempts(db, nowMs, nil)
+	return attempts, err
+}
+
+// ScanDueDeliveryAttempts scans a bounded page. The cursor skips live owners
+// and queued outcomes without preventing later deadlines from progressing.
+func ScanDueDeliveryAttempts(db storage.DB, nowMs int64, after []byte) ([]*deliverypb.DeliveryAttemptTarget, []byte, error) {
+	lower := []byte(retryExpiryPrefix)
+	if len(after) > 0 {
+		lower = append(bytes.Clone(after), 0)
+	}
 	iter, err := db.NewIter(&storage.IterOptions{
-		LowerBound: []byte(retryExpiryPrefix),
+		LowerBound: lower,
 		UpperBound: binary.BigEndian.AppendUint64([]byte(retryExpiryPrefix), uint64(nowMs)+1),
 	})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer iter.Close() //nolint:errcheck
 	var due []*deliverypb.DeliveryAttemptTarget
@@ -108,19 +134,24 @@ func DueDeliveryAttempts(db storage.DB, nowMs int64) ([]*deliverypb.DeliveryAtte
 		const tokenStart = 8 + utils.EventKeySize
 		const recipientStart = tokenStart + AttemptTokenSize
 		if len(data) <= recipientStart || !validRetryRecipient(string(data[recipientStart:])) {
-			return nil, fmt.Errorf("invalid retry deadline index")
+			return nil, nil, fmt.Errorf("invalid retry deadline index")
 		}
-		due = append(due, &deliverypb.DeliveryAttemptTarget{
+		target := &deliverypb.DeliveryAttemptTarget{
 			DeadlineMs: int64(binary.BigEndian.Uint64(data)),
 			Key:        bytes.Clone(data[8:tokenStart]),
 			Token:      bytes.Clone(data[tokenStart:recipientStart]),
 			Recipient:  string(data[recipientStart:]),
-		})
+		}
+		target.Owner = bytes.Clone(iter.Value())
+		if len(target.Owner) != 0 && len(target.Owner) != RetryOwnerSize {
+			return nil, nil, fmt.Errorf("invalid owner in retry deadline index")
+		}
+		due = append(due, target)
 		if len(due) == maxRetryExpiryBatch {
-			break
+			return due, bytes.Clone(iter.Key()), iter.Error()
 		}
 	}
-	return due, iter.Error()
+	return due, nil, iter.Error()
 }
 
 func (b *DeliveryBatch) ApplyRetry(data []byte) (statemachine.Result, [][]byte, error) {
@@ -138,9 +169,13 @@ func (b *DeliveryBatch) ApplyRetry(data []byte) (statemachine.Result, [][]byte, 
 	if cmd.Operation == deliverypb.RetryCommand_DELETE_DEAD_LETTER {
 		return result, nil, b.deleteDeadLetter(cmd.Topic, cmd.DeadLetterId)
 	}
+	if cmd.Operation == deliverypb.RetryCommand_RENEW_OWNER {
+		until, err := b.renewRetryOwner(&cmd)
+		return statemachine.Result{Value: uint64(until)}, nil, err
+	}
 	var deleted [][]byte
 	for _, target := range cmd.Attempts {
-		value, removed, err := b.applyAttempt(cmd.Operation, cmd.NowMs, target)
+		value, removed, err := b.applyAttempt(cmd.Operation, cmd.NowMs, cmd.Owner, target)
 		if err != nil {
 			return result, nil, err
 		}
@@ -152,37 +187,81 @@ func (b *DeliveryBatch) ApplyRetry(data []byte) (statemachine.Result, [][]byte, 
 	return result, deleted, nil
 }
 
-func (b *DeliveryBatch) applyAttempt(op deliverypb.RetryCommand_Operation, nowMs int64, target *deliverypb.DeliveryAttemptTarget) (uint64, bool, error) {
-	if op == deliverypb.RetryCommand_EXPIRE {
-		// A TTL delete or subscription cleanup can leave an obsolete deadline.
-		// Delete that exact index entry even when the receipt or token is gone.
-		if err := b.batch.Delete(retryExpiryKey(target)); err != nil {
-			return 0, false, err
-		}
-	}
+func (b *DeliveryBatch) applyAttempt(op deliverypb.RetryCommand_Operation, nowMs int64, owner []byte, target *deliverypb.DeliveryAttemptTarget) (uint64, bool, error) {
 	state, err := b.load(target.Key)
 	if err != nil || !state.Needs(target.Recipient) {
+		if err == nil && op == deliverypb.RetryCommand_EXPIRE {
+			err = b.batch.Delete(retryExpiryKey(target))
+		}
 		return 0, false, err
 	}
 	i := uint32(sort.SearchStrings(state.Recipients, target.Recipient))
 	previous := state.attempts[i]
 	if op == deliverypb.RetryCommand_START {
-		return b.startAttempt(state, i, previous, nowMs, target)
+		return b.startAttempt(state, i, previous, nowMs, owner, target)
 	}
 	if !bytes.Equal(previous.GetToken(), target.Token) ||
 		(op == deliverypb.RetryCommand_EXPIRE && previous.GetDeadlineMs() != target.DeadlineMs) {
+		if op == deliverypb.RetryCommand_EXPIRE {
+			return 0, false, b.batch.Delete(retryExpiryKey(target))
+		}
 		return 0, false, nil
 	}
-	if op != deliverypb.RetryCommand_EXPIRE {
-		deadline := &deliverypb.DeliveryAttemptTarget{
-			Key: target.Key, Token: target.Token, Recipient: target.Recipient, DeadlineMs: previous.DeadlineMs,
+	if op == deliverypb.RetryCommand_EXPIRE {
+		if !bytes.Equal(previous.Owner, owner) {
+			live, err := b.retryOwnerLive(previous.Owner, nowMs)
+			if err != nil || live {
+				return 0, false, err
+			}
 		}
-		if err := b.batch.Delete(retryExpiryKey(deadline)); err != nil {
-			return 0, false, err
+	} else if !bytes.Equal(previous.Owner, owner) {
+		return 0, false, nil
+	}
+	if op == deliverypb.RetryCommand_SENT {
+		if nowMs >= previous.DeadlineMs {
+			return 0, false, nil
 		}
+		if len(owner) != 0 {
+			live, err := b.retryOwnerLive(owner, nowMs)
+			if err != nil || !live {
+				return 0, false, err
+			}
+		}
+		if previous.Reserved {
+			state.attempts[i] = &deliverypb.DeliveryAttempt{
+				Number: previous.Number, Token: previous.Token, DeadlineMs: previous.DeadlineMs, Owner: previous.Owner,
+			}
+			b.save(target.Key, state)
+		}
+		return 1, false, nil
+	}
+	if op == deliverypb.RetryCommand_CANCEL_RESERVATION && !previous.Reserved {
+		return 0, false, nil
+	}
+	if previous.Reserved && (op == deliverypb.RetryCommand_ACK || op == deliverypb.RetryCommand_NACK) {
+		return 0, false, nil
+	}
+	deadline := &deliverypb.DeliveryAttemptTarget{
+		Key: target.Key, Token: target.Token, Recipient: target.Recipient, DeadlineMs: previous.DeadlineMs,
+	}
+	if err := b.batch.Delete(retryExpiryKey(deadline)); err != nil {
+		return 0, false, err
 	}
 	if op == deliverypb.RetryCommand_ACK {
 		return b.completeAttempt(state, target, 0)
+	}
+	if previous.Reserved && (op == deliverypb.RetryCommand_EXPIRE || op == deliverypb.RetryCommand_CANCEL_RESERVATION) {
+		// The sender cannot expose the attempt without committed authorization.
+		if previous.Number == 1 {
+			delete(state.attempts, i)
+			if len(state.attempts) == 0 {
+				state.attempts = nil
+			}
+		} else {
+			state.attempts[i] = &deliverypb.DeliveryAttempt{Number: previous.Number - 1}
+		}
+		b.save(target.Key, state)
+		return 0, false, nil
 	}
 	message, err := b.retryMessage(target.Key, nowMs)
 	if err != nil {
@@ -207,9 +286,15 @@ func (b *DeliveryBatch) applyAttempt(op deliverypb.RetryCommand_Operation, nowMs
 	return b.completeAttempt(state, target, archived)
 }
 
-func (b *DeliveryBatch) startAttempt(state *DeliveryState, i uint32, previous *deliverypb.DeliveryAttempt, nowMs int64, target *deliverypb.DeliveryAttemptTarget) (uint64, bool, error) {
+func (b *DeliveryBatch) startAttempt(state *DeliveryState, i uint32, previous *deliverypb.DeliveryAttempt, nowMs int64, owner []byte, target *deliverypb.DeliveryAttemptTarget) (uint64, bool, error) {
 	if len(previous.GetToken()) != 0 {
 		return 0, false, nil
+	}
+	if len(owner) != 0 {
+		live, err := b.retryOwnerLive(owner, nowMs)
+		if err != nil || !live {
+			return 0, false, err
+		}
 	}
 	message, err := b.retryMessage(target.Key, nowMs)
 	if err != nil || message == nil || message.MaxRetries == nil || previous.GetNumber() > uint64(message.GetMaxRetries()) {
@@ -221,14 +306,16 @@ func (b *DeliveryBatch) startAttempt(state *DeliveryState, i uint32, previous *d
 			return 0, false, err
 		}
 	}
-	if err := b.batch.Set(retryExpiryKey(target), nil); err != nil {
+	if err := b.batch.Set(retryExpiryKey(target), owner); err != nil {
 		return 0, false, err
 	}
 	number := previous.GetNumber() + 1
 	if state.attempts == nil {
 		state.attempts = make(map[uint32]*deliverypb.DeliveryAttempt)
 	}
-	state.attempts[i] = &deliverypb.DeliveryAttempt{Number: number, Token: target.Token, DeadlineMs: target.DeadlineMs}
+	state.attempts[i] = &deliverypb.DeliveryAttempt{
+		Number: number, Token: target.Token, DeadlineMs: target.DeadlineMs, Reserved: true, Owner: owner,
+	}
 	b.save(target.Key, state)
 	return number, false, nil
 }

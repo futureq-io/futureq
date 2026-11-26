@@ -13,6 +13,7 @@ import (
 	raft "github.com/futureq-io/futureq/internal/raft/event"
 	"github.com/futureq-io/futureq/internal/storage"
 	pb "github.com/futureq-io/protocol/proto/go"
+	deliverypb "github.com/futureq-io/protocol/proto/go/delivery"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 	"go.uber.org/zap"
@@ -21,12 +22,79 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
+	"google.golang.org/protobuf/proto"
 )
 
 type DeadLetterDeliverySuite struct{ suite.Suite }
 
 func TestDeadLetterDeliverySuite(t *testing.T) {
 	suite.Run(t, new(DeadLetterDeliverySuite))
+}
+
+func (s *DeadLetterDeliverySuite) TestListDeadLettersUsesConfiguredFrameBudget() {
+	a, _, producer, _ := openPublishTest(s.T(), "pebble")
+	const limit = 16 << 10
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	group := strings.Repeat("w", 3600)
+	subscription, err := a.Subscriptions.Create(ctx, "orders", group, "")
+	s.Require().NoError(err)
+	for range 5 {
+		ack, err := producer.processBatch(ctx, &pb.PublishBatch{Messages: []*pb.PublishMessage{{
+			Topic: "orders", MaxRetries: new(uint32(0)),
+		}}})
+		s.Require().NoError(err)
+		s.Require().True(ack.GetSuccess())
+	}
+	ledger := dispatcher.NewDeliveryLedger(a.DB, nil, nil, nil)
+	for _, key := range publishedKeys(s.T(), a.DB) {
+		target := &deliverypb.DeliveryAttemptTarget{
+			Key: key, Recipient: subscription.Recipient,
+			Token: make([]byte, raft.AttemptTokenSize), DeadlineMs: 110,
+		}
+		_, err := ledger.ApplyRetry(&deliverypb.RetryCommand{
+			Operation: deliverypb.RetryCommand_START, NowMs: 100, Attempts: []*deliverypb.DeliveryAttemptTarget{target},
+		})
+		s.Require().NoError(err)
+		target.DeadlineMs = 0
+		_, err = ledger.ApplyRetry(&deliverypb.RetryCommand{
+			Operation: deliverypb.RetryCommand_SENT, NowMs: 100, Attempts: []*deliverypb.DeliveryAttemptTarget{target},
+		})
+		s.Require().NoError(err)
+		archived, err := ledger.ApplyRetry(&deliverypb.RetryCommand{
+			Operation: deliverypb.RetryCommand_NACK, NowMs: 101, Attempts: []*deliverypb.DeliveryAttemptTarget{target},
+		})
+		s.Require().NoError(err)
+		s.Require().Equal(uint64(1), archived)
+	}
+	full, err := (raft.DeadLetterQuery{Topic: "orders", Limit: 100}).Read(a.DB)
+	s.Require().NoError(err)
+	s.Greater(proto.Size(full.Page), limit)
+
+	listener := bufconn.Listen(1 << 20)
+	defer listener.Close() //nolint:errcheck
+	server := grpc.NewServer(grpc.MaxSendMsgSize(limit))
+	defer server.Stop()
+	pb.RegisterFutureQDeadLetterServer(server, &DeadLetterHandler{Ledger: ledger, MaxSendBytes: limit})
+	go func() { _ = server.Serve(listener) }()
+	conn, err := grpc.NewClient("passthrough:///dead-letter-pages", grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) {
+		return listener.DialContext(ctx)
+	}), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	s.Require().NoError(err)
+	defer conn.Close() //nolint:errcheck
+	client := pb.NewFutureQDeadLetterClient(conn)
+	page, err := client.ListDeadLetters(ctx, &pb.ListDeadLettersRequest{Topic: "orders"})
+	s.Require().NoError(err)
+	s.Require().Len(page.Entries, 4)
+	s.Require().NotEmpty(page.NextPageToken)
+	s.LessOrEqual(proto.Size(page), limit)
+	next, err := client.ListDeadLetters(ctx, &pb.ListDeadLettersRequest{Topic: "orders", PageToken: page.NextPageToken})
+	s.Require().NoError(err)
+	s.Require().Len(next.Entries, 1)
+	s.Empty(next.NextPageToken)
+	for i, entry := range append(page.Entries, next.Entries...) {
+		s.Equal(full.Page.Entries[i].Id, entry.Id)
+	}
 }
 
 func (s *DeadLetterDeliverySuite) TestDeadLetterAfterNACKOrDisconnect() {
@@ -40,6 +108,7 @@ func (s *DeadLetterDeliverySuite) exerciseDeadLetters(engine string) {
 	a.Config().Delivery.Subscriptions.AllowAutoAck = true
 	logger := zap.NewNop()
 	ledger := dispatcher.NewDeliveryLedger(a.DB, hub.LocalDeliveryRecipients, dispatcher.NewDirectDeleteBackend(a.DB, logger), nil)
+	ledger.ConfigureRetryOutcomes(16)
 	ledger.StandaloneReceipts = raft.NewStandaloneReceiptCache(1<<20, 128)
 	producer.StandalonePublishLedger = ledger
 	a.Subscriptions.ApplyLocal = ledger.ApplySubscription
@@ -52,19 +121,22 @@ func (s *DeadLetterDeliverySuite) exerciseDeadLetters(engine string) {
 	ledger.OnDelete = hub.RemoveDeletedBatch
 
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
-	done := make(chan struct{}, 4)
+	done := make(chan struct{}, 5)
 	for _, run := range []func(context.Context){d.Run, deleter.Run, a.Subscriptions.Run, func(ctx context.Context) {
 		ledger.RunRetryExpiry(ctx, time.Millisecond, nil, logger)
+	}, func(ctx context.Context) {
+		ledger.RunRetryOutcomes(ctx, 2, logger)
 	}} {
 		go func() { defer func() { done <- struct{}{} }(); run(ctx) }()
 	}
 	listener := bufconn.Listen(1 << 20)
-	server := grpc.NewServer()
+	const sendLimit = 100 << 10
+	server := grpc.NewServer(grpc.MaxRecvMsgSize(sendLimit), grpc.MaxSendMsgSize(sendLimit))
 	s.T().Cleanup(func() {
 		cancel()
 		server.Stop()
 		_ = listener.Close()
-		for range 4 {
+		for range 5 {
 			<-done
 		}
 	})
@@ -72,7 +144,7 @@ func (s *DeadLetterDeliverySuite) exerciseDeadLetters(engine string) {
 	consumer.RetryLedger = ledger
 	pb.RegisterFutureQConsumerServer(server, consumer)
 	pb.RegisterFutureQProducerServer(server, producer)
-	pb.RegisterFutureQDeadLetterServer(server, &DeadLetterHandler{Ledger: ledger})
+	pb.RegisterFutureQDeadLetterServer(server, &DeadLetterHandler{Ledger: ledger, MaxSendBytes: sendLimit})
 	go func() { _ = server.Serve(listener) }()
 	conn, err := grpc.NewClient("passthrough:///dead-letters", grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) {
 		return listener.Dial()
@@ -110,7 +182,8 @@ func (s *DeadLetterDeliverySuite) exerciseDeadLetters(engine string) {
 			DeliveryTag: message.DeliveryTag, Success: success,
 		}}}))
 	}
-	send("rejected", 1)
+	nearLimit := strings.Repeat("r", sendLimit-100)
+	send(nearLimit, 1)
 	first, err := worker.Recv()
 	s.Require().NoError(err)
 	s.Equal(uint64(1), first.Attempt)
@@ -157,13 +230,14 @@ func (s *DeadLetterDeliverySuite) exerciseDeadLetters(engine string) {
 		s.Equal(workers.Generation, summary.Generation)
 		s.Equal("workers", summary.GroupId)
 		get := &pb.DeadLetterRequest{Topic: "orders", Id: summary.Id}
-		entry, err := dlq.GetDeadLetter(ctx, get)
+		entry, err := receiveDeadLetter(ctx, dlq, get)
 		s.Require().NoError(err)
 		s.Require().NotNil(entry.Message.MaxRetries)
 		switch summary.Reason {
 		case pb.DeadLetterReason_DEAD_LETTER_REASON_NACK:
 			s.Equal(uint64(2), summary.Attempts)
-			s.Equal("rejected", string(entry.Message.Payload))
+			s.Equal(nearLimit, string(entry.Message.Payload))
+			s.Greater(proto.Size(entry), sendLimit, "a single gRPC response would exceed the send limit")
 			s.Equal(uint32(1), *entry.Message.MaxRetries)
 		case pb.DeadLetterReason_DEAD_LETTER_REASON_TIMEOUT:
 			s.Equal(uint64(1), summary.Attempts)
@@ -176,7 +250,7 @@ func (s *DeadLetterDeliverySuite) exerciseDeadLetters(engine string) {
 		s.Require().NoError(err)
 		_, err = dlq.DeleteDeadLetter(ctx, get)
 		s.Require().NoError(err)
-		_, err = dlq.GetDeadLetter(ctx, get)
+		_, err = receiveDeadLetter(ctx, dlq, get)
 		s.Equal(codes.NotFound, status.Code(err))
 	}
 
@@ -195,6 +269,26 @@ func (s *DeadLetterDeliverySuite) exerciseDeadLetters(engine string) {
 	empty, err := dlq.ListDeadLetters(ctx, &pb.ListDeadLettersRequest{Topic: "orders"})
 	s.Require().NoError(err)
 	s.Empty(empty.Entries)
+}
+
+func receiveDeadLetter(ctx context.Context, client pb.FutureQDeadLetterClient, request *pb.DeadLetterRequest) (*pb.DeadLetter, error) {
+	stream, err := client.GetDeadLetter(ctx, request)
+	if err != nil {
+		return nil, err
+	}
+	var data []byte
+	for {
+		chunk, err := stream.Recv()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+		data = append(data, chunk.GetData()...)
+	}
+	entry := new(pb.DeadLetter)
+	return entry, proto.Unmarshal(data, entry)
 }
 
 func TestDurableSubscriptionRPCAndOfflineUniversalDelivery(t *testing.T) {

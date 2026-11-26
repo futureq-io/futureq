@@ -3,6 +3,7 @@ package dispatcher
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"strings"
 	"testing"
 	"time"
@@ -73,19 +74,47 @@ func (s *ClusterRetrySuite) TestNewLeaderDeadLettersAnAbandonedFinalAttempt() {
 	s.Require().NoError(raft.CheckPublishResult(result, 1))
 
 	ledger := NewDeliveryLedger(leader.db, nil, nil, proposeOn(leader))
+	sendAt := time.Now()
+	deadline := sendAt.Add(100 * time.Millisecond).UnixMilli()
+	leaseUntil := sendAt.Add(time.Second).UnixMilli()
+	owner := append(binary.BigEndian.AppendUint64(nil, leader.id), bytes.Repeat([]byte{19}, raft.AttemptTokenSize)...)
+	until, err := ledger.ApplyRetry(&deliverypb.RetryCommand{
+		Operation: deliverypb.RetryCommand_RENEW_OWNER, Owner: owner,
+		NowMs: sendAt.UnixMilli(), LeaseUntilMs: leaseUntil,
+	})
+	s.Require().NoError(err)
+	s.Require().Equal(uint64(leaseUntil), until)
 	attempt, err := ledger.ApplyRetry(&deliverypb.RetryCommand{
-		Operation: deliverypb.RetryCommand_START, NowMs: now.UnixMilli(),
+		Operation: deliverypb.RetryCommand_START, Owner: owner, NowMs: sendAt.UnixMilli(),
 		Attempts: []*deliverypb.DeliveryAttemptTarget{{
 			Key: utils.EventKey(bucket, topic, id), Recipient: subscription.Recipient,
-			Token: bytes.Repeat([]byte{23}, raft.AttemptTokenSize), DeadlineMs: now.Add(200 * time.Millisecond).UnixMilli(),
+			Token: bytes.Repeat([]byte{23}, raft.AttemptTokenSize), DeadlineMs: deadline,
 		}},
 	})
 	s.Require().NoError(err)
 	s.Require().Equal(uint64(1), attempt)
+	authorized, err := ledger.ApplyRetry(&deliverypb.RetryCommand{
+		Operation: deliverypb.RetryCommand_SENT, Owner: owner, NowMs: sendAt.UnixMilli(),
+		Attempts: []*deliverypb.DeliveryAttemptTarget{{
+			Key: utils.EventKey(bucket, topic, id), Recipient: subscription.Recipient,
+			Token: bytes.Repeat([]byte{23}, raft.AttemptTokenSize),
+		}},
+	})
+	s.Require().NoError(err)
+	s.Require().Equal(uint64(1), authorized)
 	c.stop(leader.id)
 	successor := waitLeader()
 	s.Require().NotEqual(leader.id, successor.id)
 	successorLedger := NewDeliveryLedger(successor.db, nil, nil, proposeOn(successor))
+	archived, err := successorLedger.ApplyRetry(&deliverypb.RetryCommand{
+		Operation: deliverypb.RetryCommand_EXPIRE, NowMs: deadline,
+		Attempts: []*deliverypb.DeliveryAttemptTarget{{
+			Key: utils.EventKey(bucket, topic, id), Recipient: subscription.Recipient,
+			Token: bytes.Repeat([]byte{23}, raft.AttemptTokenSize), DeadlineMs: deadline,
+		}},
+	})
+	s.Require().NoError(err)
+	s.Zero(archived, "the successor must allow the owner's committed lease to lapse")
 	workerCtx, stopWorker := context.WithCancel(ctx)
 	workerDone := make(chan struct{})
 	go func() {

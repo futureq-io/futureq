@@ -1,6 +1,8 @@
 package dispatcher
 
 import (
+	"bytes"
+	"context"
 	"errors"
 	"testing"
 	"time"
@@ -10,9 +12,149 @@ import (
 	"github.com/futureq-io/futureq/internal/storage"
 	"github.com/futureq-io/futureq/pkg/utils"
 	pb "github.com/futureq-io/protocol/proto/go"
+	deliverypb "github.com/futureq-io/protocol/proto/go/delivery"
+	storagepb "github.com/futureq-io/protocol/proto/go/storage"
+	"github.com/futureq-io/stormoar/v4/statemachine"
 	"github.com/stretchr/testify/require"
+	"github.com/stretchr/testify/suite"
 	"go.uber.org/zap"
+	"google.golang.org/protobuf/proto"
 )
+
+type RetryExpirySuite struct{ suite.Suite }
+
+func TestRetryExpirySuite(t *testing.T) {
+	suite.Run(t, new(RetryExpirySuite))
+}
+
+func (s *RetryExpirySuite) TestSweepDrainsMultipleBatchesAcrossTopics() {
+	logger := zap.NewNop()
+	db, err := storage.NewPebble(config.Pebble{Mode: "memory"}, logger)
+	s.Require().NoError(err)
+	defer db.Close() //nolint:errcheck
+	ledger := NewDeliveryLedger(db, nil, nil, nil)
+	topics := []string{"orders", "emails"}
+	receipt, err := raft.MarshalPublishReceipt(0, []string{"g:workers"})
+	s.Require().NoError(err)
+	token := bytes.Repeat([]byte{1}, raft.AttemptTokenSize)
+	for i := range 96 {
+		topic := topics[i%len(topics)]
+		key := utils.EventKey(1, utils.TopicHash(topic), uint64(i+1))
+		message, err := proto.Marshal(&storagepb.StoredMessage{
+			Topic: topic, Payload: []byte("timeout"), EnqueuedAtUnixMs: 100, MaxRetries: new(uint32(0)),
+		})
+		s.Require().NoError(err)
+		batch := db.NewBatch()
+		s.Require().NoError(batch.Set(key, message))
+		s.Require().NoError(batch.Set(raft.DeliveryStateKey(key), receipt))
+		s.Require().NoError(batch.Commit(storage.Sync))
+		s.Require().NoError(batch.Close())
+		target := &deliverypb.DeliveryAttemptTarget{Key: key, Recipient: "g:workers", Token: token, DeadlineMs: 110}
+		result, err := ledger.ApplyRetry(&deliverypb.RetryCommand{
+			Operation: deliverypb.RetryCommand_START, NowMs: 100, Attempts: []*deliverypb.DeliveryAttemptTarget{target},
+		})
+		s.Require().NoError(err)
+		s.Require().Equal(uint64(1), result)
+		target.DeadlineMs = 0
+		_, err = ledger.ApplyRetry(&deliverypb.RetryCommand{
+			Operation: deliverypb.RetryCommand_SENT, NowMs: 100, Attempts: []*deliverypb.DeliveryAttemptTarget{target},
+		})
+		s.Require().NoError(err)
+	}
+
+	s.Require().NoError(ledger.expireDueRetryAttempts(context.Background(), 110, nil))
+	due, err := raft.DueDeliveryAttempts(db, 110)
+	s.Require().NoError(err)
+	s.Empty(due)
+	for _, topic := range topics {
+		page, err := (raft.DeadLetterQuery{Topic: topic, Limit: 100}).Read(db)
+		s.Require().NoError(err)
+		s.Len(page.Page.Entries, 48)
+	}
+}
+
+func (s *RetryExpirySuite) TestReceivedACKSurvivesExpiryWhileOutcomeWorkersAreBlocked() {
+	logger := zap.NewNop()
+	db, err := storage.NewPebble(config.Pebble{Mode: "memory"}, logger)
+	s.Require().NoError(err)
+	defer db.Close() //nolint:errcheck
+	local := NewDeliveryLedger(db, nil, nil, nil)
+	started := make(chan struct{}, 2)
+	unblock := make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
+	ledger := NewDeliveryLedger(db, nil, nil, func(raw []byte) (statemachine.Result, error) {
+		var cmd deliverypb.RetryCommand
+		if err := proto.Unmarshal(raw[1:], &cmd); err != nil {
+			return statemachine.Result{}, err
+		}
+		if cmd.Operation == deliverypb.RetryCommand_ACK {
+			started <- struct{}{}
+			<-unblock
+		}
+		value, err := local.ApplyRetry(&cmd)
+		return statemachine.Result{Value: value}, err
+	})
+	ledger.ConfigureRetryOutcomes(4)
+	done := make(chan struct{})
+	go func() { defer close(done); ledger.RunRetryOutcomes(ctx, 2, logger) }()
+	defer func() {
+		select {
+		case <-unblock:
+		default:
+			close(unblock)
+		}
+		cancel()
+		<-done
+	}()
+
+	topic := "orders"
+	receipt, err := raft.MarshalPublishReceipt(0, []string{"g:workers"})
+	s.Require().NoError(err)
+	body, err := proto.Marshal(&storagepb.StoredMessage{Topic: topic, EnqueuedAtUnixMs: 100, MaxRetries: new(uint32(0))})
+	s.Require().NoError(err)
+	committed := make(chan struct{}, 3)
+	for i := range 3 {
+		key := utils.EventKey(1, utils.TopicHash(topic), uint64(i+1))
+		batch := db.NewBatch()
+		s.Require().NoError(batch.Set(key, body))
+		s.Require().NoError(batch.Set(raft.DeliveryStateKey(key), receipt))
+		s.Require().NoError(batch.Commit(storage.Sync))
+		s.Require().NoError(batch.Close())
+		target := &deliverypb.DeliveryAttemptTarget{
+			Key: key, Recipient: "g:workers", Token: bytes.Repeat([]byte{byte(i + 1)}, raft.AttemptTokenSize), DeadlineMs: 110,
+		}
+		_, err := ledger.ApplyRetry(&deliverypb.RetryCommand{
+			Operation: deliverypb.RetryCommand_START, NowMs: 100, Attempts: []*deliverypb.DeliveryAttemptTarget{target},
+		})
+		s.Require().NoError(err)
+		target.DeadlineMs = 0
+		value, err := ledger.ApplyRetry(&deliverypb.RetryCommand{
+			Operation: deliverypb.RetryCommand_SENT, NowMs: 101, Attempts: []*deliverypb.DeliveryAttemptTarget{target},
+		})
+		s.Require().NoError(err)
+		s.Require().Equal(uint64(1), value)
+		isAccepted := ledger.TryRetryOutcome(&deliverypb.RetryCommand{
+			Operation: deliverypb.RetryCommand_ACK, NowMs: 109, Attempts: []*deliverypb.DeliveryAttemptTarget{target},
+		}, func() { committed <- struct{}{} })
+		s.Require().True(isAccepted)
+	}
+	s.Require().Eventually(func() bool { return len(started) == 2 }, time.Second, time.Millisecond)
+	s.Require().NoError(ledger.expireDueRetryAttempts(ctx, 110, nil))
+	page, err := (raft.DeadLetterQuery{Topic: topic, Limit: 10}).Read(db)
+	s.Require().NoError(err)
+	s.Empty(page.Page.Entries)
+	due, err := raft.DueDeliveryAttempts(db, 110)
+	s.Require().NoError(err)
+	s.Len(due, 3)
+
+	<-started
+	<-started
+	close(unblock)
+	s.Require().Eventually(func() bool { return len(committed) == 3 }, time.Second, time.Millisecond)
+	due, err = raft.DueDeliveryAttempts(db, 110)
+	s.Require().NoError(err)
+	s.Empty(due)
+}
 
 func TestStandaloneRecipientAckFailureRetainsPayloadAndRetries(t *testing.T) {
 	db, err := storage.NewPebble(config.Pebble{Mode: "memory"}, zap.NewNop())

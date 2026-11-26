@@ -27,10 +27,11 @@ import (
 // ConsumerHandler implements pb.FutureQConsumerServer.
 type ConsumerHandler struct {
 	pb.UnimplementedFutureQConsumerServer
-	logger      *zap.Logger
-	hub         *dispatcher.Hub
-	deleter     *dispatcher.Deleter
-	RetryLedger *dispatcher.DeliveryLedger
+	logger       *zap.Logger
+	hub          *dispatcher.Hub
+	deleter      *dispatcher.Deleter
+	RetryLedger  *dispatcher.DeliveryLedger
+	MaxSendBytes int
 }
 
 // NewConsumerHandler returns an initialised ConsumerHandler.
@@ -366,6 +367,9 @@ func (h *ConsumerHandler) beginLimitedSend(consumerID string, init *pb.Subscribe
 	if !h.hub.CanSend(consumerID, message) {
 		return nil, nil
 	}
+	if !deliveryFrameFits(h.MaxSendBytes, message.Topic, message.Payload, message.EnqueuedAtUnixMs, message.DelayMs, message.MaxRetries) {
+		return nil, status.Error(codes.ResourceExhausted, "message exceeds this broker's gRPC delivery frame limit")
+	}
 	if h.RetryLedger == nil {
 		return nil, status.Error(codes.Unavailable, "delivery retry ledger unavailable")
 	}
@@ -382,12 +386,28 @@ func (h *ConsumerHandler) beginLimitedSend(consumerID string, init *pb.Subscribe
 	if err != nil {
 		return nil, status.Errorf(codes.Unavailable, "reserve delivery attempt: %v", err)
 	}
-	if attempt == 0 || !h.hub.BeginRetrySend(consumerID, message, token[:], time.UnixMilli(deadline)) {
+	if attempt == 0 {
 		return nil, nil
 	}
 	tag := make([]byte, 0, utils.EventKeySize+raft.AttemptTokenSize)
 	tag = append(tag, message.DeliveryTag...)
 	tag = append(tag, token[:]...)
+	if !h.hub.BeginRetrySend(consumerID, message, token[:], time.UnixMilli(deadline)) {
+		if _, err := h.RetryLedger.ApplyRetry(limitedOutcome(consumerID, init, tag, deliverypb.RetryCommand_CANCEL_RESERVATION)); err != nil {
+			h.logger.Warn("failed to release unsent delivery reservation", zap.Error(err))
+		}
+		return nil, nil
+	}
+	// Charge the attempt before exposing it to the transport. Once Send can
+	// observe a token, expiry must never refund or reuse its attempt number.
+	authorized, err := h.RetryLedger.ApplyRetry(limitedOutcome(consumerID, init, tag, deliverypb.RetryCommand_SENT))
+	if err != nil {
+		return nil, status.Errorf(codes.Unavailable, "authorize delivery send: %v", err)
+	}
+	if authorized == 0 || time.Now().UnixMilli() >= deadline {
+		h.hub.ReleaseRetrySend(consumerID, message.DeliveryTag, token[:])
+		return nil, nil
+	}
 	return &pb.QueueMessage{
 		Topic: message.Topic, Payload: message.Payload, DeliveryTag: tag,
 		EnqueuedAtUnixMs: message.EnqueuedAtUnixMs, DelayMs: message.DelayMs,
@@ -404,20 +424,25 @@ func (h *ConsumerHandler) finishLimitedSend(consumerID string, init *pb.Subscrib
 	if !success {
 		op = deliverypb.RetryCommand_NACK
 	}
-	_, err := h.RetryLedger.ApplyRetry(&deliverypb.RetryCommand{
-		Operation: op, NowMs: time.Now().UnixMilli(),
-		Attempts: []*deliverypb.DeliveryAttemptTarget{{
-			Key: key, Recipient: metadata.DeliveryRecipient(init.GroupId, consumerID), Token: token,
-		}},
-	})
-	if err != nil {
-		return false, status.Errorf(codes.Unavailable, "commit delivery outcome: %v", err)
-	}
-	h.hub.ReleaseRetrySend(consumerID, key, token)
-	if !success && h.hub.OnNack != nil {
-		h.hub.OnNack(key)
+	if !h.RetryLedger.TryRetryOutcome(limitedOutcome(consumerID, init, tag, op), func() {
+		h.hub.ReleaseRetrySend(consumerID, key, token)
+		if !success && h.hub.OnNack != nil {
+			h.hub.OnNack(key)
+		}
+	}) {
+		return false, status.Error(codes.Unavailable, "delivery outcome admission unavailable; retry subscription")
 	}
 	return true, nil
+}
+
+func limitedOutcome(consumerID string, init *pb.SubscribeInit, tag []byte, op deliverypb.RetryCommand_Operation) *deliverypb.RetryCommand {
+	return &deliverypb.RetryCommand{
+		Operation: op, NowMs: time.Now().UnixMilli(),
+		Attempts: []*deliverypb.DeliveryAttemptTarget{{
+			Key: tag[:utils.EventKeySize], Recipient: metadata.DeliveryRecipient(init.GroupId, consumerID),
+			Token: tag[utils.EventKeySize:],
+		}},
+	}
 }
 
 func boolToStr(b bool) string {

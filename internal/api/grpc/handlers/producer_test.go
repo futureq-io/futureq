@@ -1,12 +1,18 @@
 package handlers
 
 import (
+	"bytes"
+	"context"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/suite"
 
 	"github.com/futureq-io/futureq/internal/config"
 	pb "github.com/futureq-io/protocol/proto/go"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 )
 
 type ProducerSuite struct {
@@ -15,6 +21,34 @@ type ProducerSuite struct {
 
 func TestProducerSuite(t *testing.T) {
 	suite.Run(t, new(ProducerSuite))
+}
+
+func (s *ProducerSuite) TestPublishRejectsBatchWhoseDeliveryFrameExceedsSendLimit() {
+	const sendLimit = 100 << 10
+	a, _, producer, _ := openPublishTest(s.T(), "pebble")
+	a.Config().API.GRPC.MaxSendMessageSize = "100KiB"
+	ctx := context.Background()
+	s.Require().NoError(createTestInterest(ctx, "orders", "workers"))
+	now := time.Now().UnixMilli()
+	message := &pb.PublishMessage{Topic: "orders", MaxRetries: new(uint32(0))}
+	// Place the message one byte outside the actual delivery frame budget.
+	message.Payload = bytes.Repeat([]byte{'x'}, sendLimit)
+	for !deliveryFrameFits(sendLimit, message.Topic, message.Payload, now, 0, message.MaxRetries) {
+		message.Payload = message.Payload[:len(message.Payload)-1]
+	}
+	exact := proto.CloneOf(message)
+	message.Payload = append(message.Payload, 'x')
+	batch := &pb.PublishBatch{Messages: []*pb.PublishMessage{{Topic: "orders"}, message}}
+	s.Less(proto.Size(batch), sendLimit, "the publish request fits the receive limit")
+	ack, err := producer.processBatch(ctx, batch)
+	s.Equal(codes.ResourceExhausted, status.Code(err))
+	s.False(ack.GetSuccess())
+	s.Empty(publishedKeys(s.T(), a.DB), "the entire batch must be rejected")
+
+	ack, err = producer.processBatch(ctx, &pb.PublishBatch{Messages: []*pb.PublishMessage{exact}})
+	s.Require().NoError(err)
+	s.True(ack.GetSuccess())
+	s.Len(publishedKeys(s.T(), a.DB), 1)
 }
 
 // TestAckLevelDurabilityOrdering asserts the load-bearing invariant behind the

@@ -1,21 +1,226 @@
 package handlers
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/futureq-io/futureq/internal/dispatcher"
 	"github.com/futureq-io/futureq/internal/metrics"
 	raft "github.com/futureq-io/futureq/internal/raft/event"
+	"github.com/futureq-io/futureq/pkg/utils"
 	pb "github.com/futureq-io/protocol/proto/go"
+	deliverypb "github.com/futureq-io/protocol/proto/go/delivery"
+	"github.com/futureq-io/stormoar/v4/statemachine"
 	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/require"
+	"github.com/stretchr/testify/suite"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
+	"google.golang.org/protobuf/proto"
 )
+
+type LimitedConsumerSuite struct{ suite.Suite }
+
+func TestLimitedConsumerSuite(t *testing.T) {
+	suite.Run(t, new(LimitedConsumerSuite))
+}
+
+func (s *LimitedConsumerSuite) TestRebalanceBetweenReservationAndSendDoesNotCharge() {
+	a, hub, producer, _ := openPublishTest(s.T(), "pebble")
+	ctx := context.Background()
+	subscription, err := a.Subscriptions.Create(ctx, "orders", "workers", "")
+	s.Require().NoError(err)
+	ack, err := producer.processBatch(ctx, &pb.PublishBatch{Messages: []*pb.PublishMessage{{
+		Topic: "orders", MaxRetries: new(uint32(0)),
+	}}})
+	s.Require().NoError(err)
+	s.Require().True(ack.GetSuccess())
+	keys := publishedKeys(s.T(), a.DB)
+	s.Require().Len(keys, 1)
+	key := keys[0]
+	group := strings.TrimPrefix(subscription.Recipient, "g:")
+	init := &pb.SubscribeInit{Topic: "orders", GroupId: group}
+	queue := make(chan *pb.QueueMessage, 1)
+	hub.Register("consumer", "orders", group, queue)
+	defer hub.Unregister("consumer")
+	epoch := uint64(1)
+	hub.SetDeliveryFence(func() (uint64, bool) { return epoch, true }, time.Second)
+	hub.GrantDeliveryPermit(epoch, time.Now())
+
+	local := dispatcher.NewDeliveryLedger(a.DB, nil, nil, nil)
+	logger := zap.NewNop()
+	handler := NewConsumerHandler(logger, hub, nil)
+	handler.RetryLedger = dispatcher.NewDeliveryLedger(a.DB, nil, nil, func(raw []byte) (statemachine.Result, error) {
+		var cmd deliverypb.RetryCommand
+		if err := proto.Unmarshal(raw[1:], &cmd); err != nil {
+			return statemachine.Result{}, err
+		}
+		value, err := local.ApplyRetry(&cmd)
+		if epoch == 1 && cmd.Operation == deliverypb.RetryCommand_START {
+			epoch++
+		}
+		return statemachine.Result{Value: value}, err
+	})
+	input := &pb.QueueMessage{Topic: "orders", MaxRetries: new(uint32(0))}
+	s.Require().NotEmpty(hub.DispatchToTopic("orders", input, key))
+	queued := <-queue
+	wire, err := handler.beginLimitedSend("consumer", init, queued)
+	s.Require().NoError(err)
+	s.Require().Nil(wire, "revoking the permit must prevent any send")
+	hub.RejectQueuedAttempt("consumer", queued)
+	due, err := raft.DueDeliveryAttempts(a.DB, time.Now().Add(time.Minute).UnixMilli())
+	s.Require().NoError(err)
+	s.Empty(due, "the unsent reservation should be released immediately")
+
+	hub.GrantDeliveryPermit(epoch, time.Now())
+	s.Require().NotEmpty(hub.DispatchToTopic("orders", input, key))
+	wire, err = handler.beginLimitedSend("consumer", init, <-queue)
+	s.Require().NoError(err)
+	s.Require().NotNil(wire)
+	s.Equal(uint64(1), wire.Attempt)
+}
+
+func (s *LimitedConsumerSuite) TestLaterACKCommitsWhileFirstOutcomeIsStalled() {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	logger := zap.NewNop()
+	hub := dispatcher.NewHub(dispatcher.NewRoundRobinStrategy(), logger, make(chan struct{}, 1))
+	queue := make(chan *pb.QueueMessage, 2)
+	hub.Register("consumer", "orders", "workers", queue)
+	defer hub.Unregister("consumer")
+	keys := [][]byte{
+		utils.EventKey(1, utils.TopicHash("orders"), 1),
+		utils.EventKey(1, utils.TopicHash("orders"), 2),
+	}
+	stream := new(ackTestStream)
+	for i, key := range keys {
+		s.Require().NotEmpty(hub.DispatchToTopic("orders", &pb.QueueMessage{MaxRetries: new(uint32(0))}, key))
+		token := bytes.Repeat([]byte{byte(i + 1)}, raft.AttemptTokenSize)
+		s.Require().True(hub.BeginRetrySend("consumer", <-queue, token, time.Now().Add(time.Minute)))
+		stream.frames = append(stream.frames, &pb.ConsumerFrame{Body: &pb.ConsumerFrame_Ack{
+			Ack: &pb.AckRequest{DeliveryTag: append(bytes.Clone(key), token...), Success: true},
+		}})
+	}
+
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	secondCommitted := make(chan struct{})
+	ledger := dispatcher.NewDeliveryLedger(nil, nil, nil, func(raw []byte) (statemachine.Result, error) {
+		var cmd deliverypb.RetryCommand
+		if err := proto.Unmarshal(raw[1:], &cmd); err != nil {
+			return statemachine.Result{}, err
+		}
+		if bytes.Equal(cmd.GetAttempts()[0].GetKey(), keys[0]) {
+			close(firstStarted)
+			select {
+			case <-releaseFirst:
+			case <-ctx.Done():
+				return statemachine.Result{}, ctx.Err()
+			}
+		} else {
+			close(secondCommitted)
+		}
+		return statemachine.Result{}, nil
+	})
+	ledger.ConfigureRetryOutcomes(2)
+	workerDone := make(chan struct{})
+	go func() {
+		defer close(workerDone)
+		ledger.RunRetryOutcomes(ctx, 2, logger)
+	}()
+	defer func() { cancel(); <-workerDone }()
+	handler := NewConsumerHandler(logger, hub, nil)
+	handler.RetryLedger = ledger
+	errCh := make(chan error, 1)
+	go handler.receiver(stream, "consumer", &pb.SubscribeInit{Topic: "orders", GroupId: "workers"}, errCh)
+	s.Require().Eventually(func() bool { return len(errCh) > 0 }, time.Second, time.Millisecond)
+	s.Require().NoError(<-errCh)
+	select {
+	case <-firstStarted:
+	case <-ctx.Done():
+		s.FailNow("the first outcome was never proposed")
+	}
+	select {
+	case <-secondCommitted:
+	case <-ctx.Done():
+		s.FailNow("the second outcome did not commit while the first was blocked")
+	}
+	close(releaseFirst)
+}
+
+func (s *LimitedConsumerSuite) TestBlockedSendCannotRefundItsAttempt() {
+	a, hub, producer, _ := openPublishTest(s.T(), "pebble")
+	logger := zap.NewNop()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	subscription, err := a.Subscriptions.Create(ctx, "orders", "workers", "")
+	s.Require().NoError(err)
+	ack, err := producer.processBatch(ctx, &pb.PublishBatch{Messages: []*pb.PublishMessage{{
+		Topic: "orders", MaxRetries: new(uint32(0)),
+	}}})
+	s.Require().NoError(err)
+	s.Require().True(ack.GetSuccess())
+	keys := publishedKeys(s.T(), a.DB)
+	s.Require().Len(keys, 1)
+	key := keys[0]
+	group := strings.TrimPrefix(subscription.Recipient, "g:")
+	queue := make(chan *pb.QueueMessage, 1)
+	hub.Register("consumer", "orders", group, queue)
+	defer hub.Unregister("consumer")
+	s.Require().NotEmpty(hub.DispatchToTopic("orders", &pb.QueueMessage{Topic: "orders", MaxRetries: new(uint32(0))}, key))
+	ledger := dispatcher.NewDeliveryLedger(a.DB, nil, nil, nil)
+	handler := NewConsumerHandler(logger, hub, nil)
+	handler.RetryLedger = ledger
+	stream := &blockedRetrySend{ctx: ctx, sending: make(chan *pb.QueueMessage, 1), unblock: make(chan struct{})}
+	errCh := make(chan error, 1)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		handler.sender(ctx, stream, "consumer", &pb.SubscribeInit{Topic: "orders", GroupId: group}, queue, errCh)
+	}()
+	defer func() { cancel(); <-done }()
+	select {
+	case msg := <-stream.sending:
+		s.Equal(uint64(1), msg.Attempt)
+	case <-ctx.Done():
+		s.FailNow("send did not start")
+	}
+	// Advance the expiry clock while the first call is still in gRPC Send.
+	expireAt := time.Now().Add(time.Minute).UnixMilli()
+	due, err := raft.DueDeliveryAttempts(a.DB, expireAt)
+	s.Require().NoError(err)
+	s.Require().Len(due, 1)
+	value, err := ledger.ApplyRetry(&deliverypb.RetryCommand{Operation: deliverypb.RetryCommand_EXPIRE, NowMs: expireAt, Attempts: due})
+	s.Require().NoError(err)
+	s.Require().Equal(uint64(1), value, "expiry must charge the send already exposed to the transport")
+	page, err := (raft.DeadLetterQuery{Topic: "orders", Limit: 10}).Read(a.DB)
+	s.Require().NoError(err)
+	s.Require().Len(page.Page.Entries, 1)
+	s.Equal(uint64(1), page.Page.Entries[0].Attempts)
+	close(stream.unblock)
+}
+
+type blockedRetrySend struct {
+	ackTestStream
+	ctx     context.Context
+	sending chan *pb.QueueMessage
+	unblock chan struct{}
+}
+
+func (s *blockedRetrySend) Send(message *pb.QueueMessage) error {
+	s.sending <- message
+	select {
+	case <-s.unblock:
+		return nil
+	case <-s.ctx.Done():
+		return s.ctx.Err()
+	}
+}
 
 type ackTestStream struct {
 	grpc.ServerStream
