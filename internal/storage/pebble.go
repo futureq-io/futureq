@@ -1,9 +1,12 @@
 package storage
 
 import (
+	"bytes"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
+	"sync"
 	"sync/atomic"
 
 	"github.com/cockroachdb/pebble/v2"
@@ -19,6 +22,7 @@ type Pebble struct {
 	empty    pebbleEmptyRanges
 	db       *pebble.DB
 	logger   *zap.Logger
+	maxMu    sync.Mutex // orders watermark reads and applies through visibility
 }
 
 // NewPebble opens a Pebble database using the given config.
@@ -87,7 +91,7 @@ func (p *Pebble) Get(key []byte) ([]byte, io.Closer, error) {
 }
 
 func (p *Pebble) NewBatch() Batch {
-	return &pebbleBatch{b: p.db.NewBatch(), revision: &p.revision, topics: &p.topics, empty: &p.empty}
+	return &pebbleBatch{db: p, b: p.db.NewBatch(), revision: &p.revision, topics: &p.topics, empty: &p.empty}
 }
 
 // NewIter opens a snapshot internally and returns an iterator scoped to it.
@@ -179,6 +183,13 @@ type pebbleBatch struct {
 	topics   *topicRevisions
 	writes   eventTopicWrites
 	b        *pebble.Batch
+	db       *Pebble
+	maxima   []uint64Watermark
+}
+
+type uint64Watermark struct {
+	key   []byte
+	value uint64
 }
 
 func (pb *pebbleBatch) Set(key, value []byte) error {
@@ -189,6 +200,18 @@ func (pb *pebbleBatch) Set(key, value []byte) error {
 	}
 	return err
 }
+func (pb *pebbleBatch) SetMaxUint64(key []byte, value uint64) error {
+	for i := range pb.maxima {
+		if bytes.Equal(pb.maxima[i].key, key) {
+			pb.maxima[i].value = max(pb.maxima[i].value, value)
+			return nil
+		}
+	}
+	pb.sets.include(key)
+	pb.maxima = append(pb.maxima, uint64Watermark{key: bytes.Clone(key), value: value})
+	return nil
+}
+
 func (pb *pebbleBatch) Delete(key []byte) error {
 	return pb.b.Delete(key, nil)
 }
@@ -203,7 +226,17 @@ func (pb *pebbleBatch) Commit(mode SyncMode) error {
 	if mode == NoSync {
 		opts = pebble.NoSync
 	}
-	if err := pb.b.Commit(opts); err != nil {
+	var err error
+	if len(pb.maxima) == 0 {
+		err = pb.b.Commit(opts)
+	} else {
+		var waitForSync bool
+		waitForSync, err = pb.applyWithWatermarks(opts)
+		if err == nil && waitForSync {
+			err = pb.b.SyncWait()
+		}
+	}
+	if err != nil {
 		return err
 	}
 	if pb.writes.set {
@@ -211,6 +244,41 @@ func (pb *pebbleBatch) Commit(mode SyncMode) error {
 		pb.revision.Add(1)
 	}
 	return nil
+}
+
+// applyWithWatermarks keeps the compare and apply ordered with other watermark
+// batches. Once the mutation is visible, the caller can wait for WAL sync
+// outside the lock so independent publishes can share the engine's sync work.
+func (pb *pebbleBatch) applyWithWatermarks(opts *pebble.WriteOptions) (waitForSync bool, err error) {
+	pb.db.maxMu.Lock()
+	defer pb.db.maxMu.Unlock()
+	for _, watermark := range pb.maxima {
+		var value [8]byte
+		binary.BigEndian.PutUint64(value[:], watermark.value)
+		current, closer, err := pb.db.db.Get(watermark.key)
+		write := errors.Is(err, pebble.ErrNotFound)
+		if err == nil {
+			write, err = maxUint64Value(current, value[:])
+			closeErr := closer.Close()
+			if err == nil {
+				err = closeErr
+			}
+		} else if write {
+			err = nil
+		}
+		if err != nil {
+			return false, err
+		}
+		if write {
+			if err := pb.Set(watermark.key, value[:]); err != nil {
+				return false, err
+			}
+		}
+	}
+	if opts.Sync && !pb.b.Empty() {
+		return true, pb.db.db.ApplyNoSyncWait(pb.b, opts)
+	}
+	return false, pb.b.Commit(opts)
 }
 
 // ── pebbleIterator ────────────────────────────────────────────────────────────

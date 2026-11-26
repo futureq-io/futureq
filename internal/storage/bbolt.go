@@ -2,6 +2,7 @@ package storage
 
 import (
 	"bytes"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"os"
@@ -188,6 +189,7 @@ type boltBatch struct {
 
 type boltOp struct {
 	del   bool
+	max   bool
 	key   []byte
 	value []byte
 }
@@ -199,6 +201,14 @@ func (bb *boltBatch) Set(key, value []byte) error {
 	v := make([]byte, len(value))
 	copy(v, value)
 	bb.ops = append(bb.ops, boltOp{key: k, value: v})
+	return nil
+}
+
+func (bb *boltBatch) SetMaxUint64(key []byte, value uint64) error {
+	bb.writes.add(key)
+	bb.ops = append(bb.ops, boltOp{
+		max: true, key: bytes.Clone(key), value: binary.BigEndian.AppendUint64(nil, value),
+	})
 	return nil
 }
 
@@ -220,9 +230,16 @@ func (bb *boltBatch) Commit(_ SyncMode) error {
 		}
 		for _, op := range bb.ops {
 			var err error
-			if op.del {
+			switch {
+			case op.del:
 				err = bkt.Delete(op.key)
-			} else {
+			case op.max:
+				var write bool
+				write, err = maxUint64Value(bkt.Get(op.key), op.value)
+				if err == nil && write {
+					err = bkt.Put(op.key, op.value)
+				}
+			default:
 				err = bkt.Put(op.key, op.value)
 			}
 			if err != nil {

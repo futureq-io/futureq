@@ -2,11 +2,17 @@ package handlers
 
 import (
 	"context"
+	"encoding/binary"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/futureq-io/futureq/internal/app"
 	"github.com/futureq-io/futureq/internal/config"
+	"github.com/futureq-io/futureq/internal/repository"
 	"github.com/futureq-io/futureq/internal/storage"
+	"github.com/futureq-io/futureq/pkg/utils"
 	pb "github.com/futureq-io/protocol/proto/go"
 	"github.com/stretchr/testify/require"
 	bolt "go.etcd.io/bbolt"
@@ -151,6 +157,93 @@ func TestStandaloneBatchingSharesCommitAndBoltValidation(t *testing.T) {
 			require.Len(t, publishedKeys(t, db), 2)
 		})
 	}
+}
+
+type blockedPublishCommitDB struct {
+	storage.DB
+	calls   atomic.Int64
+	entered chan struct{}
+	finish  chan struct{}
+}
+
+func (db *blockedPublishCommitDB) NewBatch() storage.Batch {
+	return &blockedPublishCommitBatch{Batch: db.DB.NewBatch(), db: db}
+}
+
+type blockedPublishCommitBatch struct {
+	storage.Batch
+	db *blockedPublishCommitDB
+}
+
+func (b *blockedPublishCommitBatch) Commit(mode storage.SyncMode) error {
+	if b.db.calls.Add(1) == 1 {
+		close(b.db.entered)
+		<-b.db.finish
+	}
+	return b.Batch.Commit(mode)
+}
+
+func TestStandaloneConcurrentCommitsPreserveWatermark(t *testing.T) {
+	for _, engine := range []string{"pebble", "bolt"} {
+		t.Run(engine, func(t *testing.T) {
+			a, _, producer, reopen := openPublishTest(t, engine)
+			require.NoError(t, createTestInterest(context.Background(), "orders", "workers"))
+			db := &blockedPublishCommitDB{DB: a.DB, entered: make(chan struct{}), finish: make(chan struct{})}
+			a.DB = db
+			batch := &pb.PublishBatch{Messages: []*pb.PublishMessage{{Topic: "orders"}}}
+			first, second := make(chan error, 1), make(chan error, 1)
+			var publishers sync.WaitGroup
+			unblock := sync.OnceFunc(func() { close(db.finish) })
+			defer func() { unblock(); publishers.Wait() }()
+
+			publishers.Go(func() {
+				_, err := producer.processBatch(context.Background(), batch)
+				first <- err
+			})
+			awaitPublishSignal(t, db.entered)
+			publishers.Go(func() {
+				_, err := producer.processBatch(context.Background(), batch)
+				second <- err
+			})
+			require.NoError(t, awaitPublishError(t, second), "a blocked publisher must not hold up another commit")
+			unblock()
+			require.NoError(t, awaitPublishError(t, first))
+
+			watermark, closer, err := db.Get(repository.LastIDKey)
+			require.NoError(t, err)
+			require.Len(t, watermark, 8)
+			require.EqualValues(t, 2, binary.BigEndian.Uint64(watermark), "late commit must not replace the higher ID")
+			require.NoError(t, closer.Close())
+			reopen()
+			_, err = producer.processBatch(context.Background(), batch)
+			require.NoError(t, err)
+			var ids []uint64
+			for _, key := range publishedKeys(t, app.A.DB) {
+				_, _, id, err := utils.ParseEventKey(key)
+				require.NoError(t, err)
+				ids = append(ids, id)
+			}
+			require.ElementsMatch(t, []uint64{1, 2, 3}, ids)
+		})
+	}
+}
+
+func TestStandaloneFlushTargetDoesNotLimitIndividualPublish(t *testing.T) {
+	a, _, _, _ := openPublishTest(t, "pebble")
+	require.NoError(t, createTestInterest(context.Background(), "orders", "workers"))
+	cfg := &a.Config().Publish
+	cfg.BatchMaxRequests, cfg.BatchMaxBytes, cfg.MaxRequestBytes = 2, "64B", "480B"
+	producer := NewProducerHandler(zap.NewNop())
+	t.Cleanup(producer.Close)
+
+	batch := &pb.PublishBatch{Messages: []*pb.PublishMessage{{Topic: "orders", Payload: make([]byte, 256)}}}
+	ack, err := producer.processBatch(context.Background(), batch)
+	require.NoError(t, err)
+	require.True(t, ack.Success)
+	batch.Messages[0].Payload = make([]byte, 512)
+	_, err = producer.processBatch(context.Background(), batch)
+	require.Equal(t, codes.ResourceExhausted, status.Code(err))
+	require.Len(t, publishedKeys(t, a.DB), 1)
 }
 
 func batchWithIndex(key string) *pb.PublishBatch {

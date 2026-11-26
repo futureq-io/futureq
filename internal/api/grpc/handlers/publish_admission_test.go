@@ -344,7 +344,7 @@ func TestRaftPublishAckGuarantees(t *testing.T) {
 
 func TestRaftConcurrentPublishesHaveIndependentBudgets(t *testing.T) {
 	cfg := config.DefaultPublish()
-	cfg.BatchMaxRequests, cfg.BatchMaxWait, cfg.BatchMaxBytes = 2, 500*time.Millisecond, "480B"
+	cfg.BatchMaxRequests, cfg.BatchMaxWait, cfg.BatchMaxBytes, cfg.MaxRequestBytes = 2, 500*time.Millisecond, "64B", "480B"
 	a, producer, sm, _ := openRaftPublishFixture(t, cfg)
 	require.NoError(t, createTestInterest(context.Background(), "orders", "workers"))
 	require.Nil(t, producer.batcher)
@@ -358,6 +358,9 @@ func TestRaftConcurrentPublishesHaveIndependentBudgets(t *testing.T) {
 	}
 	require.NoError(t, awaitPublishError(t, returned))
 	require.NoError(t, awaitPublishError(t, returned))
+	batch.Messages[0].Payload = make([]byte, 512)
+	_, err := producer.processBatch(context.Background(), batch)
+	require.Equal(t, codes.ResourceExhausted, status.Code(err))
 	require.Len(t, sm.publishedCommands(), 2)
 	require.Len(t, publishedKeys(t, a.DB), 2)
 }

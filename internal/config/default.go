@@ -39,7 +39,7 @@ var defaultConfig = Config{
 		Bolt:   Bolt{File: "./data/futureq.db", Bucket: "futureq"},
 	},
 	Publish: Publish{MinAckLevel: Quorum, ProposalTimeout: 5 * time.Second,
-		BatchMaxRequests: 1, BatchMaxBytes: "1MiB", BatchMaxWait: time.Millisecond,
+		MaxRequestBytes: "1MiB", BatchMaxRequests: 1, BatchMaxBytes: "1MiB", BatchMaxWait: time.Millisecond,
 		MaxPendingRequests: 256},
 	Delivery: Delivery{
 		ShardDistribution:          metadata.ShardDistributionConsumerCount,

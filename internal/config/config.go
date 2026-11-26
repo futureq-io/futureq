@@ -187,6 +187,7 @@ type Publish struct {
 	MinAckLevel        AckLevel      `mapstructure:"minAckLevel" yaml:"minAckLevel"`
 	ProposalTimeout    time.Duration `mapstructure:"proposalTimeout" yaml:"proposalTimeout"`
 	BatchMaxRequests   int           `mapstructure:"batchMaxRequests" yaml:"batchMaxRequests"`
+	MaxRequestBytes    Size          `mapstructure:"maxRequestBytes" yaml:"maxRequestBytes"`
 	BatchMaxBytes      Size          `mapstructure:"batchMaxBytes" yaml:"batchMaxBytes"`
 	BatchMaxWait       time.Duration `mapstructure:"batchMaxWait" yaml:"batchMaxWait"`
 	MaxPendingRequests int           `mapstructure:"maxPendingRequests" yaml:"maxPendingRequests"`
@@ -497,6 +498,9 @@ func (c *Config) validatePublishAndDelivery() error {
 	}
 	if c.Publish.BatchMaxRequests < 1 || c.Publish.BatchMaxRequests > MaxPublishBatchRequests {
 		return fmt.Errorf("publish.batchMaxRequests must be 1..%d", MaxPublishBatchRequests)
+	}
+	if size, err := c.Publish.MaxRequestBytes.Bytes(); err != nil || size > MaxPublishBatchBytes {
+		return fmt.Errorf("publish.maxRequestBytes must be a positive size up to 16MiB")
 	}
 	if size, err := c.Publish.BatchMaxBytes.Bytes(); err != nil || size > MaxPublishBatchBytes {
 		return fmt.Errorf("publish.batchMaxBytes must be a positive size up to 16MiB")

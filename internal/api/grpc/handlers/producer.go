@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"sync"
 	"time"
 
 	"go.uber.org/zap"
@@ -54,7 +53,6 @@ type ProducerHandler struct {
 	batcher                 *publishBatcher
 	pending                 chan struct{}
 	maxPublishBytes         int
-	standaloneWriter        sync.Mutex
 	StandalonePublishLedger *dispatcher.DeliveryLedger
 }
 
@@ -62,7 +60,7 @@ type ProducerHandler struct {
 // Clustered publishes write through the event Raft state machine.
 func NewProducerHandler(logger *zap.Logger) *ProducerHandler {
 	cfg := app.A.Config().Publish
-	maxBytes, _ := cfg.BatchMaxBytes.Bytes() // validated at startup
+	maxBytes, _ := cfg.MaxRequestBytes.Bytes() // validated at startup
 	h := &ProducerHandler{
 		logger:          logger.Named("producer"),
 		pending:         make(chan struct{}, cfg.MaxPendingRequests),

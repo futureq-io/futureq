@@ -136,8 +136,6 @@ func (req *queuedPublish) releaseAdmission() {
 }
 
 func (ph *ProducerHandler) writeStandaloneGroup(ctx context.Context, group []*queuedPublish) error {
-	ph.standaloneWriter.Lock()
-	defer ph.standaloneWriter.Unlock()
 	if err := ctx.Err(); err != nil {
 		return status.FromContextError(err).Err()
 	}
@@ -176,7 +174,7 @@ func (ph *ProducerHandler) writeStandaloneGroup(ctx context.Context, group []*qu
 			}
 		}
 	}
-	if err := repo.PersistLastID(batch, lastID); err != nil {
+	if err := repo.AdvanceLastID(batch, lastID); err != nil {
 		return err
 	}
 	if err := ph.commitStandalonePublish(batch, published); err != nil {

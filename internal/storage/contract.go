@@ -1,7 +1,9 @@
 package storage
 
 import (
+	"bytes"
 	"errors"
+	"fmt"
 	"io"
 )
 
@@ -113,6 +115,13 @@ type Batch interface {
 	// Set adds a key-value pair to the batch, overwriting any existing value.
 	Set(key, value []byte) error
 
+	// SetMaxUint64 maintains a monotonic big-endian watermark. Commit applies
+	// the maximum of value and the stored value atomically with the batch.
+	// An absent key is initialized to value. Use only SetMaxUint64 for
+	// concurrent writes to the key, and keep it separate from Set and Delete
+	// operations in the same batch.
+	SetMaxUint64(key []byte, value uint64) error
+
 	// Delete removes a key from the batch.
 	Delete(key []byte) error
 
@@ -164,4 +173,16 @@ type DB interface {
 	// Close shuts down the storage engine, flushing all pending writes.
 	// No other methods may be called after Close returns.
 	Close() error
+}
+
+// maxUint64Value compares a staged watermark with the current stored value.
+// Both values use an eight-byte big-endian encoding.
+func maxUint64Value(current, staged []byte) (bool, error) {
+	if current == nil {
+		return true, nil
+	}
+	if len(current) != 8 {
+		return false, fmt.Errorf("invalid uint64 watermark length %d", len(current))
+	}
+	return bytes.Compare(current, staged) < 0, nil
 }
