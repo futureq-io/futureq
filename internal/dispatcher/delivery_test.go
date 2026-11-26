@@ -11,7 +11,9 @@ import (
 
 	"github.com/futureq-io/futureq/internal/config"
 	raft "github.com/futureq-io/futureq/internal/raft/event"
+	"github.com/futureq-io/futureq/internal/repository"
 	"github.com/futureq-io/futureq/internal/storage"
+	"github.com/futureq-io/futureq/internal/subscriptions"
 	"github.com/futureq-io/futureq/pkg/utils"
 	pb "github.com/futureq-io/protocol/proto/go"
 	deliverypb "github.com/futureq-io/protocol/proto/go/delivery"
@@ -231,6 +233,76 @@ func (s *RetryExpirySuite) TestShutdownDrainsRefundFromInFlightAuthorization() {
 	s.True(state.Ready(start.Attempts[0].Recipient))
 }
 
+func (s *RetryExpirySuite) TestSlowRefundDoesNotBlockAnotherDuringShutdown() {
+	logger := zap.NewNop()
+	db, err := storage.NewPebble(config.Pebble{Mode: "memory"}, logger)
+	s.Require().NoError(err)
+	defer db.Close() //nolint:errcheck
+	local := NewDeliveryLedger(db, nil, nil, nil)
+	deadline := time.Now().Add(time.Minute)
+	first, second := s.storeRetryFixture(db, 1, deadline), s.storeRetryFixture(db, 2, deadline)
+	firstStarted := make(chan struct{})
+	ledger := NewDeliveryLedger(db, nil, nil, func(raw []byte) (statemachine.Result, error) {
+		var cmd deliverypb.RetryCommand
+		if err := proto.Unmarshal(raw[1:], &cmd); err != nil {
+			return statemachine.Result{}, err
+		}
+		if cmd.Operation == deliverypb.RetryCommand_CANCEL_RESERVATION {
+			return statemachine.Result{}, errors.New("initial refund failed")
+		}
+		value, err := local.ApplyRetry(&cmd)
+		return statemachine.Result{Value: value}, err
+	})
+	ledger.ProposeContext = func(ctx context.Context, raw []byte) (statemachine.Result, error) {
+		var cmd deliverypb.RetryCommand
+		if err := proto.Unmarshal(raw[1:], &cmd); err != nil {
+			return statemachine.Result{}, err
+		}
+		if bytes.Equal(cmd.Attempts[0].Key, first.Attempts[0].Key) {
+			close(firstStarted)
+			<-ctx.Done()
+			return statemachine.Result{}, ctx.Err()
+		}
+		value, err := local.ApplyRetry(&cmd)
+		return statemachine.Result{Value: value}, err
+	}
+
+	prepare := func(uint64) (bool, error) { return true, nil }
+	allowed, err := ledger.AuthorizeRetrySend(first, time.Second, prepare, func() (time.Time, error) { return time.Time{}, nil })
+	s.Require().NoError(err)
+	s.False(allowed)
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ledger.RunRetryRefunds(ctx, time.Millisecond, logger)
+	}()
+	defer func() { cancel(); <-done }()
+	select {
+	case <-firstStarted:
+	case <-ctx.Done():
+		s.FailNow("the first refund never started")
+	}
+	allowed, err = ledger.AuthorizeRetrySend(second, time.Second, prepare, func() (time.Time, error) {
+		ledger.StopRetryOutcomeAdmission()
+		return time.Time{}, nil
+	})
+	s.Require().NoError(err)
+	s.False(allowed)
+	s.Require().Eventually(func() bool {
+		state, err := raft.ReadDeliveryState(db, second.Attempts[0].Key)
+		return err == nil && state.Ready(second.Attempts[0].Recipient)
+	}, time.Second, time.Millisecond)
+	cancel()
+	<-done
+
+	s.Require().NoError(local.expireDueRetryAttempts(context.Background(), deadline.UnixMilli(), nil))
+	page, err := (raft.DeadLetterQuery{Topic: "orders", Limit: 10}).Read(db)
+	s.Require().NoError(err)
+	s.Require().Len(page.Page.Entries, 1)
+	s.True(bytes.HasPrefix(page.Page.Entries[0].Id, first.Attempts[0].Key))
+}
+
 func (s *RetryExpirySuite) TestDeletionClearsTransportTimersAndDeadlines() {
 	logger := zap.NewNop()
 	db, err := storage.NewPebble(config.Pebble{Mode: "memory"}, logger)
@@ -285,6 +357,84 @@ func (s *RetryExpirySuite) TestDeletionDuringAuthorizationCannotInstallTransport
 	s.Empty(ledger.retry.transports)
 }
 
+func (s *RetryExpirySuite) TestRetiringRecipientStopsOnlyItsTransportTimer() {
+	for _, mode := range []string{"standalone", "raft"} {
+		s.Run(mode, func() {
+			logger := zap.NewNop()
+			db, err := storage.NewPebble(config.Pebble{Mode: "memory"}, logger)
+			s.Require().NoError(err)
+			defer db.Close() //nolint:errcheck
+			ctx := context.Background()
+			service := subscriptions.New(db, 0, logger)
+			ledger := NewDeliveryLedger(db, nil, nil, nil)
+			applySubscription := ledger.ApplySubscription
+			if mode == "raft" {
+				repo, err := repository.NewEventRepository(db, logger, time.Second)
+				s.Require().NoError(err)
+				sm := raft.NewEventStateMachineFactoryWithReceiptCache(db, repo, nil, ledger.CompleteRetryAttempts, logger, 0, 0)(1, 1)
+				var index uint64
+				ledger.propose = func(cmd []byte) (statemachine.Result, error) {
+					index++
+					results, err := sm.Update([]statemachine.Entry{{Index: index, Cmd: cmd}})
+					if err != nil {
+						return statemachine.Result{}, err
+					}
+					return results[0].Result, nil
+				}
+				applySubscription = ledger.propose
+				service.Propose = func(_ context.Context, cmd []byte) (statemachine.Result, error) { return applySubscription(cmd) }
+			} else {
+				service.ApplyLocal = applySubscription
+			}
+			s.Require().NoError(service.CreateTopic(ctx, "orders", nil))
+			retired, err := service.Create(ctx, "orders", "retired", "")
+			s.Require().NoError(err)
+			remaining, err := service.Create(ctx, "orders", "remaining", "")
+			s.Require().NoError(err)
+			now := time.Now()
+			deadline := now.Add(time.Hour)
+			start := s.storeRetryFixture(db, 1, deadline)
+			key := start.Attempts[0].Key
+			defer ledger.RemoveRetryTransports([][]byte{key})
+			receipt, err := raft.MarshalPublishReceipt(0, []string{retired.Recipient, remaining.Recipient})
+			s.Require().NoError(err)
+			batch := db.NewBatch()
+			defer batch.Close() //nolint:errcheck
+			s.Require().NoError(batch.Set(raft.DeliveryStateKey(key), receipt))
+			s.Require().NoError(batch.Commit(storage.Sync))
+			var timers []*time.Timer
+			transports := [utils.EventKeySize]byte(key)
+			for i, recipient := range []string{retired.Recipient, remaining.Recipient} {
+				target := start.Attempts[0]
+				target.Recipient = recipient
+				target.Token = bytes.Repeat([]byte{byte(i + 1)}, raft.AttemptTokenSize)
+				ok, err := ledger.AuthorizeRetrySend(start, time.Hour,
+					func(uint64) (bool, error) { return true, nil },
+					func() (time.Time, error) { return deadline, nil })
+				s.Require().NoError(err)
+				s.Require().True(ok)
+				timers = append(timers, ledger.retry.transports[transports][identifyRetry(target)].timer)
+			}
+			s.Require().NoError(service.Unsubscribe(ctx, "orders", "retired", ""))
+			cleanup, err := raft.MarshalSubscriptionCommand(&deliverypb.SubscriptionCommand{
+				Operation: raft.SubscriptionCleanup, NowMs: now.UnixMilli(), Keys: [][]byte{key},
+			})
+			s.Require().NoError(err)
+			result, err := applySubscription(cleanup)
+			s.Require().NoError(err)
+			s.Zero(result.Value, "the remaining recipient still needs the payload")
+			s.Len(ledger.retry.transports[transports], 1)
+			s.False(timers[0].Stop(), "the retired recipient's timer must already be stopped")
+			s.Equal(timers[1], ledger.retry.transports[transports][identifyRetry(start.Attempts[0])].timer)
+			s.True(timers[1].Stop(), "the remaining recipient's timer must still be active")
+			due, err := raft.DueDeliveryAttempts(db, deadline.Add(time.Second).UnixMilli())
+			s.Require().NoError(err)
+			s.Require().Len(due, 1)
+			s.Equal(remaining.Recipient, due[0].Recipient)
+		})
+	}
+}
+
 func (s *RetryExpirySuite) TestFullOutcomeQueueDoesNotDropAnUnsentRefund() {
 	db, err := storage.NewPebble(config.Pebble{Mode: "memory"}, zap.NewNop())
 	s.Require().NoError(err)
@@ -335,12 +485,16 @@ func (s *RetryExpirySuite) TestFullOutcomeQueueDoesNotDropAnUnsentRefund() {
 	s.NoError(err)
 
 	ctx := context.Background()
-	s.Require().ErrorContains(ledger.flushRetryRefunds(ctx), "transient cancellation failure")
+	refund, _ := ledger.claimRetryRefund()
+	s.Require().NotNil(refund)
+	s.Require().ErrorContains(ledger.applyRetryRefund(ctx, refund, 0), "transient cancellation failure")
 	s.Require().NoError(ledger.expireDueRetryAttempts(ctx, deadline, nil))
 	page, err := (raft.DeadLetterQuery{Topic: topic, Limit: 10}).Read(db)
 	s.Require().NoError(err)
 	s.Empty(page.Page.Entries)
-	s.Require().NoError(ledger.flushRetryRefunds(ctx))
+	refund, _ = ledger.claimRetryRefund()
+	s.Require().NotNil(refund)
+	s.Require().NoError(ledger.applyRetryRefund(ctx, refund, 0))
 	s.Len(ledger.retryOutcomes, 1, "refund does not require a slot in the outcome queue")
 	target.DeadlineMs, target.Token = deadline+10, bytes.Repeat([]byte{2}, raft.AttemptTokenSize)
 	start.NowMs = deadline + 1

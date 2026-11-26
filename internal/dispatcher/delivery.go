@@ -270,6 +270,7 @@ func (l *DeliveryLedger) applyLocal(mode storage.SyncMode, apply func(*raft.Deli
 	if l.StandaloneReceipts != nil {
 		l.StandaloneReceipts.CommitBatch(delivery)
 	}
+	l.CompleteRetryAttempts(delivery.CompletedAttempts())
 	if len(deleted) > 0 {
 		l.RemoveRetryTransports(deleted)
 		if l.OnDelete != nil {

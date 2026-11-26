@@ -140,8 +140,8 @@ sender checks its permit and reservation deadline. If either check fails, it
 refunds the unsent attempt. Once the sender enters transport, the attempt
 retains its number through stalls, failures, and broker crashes. Each attempt
 has a distinct tag, so a delayed ACK or NACK cannot settle a later attempt.
-A failed refund stays protected from expiry while the owner retries it in a
-separate worker. The broker reserves capacity for authorization and refunds
+A failed refund stays protected from expiry while a bounded worker pool retries
+refunds independently. The broker reserves capacity for authorization and refunds
 before creating an attempt, using `delivery.ackQueueCapacity` as the bound
 for this work and independently for the ACK queue. Chunked sends prepare and
 validate the first frame while the attempt is still protected for a refund.
@@ -164,9 +164,11 @@ result in a retry or a dead letter.
 Deadline scans drain expired attempts in bounded batches, including when no
 workers are connected. Deletion removes the durable retry deadlines with the
 receipt and stops local transport timers after commit. A final NACK or timeout
-atomically archives the payload and marks that subscription's delivery complete. Other subscriptions keep
-their independent retry budgets. Message TTL and unsubscribing can discard
-pending deliveries before they are dead-lettered. See the
+atomically archives the payload and marks that subscription's delivery
+complete. Other subscriptions keep their independent retry budgets. Message
+TTL and unsubscribing can discard pending deliveries before they are
+dead-lettered. Retiring a subscription stops its transport timers when cleanup
+commits, while other recipients keep their ACK windows. See the
 [dead-letter queue API](api.md#dead-letter-queue) for retention and retrieval.
 
 ## TTL janitor

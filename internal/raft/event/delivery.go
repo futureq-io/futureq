@@ -59,6 +59,12 @@ type DeliveryAck struct {
 	Recipient string
 }
 
+// CompletedAttempt identifies a recipient's attempt removed from its receipt.
+type CompletedAttempt struct {
+	Key   [utils.EventKeySize]byte
+	Token [AttemptTokenSize]byte
+}
+
 type DeliveryPrepare struct {
 	Key        []byte
 	Epoch      uint64
@@ -164,6 +170,7 @@ type DeliveryBatch struct {
 	archiveRefs        map[string]uint32
 	archiveEntries     map[string]bool
 	retryOwners        map[uint64]retryOwnerLease
+	completedAttempts  []CompletedAttempt
 }
 
 func NewDeliveryBatch(db storage.DB, batch storage.Batch) *DeliveryBatch {
@@ -171,6 +178,9 @@ func NewDeliveryBatch(db storage.DB, batch storage.Batch) *DeliveryBatch {
 }
 
 func (b *DeliveryBatch) ObserveStore(key []byte) { b.present[string(key)] = true }
+
+// CompletedAttempts returns token-scoped notifications to publish after commit.
+func (b *DeliveryBatch) CompletedAttempts() []CompletedAttempt { return b.completedAttempts }
 
 func (b *DeliveryBatch) Delete(key []byte) error {
 	state, err := b.load(key)
@@ -206,12 +216,17 @@ func (b *DeliveryBatch) deleteAttemptDeadline(key []byte, recipient string, atte
 }
 
 func (b *DeliveryBatch) acknowledgeRecipient(key []byte, state *DeliveryState, recipient string) error {
-	if !state.Needs(recipient) {
-		return nil
-	}
-	i := uint32(sort.SearchStrings(state.Recipients, recipient))
-	if err := b.deleteAttemptDeadline(key, recipient, state.attempts[i]); err != nil {
-		return err
+	if len(state.attempts) > 0 && state.Needs(recipient) {
+		i := uint32(sort.SearchStrings(state.Recipients, recipient))
+		attempt := state.attempts[i]
+		if err := b.deleteAttemptDeadline(key, recipient, attempt); err != nil {
+			return err
+		}
+		if len(attempt.GetToken()) != 0 {
+			b.completedAttempts = append(b.completedAttempts, CompletedAttempt{
+				Key: [utils.EventKeySize]byte(key), Token: [AttemptTokenSize]byte(attempt.Token),
+			})
+		}
 	}
 	state.acknowledge(recipient)
 	return nil

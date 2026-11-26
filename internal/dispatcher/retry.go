@@ -24,7 +24,7 @@ type retryCoordination struct {
 	mu          sync.Mutex
 	outcomes    map[retryIdentity]struct{}
 	authorizing map[retryIdentity]struct{}
-	refunds     map[retryIdentity]*deliverypb.RetryCommand
+	refunds     map[retryIdentity]*retryRefund
 	expiring    map[retryIdentity]struct{}
 	transports  map[[utils.EventKeySize]byte]map[retryIdentity]retryTransport
 	draining    bool
@@ -35,6 +35,12 @@ type retryCoordination struct {
 type retryTransport struct {
 	deadline time.Time
 	timer    *time.Timer
+}
+
+type retryRefund struct {
+	command  *deliverypb.RetryCommand
+	retryAt  time.Time
+	inFlight bool
 }
 
 // AuthorizeRetrySend holds capacity before reserving the attempt and protects
@@ -91,9 +97,9 @@ func (l *DeliveryLedger) AuthorizeRetrySend(start *deliverypb.RetryCommand, ackW
 		}
 		if refund != nil {
 			if l.retry.refunds == nil {
-				l.retry.refunds = make(map[retryIdentity]*deliverypb.RetryCommand)
+				l.retry.refunds = make(map[retryIdentity]*retryRefund)
 			}
-			l.retry.refunds[id] = refund
+			l.retry.refunds[id] = &retryRefund{command: refund}
 		}
 		l.retry.mu.Unlock()
 	}()
@@ -168,29 +174,44 @@ func (l *DeliveryLedger) RemoveRetryTransports(keys [][]byte) {
 	}
 }
 
-func (l *DeliveryLedger) flushRetryRefunds(ctx context.Context) error {
-	var refunds [32]*deliverypb.RetryCommand
+// CompleteRetryAttempts releases only the attempts removed by receipt cleanup.
+func (l *DeliveryLedger) CompleteRetryAttempts(attempts []raft.CompletedAttempt) {
+	if len(attempts) == 0 {
+		return
+	}
 	l.retry.mu.Lock()
-	n := 0
-	for _, command := range l.retry.refunds {
-		refunds[n] = command
-		n++
-		if n == len(refunds) {
-			break
+	defer l.retry.mu.Unlock()
+	for _, attempt := range attempts {
+		var id retryIdentity
+		copy(id[:utils.EventKeySize], attempt.Key[:])
+		copy(id[utils.EventKeySize:], attempt.Token[:])
+		l.removeRetryTransportLocked(id)
+	}
+}
+
+func (l *DeliveryLedger) claimRetryRefund() (refund *retryRefund, drained bool) {
+	l.retry.mu.Lock()
+	defer l.retry.mu.Unlock()
+	now := time.Now()
+	for _, pending := range l.retry.refunds {
+		if !pending.inFlight && !now.Before(pending.retryAt) {
+			pending.inFlight = true
+			return pending, false
 		}
 	}
-	l.retry.mu.Unlock()
-	for _, command := range refunds[:n] {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if _, err := l.applyRetry(ctx, command); err != nil {
-			return err
-		}
-		l.retry.mu.Lock()
-		delete(l.retry.refunds, identifyRetry(command.Attempts[0]))
-		l.retry.mu.Unlock()
+	return nil, l.retry.draining && len(l.retry.authorizing) == 0 && len(l.retry.refunds) == 0
+}
+
+func (l *DeliveryLedger) applyRetryRefund(ctx context.Context, refund *retryRefund, retryDelay time.Duration) error {
+	_, err := l.applyRetry(ctx, refund.command)
+	l.retry.mu.Lock()
+	defer l.retry.mu.Unlock()
+	if err != nil {
+		refund.inFlight = false
+		refund.retryAt = time.Now().Add(retryDelay)
+		return err
 	}
+	delete(l.retry.refunds, identifyRetry(refund.command.Attempts[0]))
 	return nil
 }
 
@@ -424,31 +445,33 @@ func (l *DeliveryLedger) RunRetryExpiry(ctx context.Context, interval time.Durat
 // RunRetryRefunds drains refunds independently of expiry. During shutdown it
 // also waits for authorizations that may still hand off an unsent attempt.
 func (l *DeliveryLedger) RunRetryRefunds(ctx context.Context, interval time.Duration, logger *zap.Logger) {
-	ticker := time.NewTicker(min(max(interval, 25*time.Millisecond), 250*time.Millisecond))
+	interval = min(max(interval, 25*time.Millisecond), 250*time.Millisecond)
+	const workers = 4
+	var group sync.WaitGroup
+	for range workers {
+		group.Go(func() { l.runRetryRefundWorker(ctx, interval, logger) })
+	}
+	group.Wait()
+}
+
+func (l *DeliveryLedger) runRetryRefundWorker(ctx context.Context, interval time.Duration, logger *zap.Logger) {
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
-	backoff := false
 	for ctx.Err() == nil {
-		l.retry.mu.Lock()
-		draining := l.retry.draining
-		pending := len(l.retry.refunds)
-		drained := draining && len(l.retry.authorizing) == 0 && pending == 0
-		l.retry.mu.Unlock()
+		refund, drained := l.claimRetryRefund()
 		if drained {
 			return
 		}
-		// Keep making progress through batches during the bounded shutdown
-		// window. Wait between failures or while authorizations are settling.
-		if !draining || pending == 0 || backoff {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
+		if refund != nil {
+			if err := l.applyRetryRefund(ctx, refund, interval); err != nil && ctx.Err() == nil {
+				logger.Warn("failed to refund unsent delivery attempt", zap.Error(err))
 			}
+			continue
 		}
-		err := l.flushRetryRefunds(ctx)
-		backoff = err != nil
-		if backoff && ctx.Err() == nil {
-			logger.Warn("failed to refund unsent delivery attempts", zap.Error(err))
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
 		}
 	}
 }

@@ -39,6 +39,9 @@ type EventStateMachine struct {
 	// of each deleted key. Used to remove entries from the dispatcher's in-flight
 	// map. Safe to be nil.
 	OnDeleteKeys func(keys [][]byte)
+	// OnCompletedAttempts releases recipient-specific transport tracking after
+	// commit, including when the event still has other recipients.
+	OnCompletedAttempts func([]CompletedAttempt)
 }
 
 // NewEventStateMachineFactory returns the factory function that Dragonboat
@@ -46,20 +49,21 @@ type EventStateMachine struct {
 func NewEventStateMachineFactory(db storage.DB, repo *repository.EventRepository, onDeleteKeys func(keys [][]byte), logger *zap.Logger) func(uint64, uint64) statemachine.IOnDiskStateMachine {
 	limits := config.DefaultDelivery().ReceiptCache
 	maxBytes, _ := limits.Bytes()
-	return NewEventStateMachineFactoryWithReceiptCache(db, repo, onDeleteKeys, logger, maxBytes, limits.MaxEntries)
+	return NewEventStateMachineFactoryWithReceiptCache(db, repo, onDeleteKeys, nil, logger, maxBytes, limits.MaxEntries)
 }
 
 // NewEventStateMachineFactoryWithReceiptCache uses validated per-replica cache limits.
-func NewEventStateMachineFactoryWithReceiptCache(db storage.DB, repo *repository.EventRepository, onDeleteKeys func(keys [][]byte), logger *zap.Logger, maxBytes int64, maxEntries int) func(uint64, uint64) statemachine.IOnDiskStateMachine {
+func NewEventStateMachineFactoryWithReceiptCache(db storage.DB, repo *repository.EventRepository, onDeleteKeys func(keys [][]byte), onCompletedAttempts func([]CompletedAttempt), logger *zap.Logger, maxBytes int64, maxEntries int) func(uint64, uint64) statemachine.IOnDiskStateMachine {
 	return func(clusterID uint64, nodeID uint64) statemachine.IOnDiskStateMachine {
 		return &EventStateMachine{
-			clusterID:    clusterID,
-			nodeID:       nodeID,
-			db:           db,
-			repo:         repo,
-			logger:       logger.Named("event_sm"),
-			receipts:     newReceiptCache(maxBytes, maxEntries),
-			OnDeleteKeys: onDeleteKeys,
+			clusterID:           clusterID,
+			nodeID:              nodeID,
+			db:                  db,
+			repo:                repo,
+			logger:              logger.Named("event_sm"),
+			receipts:            newReceiptCache(maxBytes, maxEntries),
+			OnDeleteKeys:        onDeleteKeys,
+			OnCompletedAttempts: onCompletedAttempts,
 		}
 	}
 }
@@ -242,6 +246,9 @@ func (s *EventStateMachine) Update(entries []statemachine.Entry) ([]statemachine
 	s.lastPersistedID = lastID
 	s.repo.ObserveID(lastID)
 
+	if s.OnCompletedAttempts != nil && len(delivery.CompletedAttempts()) != 0 {
+		s.OnCompletedAttempts(delivery.CompletedAttempts())
+	}
 	if s.OnDeleteKeys != nil && len(allDeletedKeys) > 0 {
 		s.OnDeleteKeys(allDeletedKeys)
 	}

@@ -129,9 +129,9 @@ func Init(cfg *config.Config, logger *zap.Logger) (*App, error) {
 //   - true: join an existing cluster as an already-registered member
 //     (initialMembers must be empty; membership was registered via JoinCluster).
 //
-// onDeleteKeys is called by the state machine after a DeleteBatchCmd is applied.
-// Wire this to Dispatcher.RemoveInFlightBatch in start.go.
-func (a *App) StartRaft(join bool, onDeleteKeys func(keys [][]byte)) error {
+// The event state machine calls onDeleteKeys and onCompletedAttempts after
+// committing payload deletions and recipient completions respectively.
+func (a *App) StartRaft(join bool, onDeleteKeys func(keys [][]byte), onCompletedAttempts func([]raft.CompletedAttempt)) error {
 	cfg := a.cfg
 	receiptCache := cfg.Delivery.ReceiptCache
 	receiptCacheBytes, err := receiptCache.Bytes()
@@ -260,7 +260,7 @@ func (a *App) StartRaft(join bool, onDeleteKeys func(keys [][]byte)) error {
 	// Pass the fully-initialised EventRepository so the state machine uses the
 	// same monotonic ID counter and key schema as the standalone write path.
 	eventFactory := raft.NewEventStateMachineFactoryWithReceiptCache(
-		a.DB, a.Repositories.Events, onDeleteKeys, a.Logger, receiptCacheBytes, receiptCache.MaxEntries,
+		a.DB, a.Repositories.Events, onDeleteKeys, onCompletedAttempts, a.Logger, receiptCacheBytes, receiptCache.MaxEntries,
 	)
 	if err := nh.StartOnDiskReplica(members, join, eventFactory, eventRC); err != nil {
 		if errors.Is(err, dragonboat.ErrShardNotBootstrapped) {
