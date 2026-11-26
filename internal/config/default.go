@@ -38,7 +38,9 @@ var defaultConfig = Config{
 		Pebble: Pebble{Mode: "disk", DataDir: "./data", WALEnabled: true, CacheSize: "16MiB", MemtableSize: "64MiB", CompactionConcurrency: 1},
 		Bolt:   Bolt{File: "./data/futureq.db", Bucket: "futureq"},
 	},
-	Publish: Publish{MinAckLevel: Quorum, ProposalTimeout: 5 * time.Second},
+	Publish: Publish{MinAckLevel: Quorum, ProposalTimeout: 5 * time.Second,
+		MaxRequestBytes: "1MiB", BatchMaxRequests: 1, BatchMaxBytes: "1MiB", BatchMaxWait: time.Millisecond,
+		MaxPendingRequests: 256},
 	Delivery: Delivery{
 		ShardDistribution:          metadata.ShardDistributionConsumerCount,
 		HeapType:                   HeapBinary,
@@ -72,3 +74,6 @@ var defaultConfig = Config{
 // DefaultDelivery returns a copy of the built-in delivery settings for direct
 // constructors. Application startup overrides these with the loaded config.
 func DefaultDelivery() Delivery { return defaultConfig.Delivery }
+
+// DefaultPublish returns the broker defaults for publishing.
+func DefaultPublish() Publish { return defaultConfig.Publish }

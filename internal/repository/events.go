@@ -77,8 +77,7 @@ func (er *EventRepository) StoreWithBatch(b storage.Batch, id uint64, msg *stora
 		return nil, err
 	}
 
-	// Standalone path only — the Raft path persists last-id per entry.
-	if err := er.PersistLastID(b, id); err != nil {
+	if err := er.AdvanceLastID(b, id); err != nil {
 		return nil, err
 	}
 
@@ -128,8 +127,13 @@ func (er *EventRepository) ObserveID(id uint64) {
 	}
 }
 
-// PersistLastID adds the durable last-id to an existing batch, piggybacking
-// on its commit — no extra fsync.
+// AdvanceLastID atomically advances the standalone watermark alongside the
+// event. Concurrent batches can commit in either ID order.
+func (er *EventRepository) AdvanceLastID(b storage.Batch, id uint64) error {
+	return b.SetMaxUint64(LastIDKey, id)
+}
+
+// PersistLastID writes the watermark selected by ordered Raft apply.
 func (er *EventRepository) PersistLastID(b storage.Batch, id uint64) error {
 	idBytes := make([]byte, 8)
 	binary.BigEndian.PutUint64(idBytes, id)

@@ -67,10 +67,10 @@ func TestPublishHandoffPreservesReservedMessagesAndCachedPayload(t *testing.T) {
 				items := []raft.StoreBatchItem{{ID: id, Bucket: bucket, TopicHash: utils.TopicHash("orders"), Msg: value}}
 				var command []byte
 				if mode == "quorum" {
-					command, err = raft.MarshalPublishBatchCmd(items)
+					command, err = raft.MarshalPublishCmd(items, false, 1<<20)
 				} else {
 					items[0].Receipt = receipt
-					command, err = raft.MarshalStoreDeliveryBatchCmd(items)
+					command, err = raft.MarshalPublishCmd(items, true, 1<<20)
 				}
 				require.NoError(t, err)
 				submit(nodeID, command)

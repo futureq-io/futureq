@@ -49,6 +49,7 @@ maximum is 256.
 `/futureq.FutureQProducer/PublishStream` — bidi stream of `PublishBatch` → `PublishBatchAck`.
 
 - Each `PublishBatch` carries `messages` (topic, payload, delay_ms, ttl_ms, optional indexes) and an `ack_level`.
+- With [standalone batching](configuration.md#publish) enabled, concurrent streams can share a local commit. Cancellation before submission can remove a queued request. Cancellation after submission can leave the publish outcome unknown to the client. Clustered publishes use one Raft proposal per client batch.
 - Each accepted batch receives one `PublishBatchAck`. A rejected batch writes no
   messages and closes the stream with a gRPC error.
 - An empty batch returns a default (unsuccessful) ack and performs no write.
@@ -61,6 +62,10 @@ maximum is 256.
   publications.
 - If any topic in a batch is undeclared, the whole batch fails with `NotFound`.
   A declared topic with no durable destinations fails with `FailedPrecondition`.
+- A client batch that exceeds `publish.maxRequestBytes` fails with `ResourceExhausted`.
+  Quorum apply includes the expanded delivery receipts in the budget for the
+  client batch. The broker also returns `ResourceExhausted` when its pending publish
+  limit is full.
 - Quorum admission uses subscription state at the publish entry in Raft order;
   it needs no separate admission read. Leader and no-ACK modes select destinations
   before proposal using a fresh registry read. An unroutable batch writes no

@@ -184,8 +184,13 @@ type Bolt struct {
 }
 
 type Publish struct {
-	MinAckLevel     AckLevel      `mapstructure:"minAckLevel" yaml:"minAckLevel"`
-	ProposalTimeout time.Duration `mapstructure:"proposalTimeout" yaml:"proposalTimeout"`
+	MinAckLevel        AckLevel      `mapstructure:"minAckLevel" yaml:"minAckLevel"`
+	ProposalTimeout    time.Duration `mapstructure:"proposalTimeout" yaml:"proposalTimeout"`
+	BatchMaxRequests   int           `mapstructure:"batchMaxRequests" yaml:"batchMaxRequests"`
+	MaxRequestBytes    Size          `mapstructure:"maxRequestBytes" yaml:"maxRequestBytes"`
+	BatchMaxBytes      Size          `mapstructure:"batchMaxBytes" yaml:"batchMaxBytes"`
+	BatchMaxWait       time.Duration `mapstructure:"batchMaxWait" yaml:"batchMaxWait"`
+	MaxPendingRequests int           `mapstructure:"maxPendingRequests" yaml:"maxPendingRequests"`
 }
 
 type ReceiptCache struct {
@@ -200,6 +205,12 @@ func (c ReceiptCache) Bytes() (int64, error) {
 	}
 	return c.MaxBytes.Bytes()
 }
+
+const (
+	MaxPublishBatchRequests = 256
+	MaxPublishBatchBytes    = 16 << 20
+	MaxPendingPublishes     = 4096
+)
 
 type Delivery struct {
 	ShardDistribution metadata.ShardDistribution `mapstructure:"shardDistribution" yaml:"shardDistribution"`
@@ -484,6 +495,21 @@ func (c *Config) validatePublishAndDelivery() error {
 	}
 	if c.Publish.ProposalTimeout <= 0 {
 		return fmt.Errorf("publish.proposalTimeout must be positive")
+	}
+	if c.Publish.BatchMaxRequests < 1 || c.Publish.BatchMaxRequests > MaxPublishBatchRequests {
+		return fmt.Errorf("publish.batchMaxRequests must be 1..%d", MaxPublishBatchRequests)
+	}
+	if size, err := c.Publish.MaxRequestBytes.Bytes(); err != nil || size > MaxPublishBatchBytes {
+		return fmt.Errorf("publish.maxRequestBytes must be a positive size up to 16MiB")
+	}
+	if size, err := c.Publish.BatchMaxBytes.Bytes(); err != nil || size > MaxPublishBatchBytes {
+		return fmt.Errorf("publish.batchMaxBytes must be a positive size up to 16MiB")
+	}
+	if c.Publish.BatchMaxWait <= 0 || c.Publish.BatchMaxWait > time.Second {
+		return fmt.Errorf("publish.batchMaxWait must be in (0, 1s]")
+	}
+	if c.Publish.MaxPendingRequests < 1 || c.Publish.MaxPendingRequests > MaxPendingPublishes {
+		return fmt.Errorf("publish.maxPendingRequests must be 1..%d", MaxPendingPublishes)
 	}
 
 	d := c.Delivery

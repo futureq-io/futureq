@@ -29,7 +29,7 @@ func openPublishTest(t *testing.T, engine string) (*app.App, *dispatcher.Hub, *P
 		Storage: config.Storage{Engine: engine,
 			Pebble: config.Pebble{Mode: "disk", DataDir: filepath.Join(root, "pebble"), WALEnabled: true},
 			Bolt:   config.Bolt{File: filepath.Join(root, "bolt.db")}},
-		Delivery: config.DefaultDelivery(), Publish: config.Publish{MinAckLevel: config.Quorum},
+		Delivery: config.DefaultDelivery(), Publish: config.DefaultPublish(),
 	}
 	previous := app.A
 	a, err := app.Init(cfg, zap.NewNop())

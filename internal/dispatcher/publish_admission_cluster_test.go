@@ -38,7 +38,7 @@ func TestQuorumAdmissionOfflineRecipientSurvivesReplicaRestart(t *testing.T) {
 	due := time.Now().Add(-time.Minute).UnixMilli()
 	data, err := proto.Marshal(&storagepb.StoredMessage{Topic: "orders", Payload: []byte("offline"), EnqueuedAtUnixMs: due})
 	require.NoError(t, err)
-	cmd, err := raft.MarshalPublishBatchCmd([]raft.StoreBatchItem{{ID: 708, Bucket: utils.CalculateBucket(due, time.Second), TopicHash: utils.TopicHash("orders"), Msg: data}})
+	cmd, err := raft.MarshalPublishCmd([]raft.StoreBatchItem{{ID: 708, Bucket: utils.CalculateBucket(due, time.Second), TopicHash: utils.TopicHash("orders"), Msg: data}}, false, 1<<20)
 	require.NoError(t, err)
 	result, err := node.nh.SyncPropose(ctx, node.nh.GetNoOPSession(replicaTestShard), cmd)
 	require.NoError(t, err)

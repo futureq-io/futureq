@@ -82,6 +82,11 @@ storage:
 publish:
   minAckLevel: quorum # quorum, leader, or noAck
   proposalTimeout: 5s
+  maxRequestBytes: 1MiB
+  batchMaxRequests: 1 # 1 disables standalone grouping
+  batchMaxBytes: 1MiB
+  batchMaxWait: 1ms
+  maxPendingRequests: 256
 
 delivery:
   # consumerCount weights by workers. replicaCount gives each serving replica equal weight.

@@ -120,6 +120,17 @@ are separate from application storage under `storage.pebble`.
 | ---------------------------- | -------- | ----------- |
 | `publish.minAckLevel`        | `quorum` | Broker-wide minimum acknowledgement durability. One of `quorum`, `leader`, `noAck`. Publish batches requesting a weaker level are rejected with `InvalidArgument`. See [ack levels](clustering.md#publish-ack-levels). |
 | `publish.proposalTimeout`    | `5s`     | Upper bound for each Raft propose / leader-ack wait. Must be positive. |
+| `publish.maxRequestBytes`   | `1MiB`   | Hard byte limit for an individual client batch in standalone and clustered mode, up to 16 MiB. Includes message, receipt, and index keys and values. In a cluster it also caps the encoded Raft command. |
+| `publish.batchMaxRequests`   | `1`      | Maximum client batches in one standalone flush (1–256). Use a value above 1 to enable batching in standalone mode. |
+| `publish.batchMaxBytes`      | `1MiB`   | Byte target for grouping writes in one standalone flush, up to 16 MiB. A client batch larger than the target flushes on its own if it meets the request limit. |
+| `publish.batchMaxWait`       | `1ms`    | Maximum time to collect more client batches in standalone mode once a flush starts collecting (positive, at most 1s). |
+| `publish.maxPendingRequests` | `256`    | Maximum admitted publish requests across all streams and ACK modes (1–4096). Additional requests receive `ResourceExhausted`. |
+
+For example, set `publish.batchMaxRequests: 32` to let concurrent producers
+share a standalone flush. The environment overrides are `FUTUREQ_PUBLISH_BATCHMAXREQUESTS`,
+`FUTUREQ_PUBLISH_BATCHMAXBYTES`, `FUTUREQ_PUBLISH_BATCHMAXWAIT`,
+`FUTUREQ_PUBLISH_MAXREQUESTBYTES`, and `FUTUREQ_PUBLISH_MAXPENDINGREQUESTS`. Each clustered publish uses one Raft
+proposal. The new publish command requires a fresh event Raft log.
 
 ## delivery
 

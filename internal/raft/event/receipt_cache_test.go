@@ -33,7 +33,7 @@ func TestApplyReceiptCacheCommitAndRecovery(t *testing.T) {
 	key := utils.EventKey(1, 2, 3)
 	receipt, err := MarshalPublishReceipt(1, []string{"g:a", "g:b"})
 	require.NoError(t, err)
-	store, err := MarshalStoreDeliveryBatchCmd([]StoreBatchItem{{ID: 3, Bucket: 1, TopicHash: 2, Msg: []byte("payload"), Receipt: receipt}})
+	store, err := MarshalPublishCmd([]StoreBatchItem{{ID: 3, Bucket: 1, TopicHash: 2, Msg: []byte("payload"), Receipt: receipt}}, true, 1<<20)
 	require.NoError(t, err)
 	_, err = sm.Update([]statemachine.Entry{{Index: 1, Cmd: store}})
 	require.NoError(t, err)
@@ -66,7 +66,7 @@ func TestApplyReceiptCacheCommitAndRecovery(t *testing.T) {
 
 	// Restore over a cached receipt for another message. Its old state must
 	// be discarded even though recovery installed a receipt with an earlier ID.
-	other, err := MarshalStoreDeliveryBatchCmd([]StoreBatchItem{{ID: 4, Bucket: 1, TopicHash: 2, Msg: []byte("other"), Receipt: receipt}})
+	other, err := MarshalPublishCmd([]StoreBatchItem{{ID: 4, Bucket: 1, TopicHash: 2, Msg: []byte("other"), Receipt: receipt}}, true, 1<<20)
 	require.NoError(t, err)
 	_, err = sm.Update([]statemachine.Entry{{Index: 4, Cmd: other}})
 	require.NoError(t, err)
@@ -146,7 +146,7 @@ func TestDisabledReceiptCacheFallsBackToPebble(t *testing.T) {
 	key := utils.EventKey(1, 2, 3)
 	receipt, err := MarshalPublishReceipt(1, []string{"g:a"})
 	require.NoError(t, err)
-	store, err := MarshalStoreDeliveryBatchCmd([]StoreBatchItem{{ID: 3, Bucket: 1, TopicHash: 2, Msg: []byte("payload"), Receipt: receipt}})
+	store, err := MarshalPublishCmd([]StoreBatchItem{{ID: 3, Bucket: 1, TopicHash: 2, Msg: []byte("payload"), Receipt: receipt}}, true, 1<<20)
 	require.NoError(t, err)
 	_, err = sm.Update([]statemachine.Entry{{Index: 1, Cmd: store}})
 	require.NoError(t, err)
