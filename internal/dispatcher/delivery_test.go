@@ -582,11 +582,78 @@ func (s *RetryExpirySuite) TestAutoACKReservationReleasesCapacityOnSendFailure()
 	}
 	reservation := ledger.TryReserveRetryAutoACK(outcome(1), func() {})
 	s.Require().NotNil(reservation)
-	s.False(ledger.TryRetryOutcome(outcome(2), func() {}), "manual ACKs cannot consume a reserved slot")
+	s.True(ledger.TryRetryOutcome(outcome(2), func() {}), "manual ACKs use their own capacity")
 	s.Nil(ledger.TryReserveRetryAutoACK(outcome(2), func() {}))
 	s.False(reservation.Finish(false))
-	s.Empty(ledger.retryOutcomes, "failed sends cannot enqueue an ACK")
-	s.True(ledger.TryRetryOutcome(outcome(2), func() {}))
+	s.Empty(ledger.retryAutoACKOutcomes, "failed sends cannot enqueue an ACK")
+	s.NotNil(ledger.TryReserveRetryAutoACK(outcome(3), func() {}), "automatic capacity is available with a full manual queue")
+}
+
+func (s *RetryExpirySuite) TestManualACKCommitsWhileAutoACKHoldsItsOnlySlot() {
+	logger := zap.NewNop()
+	db, err := storage.NewPebble(config.Pebble{Mode: "memory"}, logger)
+	s.Require().NoError(err)
+	defer db.Close() //nolint:errcheck
+	ledger := NewDeliveryLedger(db, nil, nil, nil)
+	ledger.ConfigureRetryOutcomes(1)
+	deadline := time.Now().Add(time.Minute)
+	manual := s.storeRetryFixture(db, 1, deadline)
+	automatic := s.storeRetryFixture(db, 2, deadline)
+	authorize := func(start *deliverypb.RetryCommand) {
+		allowed, err := ledger.AuthorizeRetrySend(start, time.Minute,
+			func(uint64) (bool, error) { return true, nil },
+			func() (time.Time, error) { return deadline, nil })
+		s.Require().NoError(err)
+		s.Require().True(allowed)
+	}
+	ack := func(start *deliverypb.RetryCommand) *deliverypb.RetryCommand {
+		target := start.Attempts[0]
+		return &deliverypb.RetryCommand{
+			Operation: deliverypb.RetryCommand_ACK, NowMs: time.Now().UnixMilli(),
+			Attempts: []*deliverypb.DeliveryAttemptTarget{{
+				Key: target.Key, Recipient: target.Recipient, Token: target.Token,
+			}},
+		}
+	}
+	defer ledger.RemoveRetryTransports([][]byte{manual.Attempts[0].Key, automatic.Attempts[0].Key})
+	authorize(manual)
+	autoACK := ledger.TryReserveRetryAutoACK(ack(automatic), func() {})
+	s.Require().NotNil(autoACK)
+	authorize(automatic)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ledger.RunRetryOutcomes(ctx, 2, logger)
+	}()
+	defer func() { cancel(); <-done }()
+	committed := make(chan struct{})
+	s.Require().True(ledger.TryRetryOutcome(ack(manual), func() { close(committed) }))
+	select {
+	case <-committed:
+	case <-ctx.Done():
+		s.FailNow("the manual ACK did not commit while the auto-ACK send was blocked")
+	}
+
+	ledger.StopRetryOutcomeAdmission()
+	s.Require().True(autoACK.Finish(true))
+	select {
+	case <-done:
+		s.Require().NoError(ctx.Err())
+	case <-ctx.Done():
+		s.FailNow("the automatic outcome did not drain during shutdown")
+	}
+	recovery := NewDeliveryLedger(db, nil, nil, nil)
+	s.Require().NoError(recovery.expireDueRetryAttempts(ctx, deadline.Add(time.Second).UnixMilli(), nil))
+	page, err := (raft.DeadLetterQuery{Topic: "orders", Limit: 10}).Read(db)
+	s.Require().NoError(err)
+	s.Empty(page.Page.Entries)
+	for _, start := range []*deliverypb.RetryCommand{manual, automatic} {
+		state, err := raft.ReadDeliveryState(db, start.Attempts[0].Key)
+		s.Require().NoError(err)
+		s.Nil(state)
+	}
 }
 
 func (s *RetryExpirySuite) TestOwnerRenewalUsesConfiguredLease() {

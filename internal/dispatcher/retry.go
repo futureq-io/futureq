@@ -296,7 +296,7 @@ type retryOutcome struct {
 	onCommitted func()
 }
 
-// RetryAutoACK reserves an outcome queue slot until transport reports its result.
+// RetryAutoACK reserves an automatic outcome slot until transport reports its result.
 type RetryAutoACK struct {
 	ledger  *DeliveryLedger
 	id      retryIdentity
@@ -308,7 +308,7 @@ func (l *DeliveryLedger) TryReserveRetryAutoACK(command *deliverypb.RetryCommand
 	l.retry.mu.Lock()
 	defer l.retry.mu.Unlock()
 	if l.retry.draining || !l.retryOwnerActive() || l.retry.autoACKs[id] != nil ||
-		len(l.retryOutcomes)+len(l.retry.autoACKs) >= cap(l.retryOutcomes) {
+		len(l.retryAutoACKOutcomes)+len(l.retry.autoACKs) >= cap(l.retryAutoACKOutcomes) {
 		return nil
 	}
 	if l.retry.autoACKs == nil {
@@ -333,9 +333,9 @@ func (a *RetryAutoACK) Finish(sent bool) bool {
 		return false
 	}
 	a.outcome.command.NowMs = time.Now().UnixMilli()
-	// Manual outcomes cannot use the reserved slot, and the channel stays
-	// open during shutdown until all reservations are released.
-	l.retryOutcomes <- a.outcome
+	// The automatic queue stays open during shutdown until all reservations
+	// are released, and this send already owns one of its slots.
+	l.retryAutoACKOutcomes <- a.outcome
 	l.trackRetryOutcomeLocked(a.id)
 	return true
 }
@@ -346,7 +346,7 @@ func (l *DeliveryLedger) releaseRetryAutoACKLocked(id retryIdentity) {
 	}
 	delete(l.retry.autoACKs, id)
 	if l.retry.draining && len(l.retry.autoACKs) == 0 {
-		close(l.retryOutcomes)
+		close(l.retryAutoACKOutcomes)
 	}
 }
 
@@ -357,9 +357,10 @@ func (l *DeliveryLedger) trackRetryOutcomeLocked(id retryIdentity) {
 	l.retry.outcomes[id] = struct{}{}
 }
 
-// ConfigureRetryOutcomes initializes the bounded queue before serving consumers.
+// ConfigureRetryOutcomes initializes the independently bounded outcome queues.
 func (l *DeliveryLedger) ConfigureRetryOutcomes(capacity int) {
 	l.retryOutcomes = make(chan retryOutcome, capacity)
+	l.retryAutoACKOutcomes = make(chan retryOutcome, capacity)
 }
 
 func (l *DeliveryLedger) TryRetryOutcome(command *deliverypb.RetryCommand, onCommitted func()) bool {
@@ -373,9 +374,6 @@ func (l *DeliveryLedger) TryRetryOutcome(command *deliverypb.RetryCommand, onCom
 		return true
 	}
 	if l.retry.autoACKs[id] != nil {
-		return false
-	}
-	if reserved := len(l.retry.autoACKs); reserved != 0 && len(l.retryOutcomes)+reserved >= cap(l.retryOutcomes) {
 		return false
 	}
 	select {
@@ -393,8 +391,11 @@ func (l *DeliveryLedger) StopRetryOutcomeAdmission() {
 	defer l.retry.mu.Unlock()
 	if !l.retry.draining {
 		l.retry.draining = true
-		if l.retryOutcomes != nil && len(l.retry.autoACKs) == 0 {
+		if l.retryOutcomes != nil {
 			close(l.retryOutcomes)
+		}
+		if l.retryAutoACKOutcomes != nil && len(l.retry.autoACKs) == 0 {
+			close(l.retryAutoACKOutcomes)
 		}
 	}
 }
@@ -405,16 +406,25 @@ func (l *DeliveryLedger) RunRetryOutcomes(ctx context.Context, workers int, logg
 	var group sync.WaitGroup
 	for range workers {
 		group.Go(func() {
-			for {
+			manual, automatic := l.retryOutcomes, l.retryAutoACKOutcomes
+			for manual != nil || automatic != nil {
+				var outcome retryOutcome
+				var ok bool
 				select {
 				case <-ctx.Done():
 					return
-				case outcome, ok := <-l.retryOutcomes:
+				case outcome, ok = <-manual:
 					if !ok {
-						return
+						manual = nil
+						continue
 					}
-					l.commitRetryOutcome(ctx, outcome, logger)
+				case outcome, ok = <-automatic:
+					if !ok {
+						automatic = nil
+						continue
+					}
 				}
+				l.commitRetryOutcome(ctx, outcome, logger)
 			}
 		})
 	}

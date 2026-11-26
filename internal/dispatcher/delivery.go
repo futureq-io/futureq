@@ -26,9 +26,10 @@ type DeliveryLedger struct {
 	StandaloneReceipts *raft.StandaloneReceiptCache
 	// Installed before Run; allows a bounded preparation job to cancel its
 	// Raft wait without changing the asynchronous ACK retry path.
-	ProposeContext func(context.Context, []byte) (statemachine.Result, error)
-	retryOutcomes  chan retryOutcome
-	retry          retryCoordination
+	ProposeContext       func(context.Context, []byte) (statemachine.Result, error)
+	retryOutcomes        chan retryOutcome
+	retryAutoACKOutcomes chan retryOutcome
+	retry                retryCoordination
 }
 
 // PublishedBatch is the production delivery path. Missing or unbound receipts
