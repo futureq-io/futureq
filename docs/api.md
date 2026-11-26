@@ -49,6 +49,7 @@ maximum is 256.
 `/futureq.FutureQProducer/PublishStream` — bidi stream of `PublishBatch` → `PublishBatchAck`.
 
 - Each `PublishBatch` carries `messages` (topic, payload, delay_ms, ttl_ms, optional indexes) and an `ack_level`.
+- When [internal batching](configuration.md#publish) is enabled, concurrent streams can share a local commit or Raft proposal. Each client batch keeps its own admission result and acknowledgment guarantee. Cancellation before a flush can remove a request from the group. Cancellation after submission can leave the publish outcome unknown to the client.
 - Each accepted batch receives one `PublishBatchAck`. A rejected batch writes no
   messages and closes the stream with a gRPC error.
 - An empty batch returns a default (unsuccessful) ack and performs no write.

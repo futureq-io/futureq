@@ -120,6 +120,18 @@ are separate from application storage under `storage.pebble`.
 | ---------------------------- | -------- | ----------- |
 | `publish.minAckLevel`        | `quorum` | Broker-wide minimum acknowledgement durability. One of `quorum`, `leader`, `noAck`. Publish batches requesting a weaker level are rejected with `InvalidArgument`. See [ack levels](clustering.md#publish-ack-levels). |
 | `publish.proposalTimeout`    | `5s`     | Upper bound for each Raft propose / leader-ack wait. Must be positive. |
+| `publish.batchMaxRequests`   | `1`      | Maximum client batches in one flush (1–256). Use a value above 1 to enable server-side batching. |
+| `publish.batchMaxBytes`      | `1MiB`   | Maximum bytes in a combined flush, up to 16 MiB. Larger client batches flush alone. Standalone counts encoded message, receipt, and index bytes including their keys. |
+| `publish.batchMaxWait`       | `1ms`    | Maximum time to collect more client batches once a flush starts collecting (positive, at most 1s). |
+
+For example, set `publish.batchMaxRequests: 32` to allow concurrent producers to
+share a flush. Environment overrides are `FUTUREQ_PUBLISH_BATCHMAXREQUESTS`,
+`FUTUREQ_PUBLISH_BATCHMAXBYTES`, and `FUTUREQ_PUBLISH_BATCHMAXWAIT`.
+Publishers can also wait for a previous flush to finish. Each gRPC stream
+preserves request and response order. In a cluster, upgrade all event replicas
+before enabling server-side batching because grouped publishes use a new Raft
+log entry. Keep replicas on a version that understands grouped entries while
+those entries can still be replayed.
 
 ## delivery
 

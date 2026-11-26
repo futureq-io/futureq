@@ -38,7 +38,8 @@ var defaultConfig = Config{
 		Pebble: Pebble{Mode: "disk", DataDir: "./data", WALEnabled: true, CacheSize: "16MiB", MemtableSize: "64MiB", CompactionConcurrency: 1},
 		Bolt:   Bolt{File: "./data/futureq.db", Bucket: "futureq"},
 	},
-	Publish: Publish{MinAckLevel: Quorum, ProposalTimeout: 5 * time.Second},
+	Publish: Publish{MinAckLevel: Quorum, ProposalTimeout: 5 * time.Second,
+		BatchMaxRequests: 1, BatchMaxBytes: "1MiB", BatchMaxWait: time.Millisecond},
 	Delivery: Delivery{
 		ShardDistribution:          metadata.ShardDistributionConsumerCount,
 		HeapType:                   HeapBinary,

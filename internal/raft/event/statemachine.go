@@ -112,6 +112,9 @@ func (s *EventStateMachine) applyEntry(batch storage.Batch, delivery *DeliveryBa
 	}
 
 	switch CommandType(cmd[0]) {
+	case PublishGroupCmd:
+		result, maxID, err := s.applyPublishGroup(batch, delivery, cmd, lastID)
+		return result, nil, maxID, err
 	case SubscriptionCmd:
 		result, deleted, err := delivery.ApplySubscription(cmd)
 		return result, deleted, 0, err
