@@ -656,6 +656,103 @@ func (s *RetryExpirySuite) TestManualACKCommitsWhileAutoACKHoldsItsOnlySlot() {
 	}
 }
 
+func (s *RetryExpirySuite) TestManualACKsCommitWhileBothAutomaticWorkersAreStalled() {
+	logger := zap.NewNop()
+	db, err := storage.NewPebble(config.Pebble{Mode: "memory"}, logger)
+	s.Require().NoError(err)
+	defer db.Close() //nolint:errcheck
+	ledger := NewDeliveryLedger(db, nil, nil, nil)
+	ledger.ConfigureRetryOutcomes(1)
+	deadline := time.Now().Add(time.Minute)
+	autoA := s.storeRetryFixture(db, 1, deadline)
+	autoB := s.storeRetryFixture(db, 2, deadline)
+	manualA := s.storeRetryFixture(db, 3, deadline)
+	manualB := s.storeRetryFixture(db, 4, deadline)
+	keys := [][]byte{autoA.Attempts[0].Key, autoB.Attempts[0].Key, manualA.Attempts[0].Key, manualB.Attempts[0].Key}
+	defer ledger.RemoveRetryTransports(keys)
+	autoStarted := make(chan struct{}, 2)
+	unblock := make(chan struct{})
+	ledger.ProposeContext = func(ctx context.Context, raw []byte) (statemachine.Result, error) {
+		var cmd deliverypb.RetryCommand
+		if err := proto.Unmarshal(raw[1:], &cmd); err != nil {
+			return statemachine.Result{}, err
+		}
+		if key := cmd.Attempts[0].Key; bytes.Equal(key, keys[0]) || bytes.Equal(key, keys[1]) {
+			autoStarted <- struct{}{}
+			select {
+			case <-unblock:
+			case <-ctx.Done():
+				return statemachine.Result{}, ctx.Err()
+			}
+		}
+		value, err := ledger.ApplyRetry(&cmd)
+		return statemachine.Result{Value: value}, err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ledger.RunRetryOutcomes(ctx, 2, logger)
+	}()
+	defer func() { cancel(); <-done }()
+	wait := func(ch <-chan struct{}, message string) {
+		select {
+		case <-ch:
+		case <-ctx.Done():
+			s.FailNow(message)
+		}
+	}
+	ack := func(start *deliverypb.RetryCommand) *deliverypb.RetryCommand {
+		target := start.Attempts[0]
+		return &deliverypb.RetryCommand{
+			Operation: deliverypb.RetryCommand_ACK, NowMs: time.Now().UnixMilli(),
+			Attempts: []*deliverypb.DeliveryAttemptTarget{{
+				Key: target.Key, Recipient: target.Recipient, Token: target.Token,
+			}},
+		}
+	}
+	prepare := func(uint64) (bool, error) { return true, nil }
+	ready := func() (time.Time, error) { return deadline, nil }
+	for _, start := range []*deliverypb.RetryCommand{autoA, autoB} {
+		automatic := ledger.TryReserveRetryAutoACK(ack(start), func() {})
+		s.Require().NotNil(automatic)
+		allowed, err := ledger.AuthorizeRetrySend(start, time.Minute, prepare, ready)
+		s.Require().NoError(err)
+		s.Require().True(allowed)
+		s.Require().True(automatic.Finish(true))
+		wait(autoStarted, "an automatic worker did not start its proposal")
+	}
+
+	commitManual := func(start *deliverypb.RetryCommand) {
+		committed := make(chan struct{})
+		s.Require().True(ledger.TryRetryOutcome(ack(start), func() { close(committed) }))
+		wait(committed, "manual persistence waited for the stalled automatic workers")
+	}
+	allowed, err := ledger.AuthorizeManualRetrySend(manualA, time.Minute, prepare, ready)
+	s.Require().NoError(err)
+	s.Require().True(allowed)
+	allowed, err = ledger.AuthorizeManualRetrySend(manualB, time.Minute, prepare, ready)
+	s.Require().NoError(err)
+	s.False(allowed, "a delivery must wait when its outcome capacity is reserved")
+	state, err := raft.ReadDeliveryState(db, keys[3])
+	s.Require().NoError(err)
+	s.True(state.Ready(manualB.Attempts[0].Recipient))
+	commitManual(manualA)
+	allowed, err = ledger.AuthorizeManualRetrySend(manualB, time.Minute, prepare, ready)
+	s.Require().NoError(err)
+	s.Require().True(allowed)
+	commitManual(manualB)
+
+	ledger.StopRetryOutcomeAdmission()
+	close(unblock)
+	wait(done, "outcomes did not drain")
+	recovery := NewDeliveryLedger(db, nil, nil, nil)
+	s.Require().NoError(recovery.expireDueRetryAttempts(ctx, deadline.Add(time.Second).UnixMilli(), nil))
+	page, err := (raft.DeadLetterQuery{Topic: "orders", Limit: 10}).Read(db)
+	s.Require().NoError(err)
+	s.Empty(page.Page.Entries)
+}
+
 func (s *RetryExpirySuite) TestOwnerRenewalUsesConfiguredLease() {
 	const lease = 250 * time.Millisecond
 	const maxClockSkew = 1500 * time.Millisecond

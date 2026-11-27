@@ -23,6 +23,7 @@ type retryIdentity [utils.EventKeySize + raft.AttemptTokenSize]byte
 type retryCoordination struct {
 	mu          sync.Mutex
 	outcomes    map[retryIdentity]struct{}
+	manualSlots map[retryIdentity]struct{}
 	autoACKs    map[retryIdentity]*RetryAutoACK
 	authorizing map[retryIdentity]struct{}
 	refunds     map[retryIdentity]*retryRefund
@@ -42,6 +43,40 @@ type retryRefund struct {
 	command  *deliverypb.RetryCommand
 	retryAt  time.Time
 	inFlight bool
+}
+
+// AuthorizeManualRetrySend reserves a manual outcome slot before START so a
+// timely ACK or NACK can always be queued for this attempt.
+func (l *DeliveryLedger) AuthorizeManualRetrySend(start *deliverypb.RetryCommand, ackWindow time.Duration, prepare func(uint64) (bool, error), checkTransport func() (time.Time, error)) (bool, error) {
+	id := identifyRetry(start.Attempts[0])
+	l.retry.mu.Lock()
+	_, reserved := l.retry.manualSlots[id]
+	if l.retry.draining || reserved || len(l.retryOutcomes)+len(l.retry.manualSlots) >= cap(l.retryOutcomes) {
+		l.retry.mu.Unlock()
+		return false, nil
+	}
+	if l.retry.manualSlots == nil {
+		l.retry.manualSlots = make(map[retryIdentity]struct{})
+	}
+	l.retry.manualSlots[id] = struct{}{}
+	l.retry.mu.Unlock()
+
+	authorized, err := l.AuthorizeRetrySend(start, ackWindow, prepare, checkTransport)
+	if !authorized {
+		l.releaseManualRetryOutcome(id)
+	}
+	return authorized, err
+}
+
+// AbandonManualRetryOutcome releases an unused slot after a transport failure.
+func (l *DeliveryLedger) AbandonManualRetryOutcome(tag []byte) {
+	l.releaseManualRetryOutcome(retryIdentity(tag))
+}
+
+func (l *DeliveryLedger) releaseManualRetryOutcome(id retryIdentity) {
+	l.retry.mu.Lock()
+	defer l.retry.mu.Unlock()
+	delete(l.retry.manualSlots, id)
 }
 
 // AuthorizeRetrySend holds capacity before reserving the attempt and protects
@@ -140,7 +175,11 @@ func (l *DeliveryLedger) AuthorizeRetrySend(start *deliverypb.RetryCommand, ackW
 	// consumer its full monotonic ACK window starting at transport.
 	transports[id] = retryTransport{deadline: transportDeadline, timer: time.AfterFunc(time.Until(transportDeadline), func() {
 		l.retry.mu.Lock()
-		l.removeRetryTransportLocked(id)
+		// Keep the identity available for committed deletion or expiry
+		// while it still owns an outcome slot.
+		if _, manual := l.retry.manualSlots[id]; !manual && l.retry.autoACKs[id] == nil {
+			l.removeRetryTransportLocked(id)
+		}
 		l.retry.mu.Unlock()
 	})}
 	return true, nil
@@ -172,6 +211,7 @@ func (l *DeliveryLedger) RemoveRetryTransports(keys [][]byte) {
 				transport.timer.Stop()
 			}
 			l.releaseRetryAutoACKLocked(id)
+			delete(l.retry.manualSlots, id)
 			delete(l.retry.refunds, id)
 		}
 		delete(l.retry.transports, eventKey)
@@ -191,6 +231,7 @@ func (l *DeliveryLedger) CompleteRetryAttempts(attempts []raft.CompletedAttempt)
 		copy(id[utils.EventKeySize:], attempt.Token[:])
 		l.removeRetryTransportLocked(id)
 		l.releaseRetryAutoACKLocked(id)
+		delete(l.retry.manualSlots, id)
 		delete(l.retry.refunds, id)
 	}
 }
@@ -376,8 +417,13 @@ func (l *DeliveryLedger) TryRetryOutcome(command *deliverypb.RetryCommand, onCom
 	if l.retry.autoACKs[id] != nil {
 		return false
 	}
+	if _, reserved := l.retry.manualSlots[id]; !reserved && len(l.retry.manualSlots) != 0 &&
+		len(l.retryOutcomes)+len(l.retry.manualSlots) >= cap(l.retryOutcomes) {
+		return false
+	}
 	select {
 	case l.retryOutcomes <- retryOutcome{command: command, onCommitted: onCommitted}:
+		delete(l.retry.manualSlots, id)
 		l.trackRetryOutcomeLocked(id)
 		return true
 	default:
@@ -391,6 +437,7 @@ func (l *DeliveryLedger) StopRetryOutcomeAdmission() {
 	defer l.retry.mu.Unlock()
 	if !l.retry.draining {
 		l.retry.draining = true
+		clear(l.retry.manualSlots)
 		if l.retryOutcomes != nil {
 			close(l.retryOutcomes)
 		}
@@ -400,33 +447,26 @@ func (l *DeliveryLedger) StopRetryOutcomeAdmission() {
 	}
 }
 
-// RunRetryOutcomes keeps Raft and storage waits off the stream receiver. More
-// than one worker lets independent deliveries progress around a slow proposal.
+// RunRetryOutcomes gives manual and automatic outcomes dedicated persistence
+// workers while keeping Raft and storage waits off the stream receiver.
 func (l *DeliveryLedger) RunRetryOutcomes(ctx context.Context, workers int, logger *zap.Logger) {
 	var group sync.WaitGroup
-	for range workers {
-		group.Go(func() {
-			manual, automatic := l.retryOutcomes, l.retryAutoACKOutcomes
-			for manual != nil || automatic != nil {
-				var outcome retryOutcome
-				var ok bool
-				select {
-				case <-ctx.Done():
-					return
-				case outcome, ok = <-manual:
-					if !ok {
-						manual = nil
-						continue
-					}
-				case outcome, ok = <-automatic:
-					if !ok {
-						automatic = nil
-						continue
+	for _, queue := range []chan retryOutcome{l.retryOutcomes, l.retryAutoACKOutcomes} {
+		for range workers {
+			group.Go(func() {
+				for {
+					select {
+					case <-ctx.Done():
+						return
+					case outcome, ok := <-queue:
+						if !ok {
+							return
+						}
+						l.commitRetryOutcome(ctx, outcome, logger)
 					}
 				}
-				l.commitRetryOutcome(ctx, outcome, logger)
-			}
-		})
+			})
+		}
 	}
 	group.Wait()
 }
@@ -631,6 +671,8 @@ func (l *DeliveryLedger) expireRetryPage(attempts []*deliverypb.DeliveryAttemptT
 		id := identifyRetry(target)
 		if err == nil {
 			l.releaseRetryAutoACKLocked(id)
+			delete(l.retry.manualSlots, id)
+			l.removeRetryTransportLocked(id)
 		}
 		delete(l.retry.expiring, id)
 	}

@@ -151,10 +151,11 @@ no longer eligible.
 The broker queues outcomes for asynchronous persistence and releases local
 tracking after commit. While a broker owns an attempt, outcomes it accepts
 into a queue take precedence over expiry. Retry-limited deliveries have
-separate manual and automatic outcome queues, each bounded by
-`delivery.ackQueueCapacity`. For auto-ACK deliveries, the broker reserves
-automatic queue capacity before charging the attempt and queues the ACK after
-transport succeeds. On graceful shutdown, the broker
+separate manual and automatic outcome queues and persistence workers.
+Each queue reserves capacity before the broker charges an attempt and
+counts its outstanding reservations toward `delivery.ackQueueCapacity`.
+A manual ACK or NACK uses its reserved slot when received. An automatic
+ACK uses its slot after transport succeeds. On graceful shutdown, the broker
 stops accepting new authorizations and outcomes. It keeps proposals and lease
 renewal active while it drains accepted outcomes and refunds unsent attempts
 within the shutdown window. Clustered brokers renew

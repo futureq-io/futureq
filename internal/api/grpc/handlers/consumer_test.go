@@ -84,6 +84,7 @@ func (s *LimitedConsumerSuite) TestFailedFirstChunkCheckRefundsBeforeSend() {
 		}
 		return statemachine.Result{Value: value}, err
 	})
+	handler.RetryLedger.ConfigureRetryOutcomes(1)
 	stream := &blockedRetrySend{ctx: ctx, sending: make(chan *pb.QueueMessage, 1), unblock: make(chan struct{})}
 	errCh := make(chan error, 1)
 	done := make(chan struct{})
@@ -161,6 +162,7 @@ func (s *LimitedConsumerSuite) exerciseCanceledSend(blockAt deliverypb.RetryComm
 		}
 		return statemachine.Result{Value: value}, err
 	})
+	handler.RetryLedger.ConfigureRetryOutcomes(1)
 	if stall {
 		expiryCtx, stopExpiry := context.WithCancel(ctx)
 		done := make(chan struct{})
@@ -343,6 +345,14 @@ func (s *LimitedConsumerSuite) TestLaterACKCommitsWhileFirstOutcomeIsStalled() {
 }
 
 func (s *LimitedConsumerSuite) TestAutoACKReservesOutcomeSpaceBeforeTransport() {
+	s.exerciseRetryOutcomeCapacity(true)
+}
+
+func (s *LimitedConsumerSuite) TestManualACKReservesOutcomeSpaceBeforeTransport() {
+	s.exerciseRetryOutcomeCapacity(false)
+}
+
+func (s *LimitedConsumerSuite) exerciseRetryOutcomeCapacity(auto bool) {
 	a, hub, producer, _ := openPublishTest(s.T(), "pebble")
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -368,11 +378,12 @@ func (s *LimitedConsumerSuite) TestAutoACKReservesOutcomeSpaceBeforeTransport() 
 	ledger.ConfigureRetryOutcomes(1)
 	handler := NewConsumerHandler(logger, hub, nil)
 	handler.RetryLedger = ledger
+	init := &pb.SubscribeInit{Topic: "orders", GroupId: group, AutoAck: auto}
 	sent := make(chan *pb.QueueMessage, 2)
 	stream := &autoAckSendStream{send: func(msg *pb.QueueMessage) error {
 		// The second send should still be able to enqueue its pre-reserved
 		// ACK if graceful shutdown starts before Send returns.
-		if bytes.HasPrefix(msg.DeliveryTag, keys[1]) {
+		if auto && bytes.HasPrefix(msg.DeliveryTag, keys[1]) {
 			ledger.StopRetryOutcomeAdmission()
 		}
 		sent <- msg
@@ -381,7 +392,7 @@ func (s *LimitedConsumerSuite) TestAutoACKReservesOutcomeSpaceBeforeTransport() 
 	errCh := make(chan error, 1)
 	var workers sync.WaitGroup
 	workers.Go(func() {
-		handler.sender(ctx, stream, consumerID, &pb.SubscribeInit{Topic: "orders", GroupId: group, AutoAck: true}, queue, errCh)
+		handler.sender(ctx, stream, consumerID, init, queue, errCh)
 	})
 	defer func() { cancel(); workers.Wait() }()
 	nextSend := func() *pb.QueueMessage {
@@ -396,7 +407,8 @@ func (s *LimitedConsumerSuite) TestAutoACKReservesOutcomeSpaceBeforeTransport() 
 		}
 		return nil
 	}
-	s.True(bytes.HasPrefix(nextSend().DeliveryTag, keys[0]))
+	first := nextSend()
+	s.True(bytes.HasPrefix(first.DeliveryTag, keys[0]))
 	s.Require().Eventually(func() bool {
 		return len(queue) == 0 && hub.GroupInFlightCount() == 1
 	}, time.Second, time.Millisecond)
@@ -404,6 +416,11 @@ func (s *LimitedConsumerSuite) TestAutoACKReservesOutcomeSpaceBeforeTransport() 
 	state, err := raft.ReadDeliveryState(a.DB, keys[1])
 	s.Require().NoError(err)
 	s.True(state.Ready(subscription.Recipient), "backpressure must leave the attempt uncharged")
+	if !auto {
+		accepted, err := handler.finishLimitedSend(consumerID, init, first.DeliveryTag, true)
+		s.Require().NoError(err)
+		s.Require().True(accepted, "the timely manual ACK must be able to use its reserved slot")
+	}
 
 	outcomesDone := make(chan struct{})
 	workers.Go(func() {
@@ -418,10 +435,16 @@ func (s *LimitedConsumerSuite) TestAutoACKReservesOutcomeSpaceBeforeTransport() 
 	second := nextSend()
 	s.True(bytes.HasPrefix(second.DeliveryTag, keys[1]))
 	s.Equal(uint64(1), second.Attempt)
+	if !auto {
+		accepted, err := handler.finishLimitedSend(consumerID, init, second.DeliveryTag, true)
+		s.Require().NoError(err)
+		s.Require().True(accepted)
+		ledger.StopRetryOutcomeAdmission()
+	}
 	select {
 	case <-outcomesDone:
 	case <-ctx.Done():
-		s.FailNow("automatic ACK did not drain during shutdown")
+		s.FailNow("ACK did not drain during shutdown")
 	}
 	for _, key := range keys {
 		_, _, err := a.DB.Get(key)
@@ -469,6 +492,7 @@ func (s *LimitedConsumerSuite) exerciseExpiredSend(chunked bool) {
 	defer hub.Unregister("consumer")
 	s.Require().NotEmpty(hub.DispatchToTopic("orders", &pb.QueueMessage{Topic: "orders", Payload: payload, MaxRetries: new(uint32(0))}, key))
 	ledger := dispatcher.NewDeliveryLedger(a.DB, nil, nil, nil)
+	ledger.ConfigureRetryOutcomes(1)
 	handler := NewConsumerHandler(logger, hub, nil)
 	handler.RetryLedger = ledger
 	if chunked {

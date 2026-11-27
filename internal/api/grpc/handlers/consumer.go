@@ -269,6 +269,8 @@ func (h *ConsumerHandler) sender(
 			}); err != nil {
 				if frames.autoACK != nil {
 					frames.autoACK.Finish(false)
+				} else if msg.MaxRetries != nil {
+					h.RetryLedger.AbandonManualRetryOutcome(frames.DeliveryTag)
 				}
 				errCh <- err
 				return
@@ -482,7 +484,11 @@ func (h *ConsumerHandler) beginLimitedSend(consumerID string, init *pb.Subscribe
 		}},
 	}
 	var frames *deliveryFrames
-	authorized, err := h.RetryLedger.AuthorizeRetrySend(start, ackWindow, func(attempt uint64) (bool, error) {
+	authorize := h.RetryLedger.AuthorizeManualRetrySend
+	if init.AutoAck {
+		authorize = h.RetryLedger.AuthorizeRetrySend
+	}
+	authorized, err := authorize(start, ackWindow, func(attempt uint64) (bool, error) {
 		if !h.hub.CanSend(consumerID, message) {
 			return false, nil
 		}
