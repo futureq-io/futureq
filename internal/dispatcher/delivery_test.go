@@ -357,6 +357,95 @@ func (s *RetryExpirySuite) TestDeletionDuringAuthorizationCannotInstallTransport
 	s.Empty(ledger.retry.transports)
 }
 
+func (s *RetryExpirySuite) TestForeignExpiryReleasesManualSlotForRedelivery() {
+	logger := zap.NewNop()
+	db, err := storage.NewPebble(config.Pebble{Mode: "memory"}, logger)
+	s.Require().NoError(err)
+	defer db.Close() //nolint:errcheck
+	repo, err := repository.NewEventRepository(db, logger, time.Second)
+	s.Require().NoError(err)
+	ledger := NewDeliveryLedger(db, nil, nil, nil)
+	ledger.ConfigureRetryOutcomes(1)
+	ledger.SetRetryOwner(1)
+	sm := raft.NewEventStateMachineFactoryWithReceiptCache(db, repo, nil, ledger.CompleteRetryAttempts, nil, logger, 0, 0)(1, 1)
+	var index uint64
+	ledger.propose = func(cmd []byte) (statemachine.Result, error) {
+		index++
+		results, err := sm.Update([]statemachine.Entry{{Index: index, Cmd: cmd}})
+		if err != nil {
+			return statemachine.Result{}, err
+		}
+		return results[0].Result, nil
+	}
+	const recipient = "g:workers"
+	topicHash := utils.TopicHash("orders")
+	key := utils.EventKey(1, topicHash, 1)
+	defer ledger.RemoveRetryTransports([][]byte{key})
+	receipt, err := raft.MarshalPublishReceipt(0, []string{recipient})
+	s.Require().NoError(err)
+	payload, err := proto.Marshal(&storagepb.StoredMessage{Topic: "orders", MaxRetries: new(uint32(1))})
+	s.Require().NoError(err)
+	store, err := raft.MarshalStoreDeliveryBatchCmd([]raft.StoreBatchItem{
+		{ID: 1, Bucket: 1, TopicHash: topicHash, Msg: payload, Receipt: receipt},
+	})
+	s.Require().NoError(err)
+	_, err = ledger.propose(store)
+	s.Require().NoError(err)
+	renew := func(now time.Time) {
+		until := now.Add(30 * time.Second)
+		result, err := ledger.ApplyRetry(&deliverypb.RetryCommand{
+			Operation: deliverypb.RetryCommand_RENEW_OWNER, Owner: ledger.retry.owner,
+			NowMs: now.UnixMilli(), LeaseUntilMs: until.UnixMilli(),
+		})
+		s.Require().NoError(err)
+		s.Require().Equal(uint64(until.UnixMilli()), result)
+		ledger.retry.until.Store(&until)
+	}
+	authorize := func(now time.Time, token byte, want uint64) *deliverypb.DeliveryAttemptTarget {
+		deadline := now.Add(time.Minute)
+		target := &deliverypb.DeliveryAttemptTarget{
+			Key: key, Recipient: recipient, Token: bytes.Repeat([]byte{token}, raft.AttemptTokenSize),
+			DeadlineMs: deadline.UnixMilli(),
+		}
+		allowed, err := ledger.AuthorizeManualRetrySend(context.Background(), &deliverypb.RetryCommand{
+			Operation: deliverypb.RetryCommand_START, NowMs: now.UnixMilli(), Attempts: []*deliverypb.DeliveryAttemptTarget{target},
+		}, time.Minute, func(attempt uint64) (bool, error) {
+			s.Equal(want, attempt)
+			return true, nil
+		}, func() (time.Time, error) { return deadline, nil })
+		s.Require().NoError(err)
+		s.Require().True(allowed)
+		return target
+	}
+	now := time.Now()
+	renew(now)
+	first := authorize(now, 1, 1)
+	timer := ledger.retry.transports[[utils.EventKeySize]byte(key)][identifyRetry(first)].timer
+	s.Require().NotNil(timer)
+	expireAt := now.Add(2 * time.Minute)
+	due, err := raft.DueDeliveryAttempts(db, expireAt.UnixMilli())
+	s.Require().NoError(err)
+	s.Require().Len(due, 1)
+	expire, err := raft.MarshalRetryCommand(&deliverypb.RetryCommand{
+		Operation: deliverypb.RetryCommand_EXPIRE, Owner: bytes.Repeat([]byte{2}, raft.RetryOwnerSize),
+		NowMs: expireAt.UnixMilli(), Attempts: due,
+	})
+	s.Require().NoError(err)
+	_, err = ledger.propose(expire)
+	s.Require().NoError(err)
+	s.Empty(ledger.retry.manualSlots)
+	s.False(timer.Stop(), "the replicated expiry should have stopped the original owner's timer")
+	state, err := raft.ReadDeliveryState(db, key)
+	s.Require().NoError(err)
+	s.True(state.Ready(recipient))
+
+	renew(expireAt)
+	second := authorize(expireAt, 2, 2)
+	_, err = ledger.propose(expire)
+	s.Require().NoError(err)
+	s.Contains(ledger.retry.manualSlots, identifyRetry(second), "a stale expiry must preserve the new token's slot")
+}
+
 func (s *RetryExpirySuite) TestSnapshotRecoveryReleasesOnlyMissingManualSlots() {
 	logger := zap.NewNop()
 	db, err := storage.NewPebble(config.Pebble{Mode: "memory"}, logger)
@@ -373,7 +462,7 @@ func (s *RetryExpirySuite) TestSnapshotRecoveryReleasesOnlyMissingManualSlots() 
 	newDelivery := s.storeRetryFixture(db, 3, deadline)
 	defer ledger.RemoveRetryTransports([][]byte{retained.Attempts[0].Key, stale.Attempts[0].Key, newDelivery.Attempts[0].Key})
 	authorize := func(start *deliverypb.RetryCommand) bool {
-		allowed, err := ledger.AuthorizeManualRetrySend(start, time.Hour,
+		allowed, err := ledger.AuthorizeManualRetrySend(context.Background(), start, time.Hour,
 			func(uint64) (bool, error) { return true, nil },
 			func() (time.Time, error) { return deadline, nil })
 		s.Require().NoError(err)
@@ -410,7 +499,7 @@ func (s *RetryExpirySuite) TestShutdownReleasesManualSlotWhenACKWindowEnds() {
 	target := start.Attempts[0]
 	defer ledger.RemoveRetryTransports([][]byte{target.Key})
 	const ackWindow = 100 * time.Millisecond
-	allowed, err := ledger.AuthorizeManualRetrySend(start, ackWindow,
+	allowed, err := ledger.AuthorizeManualRetrySend(context.Background(), start, ackWindow,
 		func(uint64) (bool, error) { return true, nil },
 		func() (time.Time, error) { return time.Now().Add(ackWindow), nil })
 	s.Require().NoError(err)
@@ -795,17 +884,17 @@ func (s *RetryExpirySuite) TestManualACKsCommitWhileBothAutomaticWorkersAreStall
 		s.Require().True(ledger.TryRetryOutcome(ack(start), func() { close(committed) }))
 		wait(committed, "manual persistence waited for the stalled automatic workers")
 	}
-	allowed, err := ledger.AuthorizeManualRetrySend(manualA, time.Minute, prepare, ready)
+	allowed, err := ledger.AuthorizeManualRetrySend(ctx, manualA, time.Minute, prepare, ready)
 	s.Require().NoError(err)
 	s.Require().True(allowed)
-	allowed, err = ledger.AuthorizeManualRetrySend(manualB, time.Minute, prepare, ready)
+	allowed, err = ledger.AuthorizeManualRetrySend(ctx, manualB, time.Minute, prepare, ready)
 	s.Require().NoError(err)
 	s.False(allowed, "a delivery must wait when its outcome capacity is reserved")
 	state, err := raft.ReadDeliveryState(db, keys[3])
 	s.Require().NoError(err)
 	s.True(state.Ready(manualB.Attempts[0].Recipient))
 	commitManual(manualA)
-	allowed, err = ledger.AuthorizeManualRetrySend(manualB, time.Minute, prepare, ready)
+	allowed, err = ledger.AuthorizeManualRetrySend(ctx, manualB, time.Minute, prepare, ready)
 	s.Require().NoError(err)
 	s.Require().True(allowed)
 	commitManual(manualB)

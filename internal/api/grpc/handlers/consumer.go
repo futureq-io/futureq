@@ -249,7 +249,7 @@ func (h *ConsumerHandler) sender(
 			var frames *deliveryFrames
 			var err error
 			if msg.MaxRetries != nil {
-				frames, err = h.beginLimitedSend(consumerID, init, msg)
+				frames, err = h.beginLimitedSend(ctx, consumerID, init, msg)
 			} else if h.hub.BeginSend(consumerID, msg) {
 				frames, err = h.prepareDeliveryFrames(msg)
 			}
@@ -443,7 +443,7 @@ func (h *ConsumerHandler) receiver(
 	}
 }
 
-func (h *ConsumerHandler) beginLimitedSend(consumerID string, init *pb.SubscribeInit, message *pb.QueueMessage) (*deliveryFrames, error) {
+func (h *ConsumerHandler) beginLimitedSend(ctx context.Context, consumerID string, init *pb.SubscribeInit, message *pb.QueueMessage) (*deliveryFrames, error) {
 	if !h.hub.CanSend(consumerID, message) {
 		return nil, nil
 	}
@@ -484,11 +484,7 @@ func (h *ConsumerHandler) beginLimitedSend(consumerID string, init *pb.Subscribe
 		}},
 	}
 	var frames *deliveryFrames
-	authorize := h.RetryLedger.AuthorizeManualRetrySend
-	if init.AutoAck {
-		authorize = h.RetryLedger.AuthorizeRetrySend
-	}
-	authorized, err := authorize(start, ackWindow, func(attempt uint64) (bool, error) {
+	prepare := func(attempt uint64) (bool, error) {
 		if !h.hub.CanSend(consumerID, message) {
 			return false, nil
 		}
@@ -499,7 +495,8 @@ func (h *ConsumerHandler) beginLimitedSend(consumerID string, init *pb.Subscribe
 		})
 		frames = prepared
 		return err == nil, err
-	}, func() (time.Time, error) {
+	}
+	checkTransport := func() (time.Time, error) {
 		if frames.encoded != nil {
 			if err := h.checkDeliveryChunk(consumerID, recipient, message, frames.QueueMessage); err != nil {
 				return time.Time{}, err
@@ -511,7 +508,14 @@ func (h *ConsumerHandler) beginLimitedSend(consumerID string, init *pb.Subscribe
 			return time.Time{}, nil
 		}
 		return deadline, nil
-	})
+	}
+	var authorized bool
+	var err error
+	if init.AutoAck {
+		authorized, err = h.RetryLedger.AuthorizeRetrySend(start, ackWindow, prepare, checkTransport)
+	} else {
+		authorized, err = h.RetryLedger.AuthorizeManualRetrySend(ctx, start, ackWindow, prepare, checkTransport)
+	}
 	if !authorized {
 		if autoACK != nil {
 			autoACK.Finish(false)

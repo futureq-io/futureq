@@ -158,8 +158,10 @@ A manual ACK or NACK uses its reserved slot when received. An automatic
 ACK uses its slot after transport succeeds. Snapshot recovery releases slots
 for attempts missing from the restored receipts. On graceful shutdown, the
 broker stops granting new reservations and honors active reservations within
-the shutdown window. It keeps proposals and lease renewal active while it
-drains accepted outcomes and refunds unsent attempts. Clustered brokers renew
+the shutdown window. Closing a consumer stream releases its unused manual
+slots, and its durable attempts keep their expiry deadlines. The broker keeps
+proposals and lease renewal active while it drains accepted outcomes and
+refunds unsent attempts. Clustered brokers renew
 `delivery.retryOwnerLease` every fifth of its duration (every 3 seconds by
 default). Leaders wait an additional `delivery.retryOwnerMaxClockSkew`
 (default 2 seconds) before recovering another broker's expired attempts.
@@ -168,7 +170,8 @@ An outage that prevents outcomes from committing before recovery can still
 result in a retry or a dead letter.
 
 Deadline scans drain expired attempts in bounded batches, including when no
-workers are connected. Deletion removes the durable retry deadlines with the
+workers are connected. Expiry releases the matching local slot on every replica
+after commit. Deletion removes the durable retry deadlines with the
 receipt and stops local transport timers after commit. A final NACK or timeout
 atomically archives the payload and marks that subscription's delivery
 complete. Other subscriptions keep their independent retry budgets. Message

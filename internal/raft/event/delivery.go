@@ -210,9 +210,15 @@ func (b *DeliveryBatch) deleteAttemptDeadline(key []byte, recipient string, atte
 	if len(attempt.GetToken()) == 0 {
 		return nil
 	}
-	return b.batch.Delete(retryExpiryKey(&deliverypb.DeliveryAttemptTarget{
+	if err := b.batch.Delete(retryExpiryKey(&deliverypb.DeliveryAttemptTarget{
 		Key: key, Recipient: recipient, Token: attempt.Token, DeadlineMs: attempt.DeadlineMs,
-	}))
+	})); err != nil {
+		return err
+	}
+	b.completedAttempts = append(b.completedAttempts, CompletedAttempt{
+		Key: [utils.EventKeySize]byte(key), Token: [AttemptTokenSize]byte(attempt.Token),
+	})
+	return nil
 }
 
 func (b *DeliveryBatch) acknowledgeRecipient(key []byte, state *DeliveryState, recipient string) error {
@@ -221,11 +227,6 @@ func (b *DeliveryBatch) acknowledgeRecipient(key []byte, state *DeliveryState, r
 		attempt := state.attempts[i]
 		if err := b.deleteAttemptDeadline(key, recipient, attempt); err != nil {
 			return err
-		}
-		if len(attempt.GetToken()) != 0 {
-			b.completedAttempts = append(b.completedAttempts, CompletedAttempt{
-				Key: [utils.EventKeySize]byte(key), Token: [AttemptTokenSize]byte(attempt.Token),
-			})
 		}
 	}
 	state.acknowledge(recipient)

@@ -266,10 +266,7 @@ func (b *DeliveryBatch) applyAttempt(op deliverypb.RetryCommand_Operation, nowMs
 	if previous.Reserved && (op == deliverypb.RetryCommand_ACK || op == deliverypb.RetryCommand_NACK) {
 		return 0, false, nil
 	}
-	deadline := &deliverypb.DeliveryAttemptTarget{
-		Key: target.Key, Token: target.Token, Recipient: target.Recipient, DeadlineMs: previous.DeadlineMs,
-	}
-	if err := b.batch.Delete(retryExpiryKey(deadline)); err != nil {
+	if err := b.deleteAttemptDeadline(target.Key, target.Recipient, previous); err != nil {
 		return 0, false, err
 	}
 	if op == deliverypb.RetryCommand_ACK {

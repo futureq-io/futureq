@@ -175,7 +175,7 @@ func (s *LimitedConsumerSuite) exerciseCanceledSend(blockAt deliverypb.RetryComm
 	input := &pb.QueueMessage{Topic: "orders", MaxRetries: new(uint32(0))}
 	s.Require().NotEmpty(hub.DispatchToTopic("orders", input, key))
 	queued := <-queue
-	wire, err := handler.beginLimitedSend("consumer", init, queued)
+	wire, err := handler.beginLimitedSend(ctx, "consumer", init, queued)
 	s.Require().NoError(err)
 	s.Require().Nil(wire, "an expired or invalid permit must prevent any send")
 	hub.RejectQueuedAttempt("consumer", queued)
@@ -188,7 +188,7 @@ func (s *LimitedConsumerSuite) exerciseCanceledSend(blockAt deliverypb.RetryComm
 
 	hub.GrantDeliveryPermit(epoch, time.Now())
 	s.Require().NotEmpty(hub.DispatchToTopic("orders", input, key))
-	wire, err = handler.beginLimitedSend("consumer", init, <-queue)
+	wire, err = handler.beginLimitedSend(ctx, "consumer", init, <-queue)
 	s.Require().NoError(err)
 	s.Require().NotNil(wire)
 	s.Equal(uint64(1), wire.Attempt)
@@ -350,6 +350,69 @@ func (s *LimitedConsumerSuite) TestAutoACKReservesOutcomeSpaceBeforeTransport() 
 
 func (s *LimitedConsumerSuite) TestManualACKReservesOutcomeSpaceBeforeTransport() {
 	s.exerciseRetryOutcomeCapacity(false)
+}
+
+func (s *LimitedConsumerSuite) TestDisconnectedManualStreamReleasesShutdownReservation() {
+	a, hub, producer, _ := openPublishTest(s.T(), "pebble")
+	drainCtx, cancelDrain := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancelDrain()
+	streamCtx, disconnect := context.WithCancel(drainCtx)
+	defer disconnect()
+	subscription, err := a.Subscriptions.Create(drainCtx, "orders", "workers", "")
+	s.Require().NoError(err)
+	ack, err := producer.processBatch(drainCtx, &pb.PublishBatch{Messages: []*pb.PublishMessage{{
+		Topic: "orders", MaxRetries: new(uint32(0)),
+	}}})
+	s.Require().NoError(err)
+	s.Require().True(ack.GetSuccess())
+	keys := publishedKeys(s.T(), a.DB)
+	s.Require().Len(keys, 1)
+	key := keys[0]
+	group := strings.TrimPrefix(subscription.Recipient, "g:")
+	queue := make(chan *pb.QueueMessage, 1)
+	hub.SetDeliveryTimeout(time.Minute)
+	hub.Register("consumer", "orders", group, queue)
+	defer hub.Unregister("consumer")
+	s.Require().NotEmpty(hub.DispatchToTopic("orders", &pb.QueueMessage{Topic: "orders", MaxRetries: new(uint32(0))}, key))
+	logger := zap.NewNop()
+	ledger := dispatcher.NewDeliveryLedger(a.DB, nil, nil, nil)
+	ledger.ConfigureRetryOutcomes(1)
+	handler := NewConsumerHandler(logger, hub, nil)
+	handler.RetryLedger = ledger
+	sent := make(chan struct{}, 1)
+	stream := &autoAckSendStream{send: func(*pb.QueueMessage) error { sent <- struct{}{}; return nil }}
+	errCh := make(chan error, 1)
+	var workers sync.WaitGroup
+	workers.Go(func() {
+		handler.sender(streamCtx, stream, "consumer", &pb.SubscribeInit{Topic: "orders", GroupId: group}, queue, errCh)
+	})
+	defer func() { disconnect(); cancelDrain(); workers.Wait() }()
+	select {
+	case <-sent:
+	case err := <-errCh:
+		s.Require().NoError(err)
+		s.FailNow("manual delivery did not reach transport")
+	case <-drainCtx.Done():
+		s.FailNow("manual delivery did not reach transport")
+	}
+
+	ledger.StopRetryOutcomeAdmission()
+	outcomesDone := make(chan struct{})
+	workers.Go(func() {
+		defer close(outcomesDone)
+		ledger.RunRetryOutcomes(drainCtx, 1, logger)
+	})
+	disconnect()
+	select {
+	case <-outcomesDone:
+		s.Require().NoError(drainCtx.Err())
+	case <-drainCtx.Done():
+		s.FailNow("the disconnected stream kept the drain open")
+	}
+	due, err := raft.DueDeliveryAttempts(a.DB, time.Now().Add(2*time.Minute).UnixMilli())
+	s.Require().NoError(err)
+	s.Require().Len(due, 1, "disconnect must leave the durable attempt for expiry")
+	s.Equal(key, due[0].Key)
 }
 
 func (s *LimitedConsumerSuite) exerciseRetryOutcomeCapacity(auto bool) {

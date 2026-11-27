@@ -23,7 +23,7 @@ type retryIdentity [utils.EventKeySize + raft.AttemptTokenSize]byte
 type retryCoordination struct {
 	mu          sync.Mutex
 	outcomes    map[retryIdentity]struct{}
-	manualSlots map[retryIdentity]struct{}
+	manualSlots map[retryIdentity]func() bool
 	autoACKs    map[retryIdentity]*RetryAutoACK
 	authorizing map[retryIdentity]struct{}
 	refunds     map[retryIdentity]*retryRefund
@@ -48,22 +48,22 @@ type retryRefund struct {
 }
 
 // AuthorizeManualRetrySend reserves a manual outcome slot before START so a
-// timely ACK or NACK can always be queued for this attempt.
-func (l *DeliveryLedger) AuthorizeManualRetrySend(start *deliverypb.RetryCommand, ackWindow time.Duration, prepare func(uint64) (bool, error), checkTransport func() (time.Time, error)) (bool, error) {
+// timely ACK or NACK can be queued while the stream is live.
+func (l *DeliveryLedger) AuthorizeManualRetrySend(streamCtx context.Context, start *deliverypb.RetryCommand, ackWindow time.Duration, prepare func(uint64) (bool, error), checkTransport func() (time.Time, error)) (bool, error) {
 	id := identifyRetry(start.Attempts[0])
 	l.retry.mu.Lock()
 	_, reserved := l.retry.manualSlots[id]
-	if l.retry.draining || reserved || len(l.retryOutcomes)+len(l.retry.manualSlots) >= cap(l.retryOutcomes) {
+	if streamCtx.Err() != nil || l.retry.draining || reserved || len(l.retryOutcomes)+len(l.retry.manualSlots) >= cap(l.retryOutcomes) {
 		l.retry.mu.Unlock()
 		return false, nil
 	}
 	if l.retry.manualSlots == nil {
-		l.retry.manualSlots = make(map[retryIdentity]struct{})
+		l.retry.manualSlots = make(map[retryIdentity]func() bool)
 	}
-	l.retry.manualSlots[id] = struct{}{}
+	l.retry.manualSlots[id] = context.AfterFunc(streamCtx, func() { l.releaseManualRetryOutcome(id) })
 	l.retry.mu.Unlock()
 
-	authorized, err := l.AuthorizeRetrySend(start, ackWindow, prepare, checkTransport)
+	authorized, err := l.authorizeRetrySend(streamCtx, start, ackWindow, prepare, checkTransport)
 	if !authorized {
 		l.releaseManualRetryOutcome(id)
 	}
@@ -82,10 +82,12 @@ func (l *DeliveryLedger) releaseManualRetryOutcome(id retryIdentity) {
 }
 
 func (l *DeliveryLedger) releaseManualRetryOutcomeLocked(id retryIdentity) {
-	if _, reserved := l.retry.manualSlots[id]; !reserved {
+	stop, reserved := l.retry.manualSlots[id]
+	if !reserved {
 		return
 	}
 	delete(l.retry.manualSlots, id)
+	stop()
 	if l.retry.draining && len(l.retry.manualSlots) == 0 {
 		close(l.retryOutcomes)
 	}
@@ -94,6 +96,10 @@ func (l *DeliveryLedger) releaseManualRetryOutcomeLocked(id retryIdentity) {
 // AuthorizeRetrySend holds capacity before reserving the attempt and protects
 // it from expiry until preparation and the final transport check have passed.
 func (l *DeliveryLedger) AuthorizeRetrySend(start *deliverypb.RetryCommand, ackWindow time.Duration, prepare func(uint64) (bool, error), checkTransport func() (time.Time, error)) (authorized bool, err error) {
+	return l.authorizeRetrySend(context.Background(), start, ackWindow, prepare, checkTransport)
+}
+
+func (l *DeliveryLedger) authorizeRetrySend(streamCtx context.Context, start *deliverypb.RetryCommand, ackWindow time.Duration, prepare func(uint64) (bool, error), checkTransport func() (time.Time, error)) (authorized bool, err error) {
 	target := start.Attempts[0]
 	id := identifyRetry(target)
 	key := [utils.EventKeySize]byte(id[:utils.EventKeySize])
@@ -102,7 +108,7 @@ func (l *DeliveryLedger) AuthorizeRetrySend(start *deliverypb.RetryCommand, ackW
 		capacity = MaxPendingCompletions
 	}
 	l.retry.mu.Lock()
-	if _, expiring := l.retry.expiring[id]; l.retry.draining || expiring || len(l.retry.authorizing)+len(l.retry.refunds) >= capacity {
+	if _, expiring := l.retry.expiring[id]; streamCtx.Err() != nil || l.retry.draining || expiring || len(l.retry.authorizing)+len(l.retry.refunds) >= capacity {
 		l.retry.mu.Unlock()
 		return false, nil
 	}
@@ -163,7 +169,7 @@ func (l *DeliveryLedger) AuthorizeRetrySend(start *deliverypb.RetryCommand, ackW
 		return false, nil
 	}
 	prepared, err := prepare(attempt)
-	if !prepared || err != nil {
+	if !prepared || err != nil || streamCtx.Err() != nil {
 		return false, err
 	}
 	now := time.Now()
@@ -181,7 +187,8 @@ func (l *DeliveryLedger) AuthorizeRetrySend(start *deliverypb.RetryCommand, ackW
 	l.retry.mu.Lock()
 	defer l.retry.mu.Unlock()
 	transports := l.retry.transports[key]
-	if _, exists := transports[id]; !exists || err != nil || !time.Now().Before(transportDeadline) || l.retry.draining || !l.retryOwnerActive() {
+	if _, exists := transports[id]; !exists || err != nil || streamCtx.Err() != nil ||
+		!time.Now().Before(transportDeadline) || l.retry.draining || !l.retryOwnerActive() {
 		return false, err
 	}
 	if recovery != l.retry.recovery {
