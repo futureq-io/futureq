@@ -126,7 +126,7 @@ are separate from application storage under `storage.pebble`.
 | Key                            | Default      | Description |
 | ------------------------------ | ------------ | ----------- |
 | `storage.engine`               | `pebble`     | `pebble` (LSM) or `bolt` (single-file B+-tree). |
-| `storage.virtualShards`         | `256`        | Number of virtual delivery shards for new clustered publishes. Accepts powers of two from `1` through `65536`. The event leader reads this at startup. See [virtual delivery shards](storage.md#virtual-delivery-shards). |
+| `storage.virtualShards`         | `256`        | Number of virtual delivery shards for new publishes in standalone and clustered modes. Accepts powers of two from `1` through `65536`. Applied at startup. See [virtual delivery shards](storage.md#virtual-delivery-shards). |
 | `storage.pebble.mode`          | `disk`       | `disk` or `memory` (Pebble over an in-memory FS; nothing persists). |
 | `storage.pebble.dataDir`       | `./data`     | Pebble data directory. |
 | `storage.pebble.walEnabled`    | `true`       | Pebble WAL toggle for disk mode. Clustered disk nodes can set it to `false` and recover from the Raft log. |
@@ -151,7 +151,7 @@ are separate from application storage under `storage.pebble`.
 | `delivery.heapType`                 | `binary` | Candidate heap for due and future messages: `binary` (typed binary), `4ary`, or `8ary`. Applied at startup; restart to change. All choices order by exact due time, then message key. |
 | `delivery.shardDistribution`        | `consumerCount` | Per-group cluster delivery policy. `consumerCount` weights replicas by their consumer counts. `replicaCount` gives equal weight to replicas with at least one consumer in the group. Update the setting on all cluster nodes and restart them. The metadata leader activates its configured policy through a fenced rebalance. |
 | `delivery.discoveryWorkers`          | `2`     | Concurrent topic discovery passes per node, `1..16`. |
-| `delivery.shardWorkers`              | `1`     | Maximum concurrent shard scans within one sharded topic pass. Must be positive. Maximum total concurrency is `discoveryWorkers × shardWorkers`, subject to available shard ranges and the scan budget. A clustered node warns at startup when the configured product exceeds `GOMAXPROCS`. |
+| `delivery.shardWorkers`              | `1`     | Maximum concurrent shard scans within one topic pass in either mode. Must be positive. Maximum total concurrency is `discoveryWorkers × shardWorkers`, subject to available shard ranges and the scan budget. The broker warns at startup when the configured product exceeds `GOMAXPROCS`. |
 | `delivery.preloadScanIdleMaxInterval` | `100ms` | Maximum speculative idle scan backoff. `0` disables it; must be nonnegative. The effective limit is at least the poll interval. Payload mutations reset backoff; due repair cadence is unchanged. |
 | `delivery.dispatchPollInterval`     | `5ms`   | Periodic live due-message scan interval, also used when preloading is enabled. |
 | `delivery.preloadLookahead`         | `0s`    | How far ahead the scheduler scans for upcoming messages. Must be a nonnegative whole number of milliseconds. `0` disables preloading. |

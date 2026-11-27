@@ -173,7 +173,7 @@ func startRun(cmd *cobra.Command, _ []string) {
 	disp.TimeBucket = cfg.Delivery.TimeBucket
 	disp.DiscoveryWorkers = cfg.Delivery.DiscoveryWorkers
 	disp.ShardWorkers = cfg.Delivery.ShardWorkers
-	if cpus := runtime.GOMAXPROCS(0); cfg.Cluster.Enabled && disp.ShardWorkers > cpus/disp.DiscoveryWorkers {
+	if cpus := runtime.GOMAXPROCS(0); disp.ShardWorkers > cpus/disp.DiscoveryWorkers {
 		logger.Warn("configured discovery and shard worker product exceeds GOMAXPROCS",
 			zap.Int("discoveryWorkers", disp.DiscoveryWorkers), zap.Int("shardWorkers", disp.ShardWorkers), zap.Int("gomaxprocs", cpus))
 	}
@@ -241,6 +241,8 @@ func startRun(cmd *cobra.Command, _ []string) {
 			defer a.ComponentShutdownDone()
 			consumerMetadataLoop(a.Ctx, a, hub, logger)
 		}()
+	} else {
+		hub.EnableStandaloneShardScans()
 	}
 
 	a.RegisterComponentWithShutdown()

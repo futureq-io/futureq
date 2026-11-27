@@ -68,7 +68,7 @@ cluster:
 
 storage:
   engine: pebble
-  # Virtual delivery shards for clustered publishes.
+  # Virtual delivery shards for new publishes in both modes.
   virtualShards: 256 # A power of two from 1 through 65536
   pebble:
     # memory uses a virtual filesystem and discards data on exit.

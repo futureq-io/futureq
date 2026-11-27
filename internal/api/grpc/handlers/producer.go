@@ -407,6 +407,8 @@ func waitForLeaderAck(ctx context.Context, persisted <-chan struct{}, applied <-
 func (ph *ProducerHandler) processStandaloneBatch(batch *pb.PublishBatch, nowMs int64, receipts map[string][]byte) error {
 	b := app.A.DB.NewBatch()
 	defer func() { _ = b.Close() }()
+	events := app.A.Repositories.Events
+	shardCount := app.A.Config().Storage.VirtualShards
 
 	var published map[string]*raft.DeliveryState
 	var byTopic map[string]*raft.DeliveryState
@@ -424,7 +426,7 @@ func (ph *ProducerHandler) processStandaloneBatch(batch *pb.PublishBatch, nowMs 
 	}
 
 	if err := ph.marshalMessages(batch, nowMs, func(data *storagepb.StoredMessage) error {
-		key, err := app.A.Repositories.Events.StoreWithBatch(b, app.A.Repositories.Events.NextID(), data)
+		key, err := events.StoreWithBatch(b, events.NextID(), data, shardCount)
 		if err != nil {
 			return err
 		}

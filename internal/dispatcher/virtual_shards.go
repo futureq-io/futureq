@@ -102,11 +102,12 @@ func (r shardSlotRanges) next(slot int) int {
 // ownedShardSlots returns the union of local group ranges for the requested layouts.
 func (v InterestView) ownedShardSlots(layouts int) shardSlotRanges {
 	var owned shardSlotRanges
+	allShards := len(v.universal) != 0 || (v.standaloneShardScans && len(v.groups) != 0)
 	for count := 1; count <= utils.MaxVirtualShards; count *= 2 {
 		if layouts&count == 0 {
 			continue
 		}
-		if len(v.universal) != 0 {
+		if allShards {
 			owned = append(owned, shardSlotRange{count, 2 * count})
 			continue
 		}

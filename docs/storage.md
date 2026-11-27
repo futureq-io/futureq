@@ -25,8 +25,8 @@ Unsharded keys sort by topic, time bucket, and ID. Sharded keys sort by topic,
 shard slot, time bucket, and ID. Slot zero selects the unsharded layout. A
 sharded slot stores the shard count plus the zero-based shard ordinal. The
 largest layout uses 65,536 shards. Time buckets above the 55-bit maximum use
-the final unsharded bucket, and delivery still checks the exact scheduled time
-stored in the message.
+the final time bucket. Clustered publishes use slot zero for these buckets.
+Delivery checks the exact scheduled time stored in the message.
 
 The stored value is the protobuf `StoredMessage` (topic, payload, enqueue time, delay, TTL, indexes). The 25-byte key doubles as the opaque `delivery_tag` consumers receive and echo back on ACK.
 
@@ -37,10 +37,17 @@ Delivery preparation and ACK commands, preparation results, and persisted delive
 
 ## Virtual delivery shards
 
-The event leader chooses a uniform random shard for each published message and
-includes the packed bucket in its Raft command. Every replica stores the same
-key and payload. Each named group divides each layout into contiguous runs of
-shards, ordered by replica ID. `delivery.shardDistribution` defaults to
+The broker chooses a uniform random shard for each published message.
+Standalone discovery scans all shards for topics with local subscribers and
+splits the ranges among up to `delivery.shardWorkers` workers. On Pebble the
+workers share one snapshot per topic pass. Standalone discovery starts at
+slot one, so data from older standalone versions with slot-zero messages
+requires a fresh database.
+
+In cluster mode the event leader includes the packed bucket in its Raft
+command. Every replica stores the same key and payload. Each named group
+divides each layout into contiguous runs of shards, ordered by replica ID.
+`delivery.shardDistribution` defaults to
 `consumerCount`, which weights replicas by the group's worker counts.
 `replicaCount` gives equal weight to each replica with consumers in the group.
 The owning replica selects one of its committed local workers using the Hub's
@@ -56,13 +63,11 @@ fences in-flight delivery before activating the new ownership for queued and
 new messages. During a rollout, the elected metadata leader's config determines
 the desired policy.
 
-Change `storage.virtualShards` on the nodes and restart them to change the
-layout used by the event leader for new publishes. During a rollout, each
-message's key identifies its own layout. Existing messages drain at their
-original keys, including when the count is reduced to one. Worker or
-replica membership changes recalculate ownership for every layout under the
-existing rebalance fence. A size change requires no data copy or delivery-tag
-rewrite. The option applies to clustered publishes.
+Change `storage.virtualShards` and restart to change the layout used for new
+publishes. Each message's key identifies its own layout, so queued messages
+drain at their original keys, including when the count is reduced to one. In
+cluster mode, worker or replica membership changes recalculate ownership for
+every layout under the rebalance fence.
 
 ## Engines
 
