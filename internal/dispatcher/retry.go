@@ -14,6 +14,7 @@ import (
 	"github.com/futureq-io/futureq/internal/storage"
 	"github.com/futureq-io/futureq/pkg/utils"
 	deliverypb "github.com/futureq-io/protocol/proto/go/delivery"
+	"github.com/futureq-io/stormoar/v4/statemachine"
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 )
@@ -36,9 +37,10 @@ type retryCoordination struct {
 }
 
 type retryTransport struct {
-	recipient string
-	deadline  time.Time
-	timer     *time.Timer
+	recipient          string
+	deadline           time.Time
+	messageExpiresAtMs int64
+	timer              *time.Timer
 }
 
 type retryRefund struct {
@@ -173,7 +175,7 @@ func (l *DeliveryLedger) AuthorizeRetrySend(streamCtx context.Context, start *de
 		return false, err
 	}
 	now := time.Now()
-	result, err := l.applyRetry(streamCtx, &deliverypb.RetryCommand{
+	result, err := l.applyRetryResult(streamCtx, &deliverypb.RetryCommand{
 		Operation: deliverypb.RetryCommand_SENT, NowMs: now.UnixMilli(),
 		Attempts: []*deliverypb.DeliveryAttemptTarget{{
 			Key: target.Key, Recipient: target.Recipient, Token: target.Token,
@@ -183,8 +185,15 @@ func (l *DeliveryLedger) AuthorizeRetrySend(streamCtx context.Context, start *de
 	if streamCtx.Err() != nil {
 		return false, nil
 	}
-	if err != nil || result == 0 {
+	if err != nil || result.Value == 0 {
 		return false, err
+	}
+	var expiresAtMs int64
+	if len(result.Data) != 0 {
+		if len(result.Data) != 8 {
+			return false, errors.New("invalid message expiration in retry authorization")
+		}
+		expiresAtMs = int64(binary.BigEndian.Uint64(result.Data))
 	}
 	transportDeadline, err := checkTransport()
 	l.retry.mu.Lock()
@@ -200,10 +209,13 @@ func (l *DeliveryLedger) AuthorizeRetrySend(streamCtx context.Context, start *de
 			return false, err
 		}
 	}
+	if expiresAtMs != 0 && time.Now().UnixMilli() >= expiresAtMs {
+		return false, nil
+	}
 	// The durable deadline is set before SENT. The local owner gives the
 	// consumer its full monotonic ACK window starting at transport.
 	transports[id] = retryTransport{
-		recipient: target.Recipient, deadline: transportDeadline,
+		recipient: target.Recipient, deadline: transportDeadline, messageExpiresAtMs: expiresAtMs,
 		timer: time.AfterFunc(time.Until(transportDeadline), func() { l.onRetryTransportDeadline(id) }),
 	}
 	return true, nil
@@ -349,6 +361,10 @@ func (l *DeliveryLedger) RetrySendActive(key []byte, recipient string, token []b
 	l.retry.mu.Lock()
 	defer l.retry.mu.Unlock()
 	_, expiring := l.retry.expiring[id]
+	transport := l.retry.transports[[utils.EventKeySize]byte(key)][id]
+	if transport.messageExpiresAtMs != 0 && time.Now().UnixMilli() >= transport.messageExpiresAtMs {
+		return false, nil
+	}
 	return !expiring && l.retryOwnerActive(), nil
 }
 
@@ -581,53 +597,51 @@ func (l *DeliveryLedger) ApplyRetry(command *deliverypb.RetryCommand) (uint64, e
 }
 
 func (l *DeliveryLedger) applyRetry(ctx context.Context, command *deliverypb.RetryCommand) (uint64, error) {
+	result, err := l.applyRetryResult(ctx, command)
+	return result.Value, err
+}
+
+func (l *DeliveryLedger) applyRetryResult(ctx context.Context, command *deliverypb.RetryCommand) (statemachine.Result, error) {
+	var result statemachine.Result
 	if len(l.retry.owner) != 0 && command.Operation != deliverypb.RetryCommand_RENEW_OWNER &&
 		command.Operation != deliverypb.RetryCommand_DELETE_DEAD_LETTER {
 		command.Owner = l.retry.owner
 		switch command.Operation {
 		case deliverypb.RetryCommand_START, deliverypb.RetryCommand_SENT:
 			if !l.retryOwnerActive() {
-				return 0, errors.New("delivery retry owner lease unavailable")
+				return result, errors.New("delivery retry owner lease unavailable")
 			}
 		}
 	}
 	cmd, err := raft.MarshalRetryCommand(command)
 	if err != nil {
-		return 0, err
+		return result, err
 	}
-	var value uint64
 	switch {
 	case ctx != nil && l.ProposeContext != nil:
-		result, err := l.ProposeContext(ctx, cmd)
-		if err != nil {
-			return 0, err
-		}
-		value = result.Value
+		result, err = l.ProposeContext(ctx, cmd)
 	case l.propose != nil:
-		result, err := l.propose(cmd)
-		if err != nil {
-			return 0, err
-		}
-		value = result.Value
+		result, err = l.propose(cmd)
 	default:
-		err := l.applyLocal(storage.Sync, func(batch *raft.DeliveryBatch) ([][]byte, error) {
-			result, deleted, err := batch.ApplyRetry(cmd)
-			value = result.Value
+		err = l.applyLocal(storage.Sync, func(batch *raft.DeliveryBatch) ([][]byte, error) {
+			var deleted [][]byte
+			var err error
+			result, deleted, err = batch.ApplyRetry(cmd)
 			return deleted, err
 		})
-		if err != nil {
-			return 0, err
-		}
 	}
-	if value > 0 {
+	if err != nil {
+		return statemachine.Result{}, err
+	}
+	if result.Value > 0 {
 		switch command.Operation {
 		case deliverypb.RetryCommand_NACK:
-			metrics.DeadLetteredTotal.WithLabelValues("nack").Add(float64(value))
+			metrics.DeadLetteredTotal.WithLabelValues("nack").Add(float64(result.Value))
 		case deliverypb.RetryCommand_EXPIRE:
-			metrics.DeadLetteredTotal.WithLabelValues("timeout").Add(float64(value))
+			metrics.DeadLetteredTotal.WithLabelValues("timeout").Add(float64(result.Value))
 		}
 	}
-	return value, nil
+	return result, nil
 }
 
 // RunRetryExpiry resolves unacknowledged attempts even if the worker or broker

@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math"
 	"sort"
 	"strings"
 	"unicode/utf8"
@@ -192,7 +193,7 @@ func (b *DeliveryBatch) ApplyRetry(data []byte) (statemachine.Result, [][]byte, 
 	}
 	var deleted [][]byte
 	for _, target := range cmd.Attempts {
-		value, removed, err := b.applyAttempt(cmd.Operation, cmd.NowMs, cmd.Owner, target)
+		value, removed, err := b.applyAttempt(cmd.Operation, cmd.NowMs, cmd.Owner, target, &result)
 		if err != nil {
 			return result, nil, err
 		}
@@ -204,7 +205,7 @@ func (b *DeliveryBatch) ApplyRetry(data []byte) (statemachine.Result, [][]byte, 
 	return result, deleted, nil
 }
 
-func (b *DeliveryBatch) applyAttempt(op deliverypb.RetryCommand_Operation, nowMs int64, owner []byte, target *deliverypb.DeliveryAttemptTarget) (uint64, bool, error) {
+func (b *DeliveryBatch) applyAttempt(op deliverypb.RetryCommand_Operation, nowMs int64, owner []byte, target *deliverypb.DeliveryAttemptTarget, result *statemachine.Result) (uint64, bool, error) {
 	state, err := b.load(target.Key)
 	if err != nil || !state.Needs(target.Recipient) {
 		if err == nil && op == deliverypb.RetryCommand_EXPIRE {
@@ -244,6 +245,10 @@ func (b *DeliveryBatch) applyAttempt(op deliverypb.RetryCommand_Operation, nowMs
 				return 0, false, err
 			}
 		}
+		message, err := b.retryMessage(target.Key, nowMs)
+		if err != nil || message == nil {
+			return 0, false, err
+		}
 		if previous.Reserved {
 			if previous.DeadlineMs != target.DeadlineMs {
 				reservation := &deliverypb.DeliveryAttemptTarget{
@@ -260,6 +265,11 @@ func (b *DeliveryBatch) applyAttempt(op deliverypb.RetryCommand_Operation, nowMs
 				Number: previous.Number, Token: previous.Token, DeadlineMs: target.DeadlineMs, Owner: previous.Owner,
 			}
 			b.save(target.Key, state)
+		}
+		// SENT authorizes one target. Return its TTL so the sender can check
+		// it again when the proposal response arrives.
+		if message.TtlMs > 0 && message.EnqueuedAtUnixMs <= math.MaxInt64-message.TtlMs {
+			result.Data = binary.BigEndian.AppendUint64(nil, uint64(message.EnqueuedAtUnixMs+message.TtlMs))
 		}
 		return 1, false, nil
 	}

@@ -106,6 +106,44 @@ func (s *RetryExpirySuite) TestAuthorizationCapacityIsCheckedBeforeReservation()
 	s.True(allowed)
 }
 
+func (s *RetryExpirySuite) TestRetrySendActiveStopsAtMessageTTL() {
+	db, err := storage.NewPebble(config.Pebble{Mode: "memory"}, zap.NewNop())
+	s.Require().NoError(err)
+	defer db.Close() //nolint:errcheck
+	ledger := NewDeliveryLedger(db, nil, nil, nil)
+	deadline := time.Now().Add(time.Minute)
+	start := s.storeRetryFixture(db, 1, deadline)
+	target := start.Attempts[0]
+	defer ledger.RemoveRetryTransports([][]byte{target.Key})
+	enqueuedAtMs := time.Now().UnixMilli()
+	const ttlMs = 500
+	payload, err := proto.Marshal(&storagepb.StoredMessage{
+		Topic: "orders", EnqueuedAtUnixMs: enqueuedAtMs, TtlMs: ttlMs, MaxRetries: new(uint32(0)),
+	})
+	s.Require().NoError(err)
+	batch := db.NewBatch()
+	defer batch.Close() //nolint:errcheck
+	s.Require().NoError(batch.Set(target.Key, payload))
+	s.Require().NoError(batch.Commit(storage.Sync))
+
+	allowed, err := ledger.AuthorizeRetrySend(context.Background(), start, time.Minute,
+		func(uint64) (bool, error) { return true, nil },
+		func() (time.Time, error) { return deadline, nil })
+	s.Require().NoError(err)
+	s.Require().True(allowed)
+	active, err := ledger.RetrySendActive(target.Key, target.Recipient, target.Token)
+	s.Require().NoError(err)
+	s.True(active)
+
+	time.Sleep(time.Until(time.UnixMilli(enqueuedAtMs + ttlMs)))
+	active, err = ledger.RetrySendActive(target.Key, target.Recipient, target.Token)
+	s.Require().NoError(err)
+	s.False(active, "the sender must skip remaining chunks after the TTL")
+	state, err := raft.ReadDeliveryState(db, target.Key)
+	s.Require().NoError(err)
+	s.True(state.HasActiveAttempt(target.Recipient, target.Token), "the ACK window is separate from the message TTL")
+}
+
 func (s *RetryExpirySuite) TestDisconnectCancelsAuthorizationWaitAndRefunds() {
 	for _, stage := range []deliverypb.RetryCommand_Operation{deliverypb.RetryCommand_START, deliverypb.RetryCommand_SENT} {
 		s.Run(stage.String(), func() {

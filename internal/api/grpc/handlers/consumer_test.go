@@ -18,6 +18,7 @@ import (
 	"github.com/futureq-io/futureq/pkg/utils"
 	pb "github.com/futureq-io/protocol/proto/go"
 	deliverypb "github.com/futureq-io/protocol/proto/go/delivery"
+	storagepb "github.com/futureq-io/protocol/proto/go/storage"
 	"github.com/futureq-io/stormoar/v4/statemachine"
 	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/require"
@@ -116,6 +117,72 @@ func (s *LimitedConsumerSuite) TestRebalanceBetweenReservationAndSendDoesNotChar
 
 func (s *LimitedConsumerSuite) TestAuthorizationThatReturnsPastDeadlineIsRefunded() {
 	s.exerciseCanceledSend(deliverypb.RetryCommand_SENT, true)
+}
+
+func (s *LimitedConsumerSuite) TestAuthorizationResumingAfterTTLDoesNotReturnDelivery() {
+	for _, stage := range []deliverypb.RetryCommand_Operation{deliverypb.RetryCommand_START, deliverypb.RetryCommand_SENT} {
+		s.Run(stage.String(), func() {
+			a, hub, producer, _ := openPublishTest(s.T(), "pebble")
+			ctx := context.Background()
+			subscription, err := a.Subscriptions.Create(ctx, "orders", "workers", "")
+			s.Require().NoError(err)
+			ack, err := producer.processBatch(ctx, &pb.PublishBatch{Messages: []*pb.PublishMessage{{
+				Topic: "orders", Payload: []byte("original"), TtlMs: 500, MaxRetries: new(uint32(0)),
+			}}})
+			s.Require().NoError(err)
+			s.Require().True(ack.GetSuccess())
+			keys := publishedKeys(s.T(), a.DB)
+			s.Require().Len(keys, 1)
+			key := keys[0]
+			value, closer, err := a.DB.Get(key)
+			s.Require().NoError(err)
+			var stored storagepb.StoredMessage
+			err = proto.Unmarshal(value, &stored)
+			s.Require().NoError(closer.Close())
+			s.Require().NoError(err)
+			expires := time.UnixMilli(stored.EnqueuedAtUnixMs + stored.TtlMs)
+			group := strings.TrimPrefix(subscription.Recipient, "g:")
+			queue := make(chan *pb.QueueMessage, 1)
+			hub.Register("consumer", "orders", group, queue)
+			defer hub.Unregister("consumer")
+			s.Require().NotEmpty(hub.DispatchToTopic("orders", &pb.QueueMessage{
+				Topic: "orders", Payload: stored.Payload, EnqueuedAtUnixMs: stored.EnqueuedAtUnixMs, MaxRetries: stored.MaxRetries,
+			}, key))
+
+			logger := zap.NewNop()
+			sm := raft.NewEventStateMachineFactory(a.DB, a.Repositories.Events, nil, logger)(1, 1)
+			var index uint64
+			delayed := false
+			ledger := dispatcher.NewDeliveryLedger(a.DB, nil, nil, func(raw []byte) (statemachine.Result, error) {
+				var cmd deliverypb.RetryCommand
+				if err := proto.Unmarshal(raw[1:], &cmd); err != nil {
+					return statemachine.Result{}, err
+				}
+				index++
+				results, err := sm.Update([]statemachine.Entry{{Index: index, Cmd: raw}})
+				if err != nil {
+					return statemachine.Result{}, err
+				}
+				result := results[0].Result
+				if cmd.Operation == stage && result.Value != 0 {
+					delayed = true
+					time.Sleep(time.Until(expires))
+				}
+				return result, nil
+			})
+			ledger.ConfigureRetryOutcomes(1)
+			defer ledger.RemoveRetryTransports([][]byte{key})
+			handler := NewConsumerHandler(logger, hub, nil)
+			handler.RetryLedger = ledger
+			frames, err := handler.beginLimitedSend(ctx, "consumer", &pb.SubscribeInit{Topic: "orders", GroupId: group}, <-queue)
+			s.Require().NoError(err)
+			s.Require().True(delayed, "the proposal must commit before TTL expiry")
+			s.Nil(frames, "an expired payload must never reach the gRPC sender")
+			due, err := raft.DueDeliveryAttempts(a.DB, time.Now().Add(time.Minute).UnixMilli())
+			s.Require().NoError(err)
+			s.Empty(due, "skipping transport must refund the attempt")
+		})
+	}
 }
 
 func (s *LimitedConsumerSuite) exerciseCanceledSend(blockAt deliverypb.RetryCommand_Operation, stall bool) {

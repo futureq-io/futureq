@@ -231,6 +231,18 @@ func (s *DeliveryRetrySuite) TestSentReplacesReservationDeadlineWithoutExtending
 	s.Equal(send.DeadlineMs, due[0].DeadlineMs)
 }
 
+func (s *DeliveryRetrySuite) TestSentRejectsMessageAtTTLBoundary() {
+	key := s.store(&storagepb.StoredMessage{
+		Topic: "orders", EnqueuedAtUnixMs: 100, TtlMs: 500, MaxRetries: new(uint32(0)),
+	}, "g:worker")
+	target := s.attempt(key, "g:worker", 1, 1500)
+	s.Require().Equal(uint64(1), s.apply(s.retry(deliverypb.RetryCommand_START, 599, target))[0].Result.Value)
+	s.Zero(s.apply(s.retry(deliverypb.RetryCommand_SENT, 600, target))[0].Result.Value)
+	state, err := ReadDeliveryState(s.db, key)
+	s.Require().NoError(err)
+	s.False(state.HasActiveAttempt(target.Recipient, target.Token))
+}
+
 func (s *DeliveryRetrySuite) TestReplicatedDeleteClearsReservedAndSentDeadlines() {
 	key := s.store(&storagepb.StoredMessage{Topic: "orders", EnqueuedAtUnixMs: 100, MaxRetries: new(uint32(0))}, "g:worker", "u:audit")
 	sent := s.attempt(key, "g:worker", 1, 3700)
