@@ -204,30 +204,38 @@ func (l *DeliveryLedger) AuthorizeRetrySend(streamCtx context.Context, start *de
 // BeginRetryTransport checks the delivery permit and deadlines immediately
 // before the first frame, using the same lock that arbitrates expiry.
 func (l *DeliveryLedger) BeginRetryTransport(tag []byte, canSend func() bool) bool {
-	id := retryIdentity(tag)
+	return l.beginRetryFrame(retryIdentity(tag), true, nil, canSend)
+}
+
+func (l *DeliveryLedger) beginRetryFrame(id retryIdentity, first bool, autoACK *RetryAutoACK, canSend func() bool) bool {
 	key := [utils.EventKeySize]byte(id[:utils.EventKeySize])
 	l.retry.mu.Lock()
 	transport, exists := l.retry.transports[key][id]
 	_, held := l.retry.authorizing[id]
 	_, expiring := l.retry.expiring[id]
-	if !held || !exists || expiring {
-		delete(l.retry.authorizing, id)
+	if (first && !held) || !exists || expiring {
 		l.retry.mu.Unlock()
 		return false
 	}
-	permitted := canSend() && l.retryOwnerActive()
+	permitted := (autoACK == nil || (l.retry.autoACKs[id] == autoACK && !autoACK.sendingFinalFrame)) &&
+		canSend() && l.retryOwnerActive()
 	now := time.Now()
 	if permitted && now.Before(transport.deadline) &&
 		(transport.messageExpiresAtMs == 0 || now.UnixMilli() < transport.messageExpiresAtMs) {
 		delete(l.retry.authorizing, id)
+		if autoACK != nil {
+			autoACK.sendingFinalFrame = true
+		}
 		l.retry.mu.Unlock()
 		return true
 	}
-	// Keep expiry out until the refund commits or is queued.
 	l.retry.mu.Unlock()
-	l.refundUnsentRetry(&deliverypb.DeliveryAttemptTarget{
-		Key: tag[:utils.EventKeySize], Recipient: transport.recipient, Token: tag[utils.EventKeySize:],
-	})
+	if first {
+		// Keep expiry out until the refund commits or is queued.
+		l.refundUnsentRetry(&deliverypb.DeliveryAttemptTarget{
+			Key: key[:], Recipient: transport.recipient, Token: id[utils.EventKeySize:],
+		})
+	}
 	return false
 }
 
@@ -465,9 +473,16 @@ type retryOutcome struct {
 
 // RetryAutoACK reserves an automatic outcome slot until transport reports its result.
 type RetryAutoACK struct {
-	ledger  *DeliveryLedger
-	id      retryIdentity
-	outcome retryOutcome
+	ledger            *DeliveryLedger
+	id                retryIdentity
+	outcome           retryOutcome
+	sendingFinalFrame bool // guarded by ledger.retry.mu until Finish
+}
+
+// BeginFinalFrame holds off expiry until Finish can report the transport result.
+// Earlier chunks remain subject to the normal attempt deadline.
+func (a *RetryAutoACK) BeginFinalFrame(first bool, canSend func() bool) bool {
+	return a.ledger.beginRetryFrame(a.id, first, a, canSend)
 }
 
 func (l *DeliveryLedger) TryReserveRetryAutoACK(command *deliverypb.RetryCommand, onCommitted func()) *RetryAutoACK {
@@ -799,8 +814,10 @@ func (l *DeliveryLedger) expireRetryPage(attempts []*deliverypb.DeliveryAttemptT
 		_, authorizing := l.retry.authorizing[id]
 		_, refunding := l.retry.refunds[id]
 		_, expiringElsewhere := l.retry.expiring[id]
+		autoACK := l.retry.autoACKs[id]
 		transport := l.retry.transports[[utils.EventKeySize]byte(id[:utils.EventKeySize])][id]
-		if !pending && !authorizing && !refunding && !expiringElsewhere && !time.Now().Before(transport.deadline) {
+		if !pending && !authorizing && !refunding && !expiringElsewhere &&
+			(autoACK == nil || !autoACK.sendingFinalFrame) && !time.Now().Before(transport.deadline) {
 			if l.retry.expiring == nil {
 				l.retry.expiring = make(map[retryIdentity]struct{})
 			}

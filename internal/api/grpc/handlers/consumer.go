@@ -356,7 +356,14 @@ func (h *ConsumerHandler) sendDelivery(ctx context.Context, stream grpc.BidiStre
 	first := true
 	canSend := func() bool { return h.hub.CanSend(consumerID, queued) && ctx.Err() == nil }
 	send := func(frame *pb.QueueMessage) error {
-		if first && frames.MaxRetries != nil && !h.RetryLedger.BeginRetryTransport(frames.DeliveryTag, canSend) {
+		if frames.autoACK != nil && !frame.GetMoreChunks() {
+			if !frames.autoACK.BeginFinalFrame(first, canSend) {
+				if first {
+					return errRetryTransportSkipped
+				}
+				return status.Error(codes.Aborted, "delivery attempt ended before the final chunk")
+			}
+		} else if first && frames.MaxRetries != nil && !h.RetryLedger.BeginRetryTransport(frames.DeliveryTag, canSend) {
 			return errRetryTransportSkipped
 		}
 		first = false

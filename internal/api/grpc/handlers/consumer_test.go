@@ -615,6 +615,88 @@ func (s *LimitedConsumerSuite) TestSuccessfulAutoACKSendWinsExpiryWhileMetricsWa
 	require.ErrorIs(t, <-errs, context.Canceled)
 }
 
+func (s *LimitedConsumerSuite) TestSuccessfulAutoACKSendWinsExpiryBeforeAdmission() {
+	for _, tc := range []struct {
+		name         string
+		maxSendBytes int
+	}{
+		{name: "single frame"},
+		{name: "chunked", maxSendBytes: 256},
+	} {
+		s.Run(tc.name, func() {
+			a, hub, producer, _ := openPublishTest(s.T(), "pebble")
+			ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+			defer cancel()
+			subscription, err := a.Subscriptions.Create(ctx, "orders", "workers", "")
+			s.Require().NoError(err)
+			payload := bytes.Repeat([]byte("message"), 100)
+			published, err := producer.processBatch(ctx, &pb.PublishBatch{Messages: []*pb.PublishMessage{{
+				Topic: "orders", Payload: payload, MaxRetries: new(uint32(0)),
+			}}})
+			s.Require().NoError(err)
+			s.Require().True(published.GetSuccess())
+			keys := publishedKeys(s.T(), a.DB)
+			s.Require().Len(keys, 1)
+			key := keys[0]
+
+			group := strings.TrimPrefix(subscription.Recipient, "g:")
+			init := &pb.SubscribeInit{Topic: "orders", GroupId: group, AutoAck: true}
+			queue := make(chan *pb.QueueMessage, 1)
+			hub.SetDeliveryTimeout(300 * time.Millisecond)
+			hub.Register("consumer", "orders", group, queue)
+			defer hub.Unregister("consumer")
+			s.Require().NotEmpty(hub.DispatchToTopic("orders", &pb.QueueMessage{
+				Topic: "orders", Payload: payload, MaxRetries: new(uint32(0)),
+			}, key))
+			queued := <-queue
+			logger := zap.NewNop()
+			ledger := dispatcher.NewDeliveryLedger(a.DB, nil, nil, nil)
+			ledger.ConfigureRetryOutcomes(1)
+			defer ledger.RemoveRetryTransports(keys)
+			handler := NewConsumerHandler(logger, hub, nil)
+			handler.RetryLedger = ledger
+			handler.MaxSendBytes = tc.maxSendBytes
+			frames, err := handler.beginLimitedSend(ctx, "consumer", init, queued)
+			s.Require().NoError(err)
+			s.Require().NotNil(frames)
+			s.Require().NotNil(frames.autoACK)
+
+			sent := 0
+			stream := &autoAckSendStream{send: func(*pb.QueueMessage) error { sent++; return nil }}
+			s.Require().NoError(handler.sendDelivery(ctx, stream, "consumer", subscription.Recipient, queued, frames))
+			s.Positive(sent)
+			s.Equal(tc.maxSendBytes > 0, sent > 1)
+
+			// Pause after the final Send succeeds and let expiry scan before Finish.
+			s.Require().Eventually(func() bool { return !hub.CanSend("consumer", queued) }, time.Second, 5*time.Millisecond)
+			expiryCtx, stopExpiry := context.WithCancel(ctx)
+			scans := 0
+			ledger.RunRetryExpiry(expiryCtx, time.Millisecond, func() bool {
+				scans++
+				if scans == 2 {
+					stopExpiry()
+					return false
+				}
+				return true
+			}, logger)
+			stopExpiry()
+			s.Require().Equal(2, scans)
+			s.True(frames.autoACK.Finish(true), "expiry must wait for successful auto-ACK admission")
+
+			var workers sync.WaitGroup
+			workers.Go(func() { ledger.RunRetryOutcomes(ctx, 1, logger) })
+			defer func() { cancel(); workers.Wait() }()
+			s.Require().Eventually(func() bool {
+				state, err := raft.ReadDeliveryState(a.DB, key)
+				return err == nil && state == nil
+			}, time.Second, 5*time.Millisecond)
+			page, err := (raft.DeadLetterQuery{Topic: "orders", Limit: 1}).Read(a.DB)
+			s.Require().NoError(err)
+			s.Empty(page.Page.Entries)
+		})
+	}
+}
+
 func (s *LimitedConsumerSuite) TestCanceledAutoACKDuringAuthorizationRefundsWithoutSend() {
 	a, hub, producer, _ := openPublishTest(s.T(), "pebble")
 	ctx, cancel := context.WithCancel(context.Background())

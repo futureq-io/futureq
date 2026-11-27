@@ -2,8 +2,6 @@ module github.com/futureq-io/futureq
 
 go 1.27.1
 
-replace github.com/futureq-io/protocol/proto/go => ../futureq-proto/proto/go
-
 require (
 	github.com/cespare/xxhash/v2 v2.3.0
 	github.com/cockroachdb/pebble/v2 v2.1.7
