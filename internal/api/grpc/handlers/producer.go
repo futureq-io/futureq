@@ -117,6 +117,11 @@ func (ph *ProducerHandler) processBatch(ctx context.Context, batch *pb.PublishBa
 		return &pb.PublishBatchAck{Success: false}, status.Errorf(codes.InvalidArgument,
 			"ack level %s is below the broker minimum %s", ackLevel, app.A.Config().Publish.MinAckLevel)
 	}
+	if ackLevel == pb.AckLevel_ACK_LEVEL_LEADER && app.A.NodeHost != nil &&
+		app.A.Config().Cluster.Raft.LogDB.Backend == config.LogDBPebble {
+		metrics.PublishRequestsTotal.WithLabelValues(topicLabel, ackLevel.String(), "rejected").Inc()
+		return &pb.PublishBatchAck{Success: false}, status.Error(codes.InvalidArgument, "leader acknowledgements require the Tan Raft LogDB")
+	}
 
 	nowMs := time.Now().UnixMilli()
 	if maxSize, _ := app.A.Config().API.GRPC.MaxSendMessageSize.Bytes(); maxSize > 0 {

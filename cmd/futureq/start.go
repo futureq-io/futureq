@@ -77,16 +77,20 @@ func startRun(cmd *cobra.Command, _ []string) {
 		seeds = joinSeeds
 	}
 	joining := false
-	if cfg.Cluster.Enabled && len(seeds) > 0 {
-		if a.HasRaftData() {
+	if cfg.Cluster.Enabled {
+		if err := a.OpenRaft(); err != nil {
+			logger.Fatal("failed to open raft storage", zap.Error(err))
+		}
+		switch {
+		case a.HasRaftData():
 			logger.Info("local raft data found, skipping join flow")
-		} else {
+			joining = len(seeds) > 0
+		case len(seeds) > 0:
 			joinCluster(cfg, seeds, logger)
 			joining = true
+		case len(cfg.Cluster.Raft.InitialMembers) == 0:
+			logger.Fatal("fresh cluster node requires cluster.raft.initialMembers or cluster.joinSeeds")
 		}
-	}
-	if cfg.Cluster.Enabled && !a.HasRaftData() && !joining && len(cfg.Cluster.Raft.InitialMembers) == 0 {
-		logger.Fatal("fresh cluster node requires cluster.raft.initialMembers or cluster.joinSeeds")
 	}
 
 	// ── Dispatcher components ─────────────────────────────────────────────────

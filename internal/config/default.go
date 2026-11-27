@@ -22,6 +22,10 @@ var defaultConfig = Config{
 			InitialMembers: map[uint64]string{}, RTT: 200 * time.Millisecond,
 			SnapshotEntries: 10000, CompactionOverhead: 5000,
 			LogDB: LogDB{
+				Backend:                  LogDBPebble,
+				PebbleWALMinSyncInterval: 500 * time.Microsecond,
+				CompactionConcurrency:    1,
+
 				Workers: 16, Shards: 16, KVKeepLogFileNum: 16,
 				KVMaxBackgroundCompactions: 2, KVMaxBackgroundFlushes: 2,
 				KVLRUCacheSize: "0B", KVWriteBufferSize: "16MiB", KVMaxWriteBufferNumber: 4,
@@ -35,8 +39,9 @@ var defaultConfig = Config{
 	},
 	Storage: Storage{
 		Engine: "pebble", VirtualShards: 256,
-		Pebble: Pebble{Mode: "disk", DataDir: "./data", WALEnabled: true, CacheSize: "16MiB", MemtableSize: "64MiB", CompactionConcurrency: 1},
-		Bolt:   Bolt{File: "./data/futureq.db", Bucket: "futureq"},
+		Pebble: Pebble{Mode: "disk", DataDir: "./data", WALEnabled: true, WALMinSyncInterval: 500 * time.Microsecond,
+			CacheSize: "16MiB", MemtableSize: "64MiB", CompactionConcurrency: 1},
+		Bolt: Bolt{File: "./data/futureq.db", Bucket: "futureq"},
 	},
 	Publish: Publish{MinAckLevel: Quorum, ProposalTimeout: 5 * time.Second},
 	Delivery: Delivery{

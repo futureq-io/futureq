@@ -70,8 +70,8 @@ A `metadata.Service` registers as Dragonboat's Raft/system event listener. On le
 
 ### Restart
 
-- If local Raft data exists (`logdb-0/MANIFEST-000001`), the node skips the join flow and starts as an existing member.
-- On `ErrShardNotBootstrapped` (e.g. stale data from an aborted bootstrap), the app wipes `cluster.raft.dataDir` so the next start retries cleanly instead of crash-looping.
+- The node opens its configured LogDB and checks for local replica bootstrap records. A node with a record skips the join flow. If the first start was interrupted before both replicas were initialized, keep the initial member list or join seeds for the retry.
+- Keep the configured LogDB backend when reopening a Raft data directory. Stormoar rejects a backend mismatch.
 
 ## Leader persistence
 
@@ -82,7 +82,7 @@ A `metadata.Service` registers as Dragonboat's Raft/system event listener. On le
 | Level | Durability | Mechanism |
 | ----- | ---------- | ---------- |
 | `ACK_LEVEL_QUORUM` (default) | Returns after majority commit and successful admission during local apply | `SyncPropose`, no admission read; bounded by `publish.proposalTimeout` (default 5s) |
-| `ACK_LEVEL_LEADER` | Returns once the leader durably persisted the entry locally; followers replicate asynchronously | Async propose + leaderpersist tracker wait. **Can lose data on leader crash.** |
+| `ACK_LEVEL_LEADER` | Returns once the leader durably persisted the entry locally; followers replicate asynchronously | Tan only. Async propose + leaderpersist tracker wait. **Can lose data on leader crash.** |
 | `ACK_LEVEL_NO_ACK` | Fire-and-forget; success means "submitted" only | Async propose, no wait |
 
 The broker enforces a configurable floor: `publish.minAckLevel` (`quorum` | `leader` | `noAck`, default `quorum`). A batch requesting a level weaker than the floor is rejected with `InvalidArgument`. An omitted level defaults to QUORUM; unknown enum values are rejected.

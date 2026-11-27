@@ -88,10 +88,18 @@ type Raft struct {
 	LogDB              LogDB             `mapstructure:"logDB" yaml:"logDB"`
 }
 
-// LogDB exposes every field of Dragonboat's LogDBConfig. Workers separately
-// controls Engine.ExecShards, whose workers call SaveRaftState. The active Tan
-// backend only consumes KVWriteBufferSize directly and retains 16 buffers.
+const (
+	LogDBTan    = "tan"
+	LogDBPebble = "pebble"
+)
+
+// LogDB selects the Raft log backend and exposes Stormoar's LogDBConfig.
+// Workers controls Engine.ExecShards, whose workers call SaveRaftState.
 type LogDB struct {
+	Backend                  string        `mapstructure:"backend" yaml:"backend"`
+	PebbleWALMinSyncInterval time.Duration `mapstructure:"pebbleWALMinSyncInterval" yaml:"pebbleWALMinSyncInterval"`
+	CompactionConcurrency    int           `mapstructure:"compactionConcurrency" yaml:"compactionConcurrency"`
+
 	Workers                            uint64 `mapstructure:"workers" yaml:"workers"`
 	Shards                             uint64 `mapstructure:"shards" yaml:"shards"`
 	KVKeepLogFileNum                   uint64 `mapstructure:"kvKeepLogFileNum" yaml:"kvKeepLogFileNum"`
@@ -119,11 +127,23 @@ type LogDB struct {
 // where it disables a cache/limit. Worker/shard counts are stored in Raft's
 // compatibility flags and cannot be changed against existing Raft storage.
 func (c LogDB) DragonboatConfig() (raftconfig.LogDBConfig, error) {
+	if c.Backend != LogDBTan && c.Backend != LogDBPebble {
+		return raftconfig.LogDBConfig{}, fmt.Errorf("cluster.raft.logDB.backend must be tan or pebble")
+	}
+	if c.PebbleWALMinSyncInterval < 0 {
+		return raftconfig.LogDBConfig{}, fmt.Errorf("cluster.raft.logDB.pebbleWALMinSyncInterval must be nonnegative")
+	}
+	if c.CompactionConcurrency < 1 {
+		return raftconfig.LogDBConfig{}, fmt.Errorf("cluster.raft.logDB.compactionConcurrency must be at least 1")
+	}
 	maxInt := uint64(int(^uint(0) >> 1))
 	if c.Workers == 0 || c.Shards == 0 || c.Workers > maxInt || c.Shards > maxInt {
 		return raftconfig.LogDBConfig{}, fmt.Errorf("cluster.raft.logDB.workers and shards must be positive supported counts")
 	}
 	result := raftconfig.LogDBConfig{
+		PebbleWALMinSyncInterval:    c.PebbleWALMinSyncInterval,
+		PebbleCompactionConcurrency: c.CompactionConcurrency,
+
 		Shards: c.Shards, KVKeepLogFileNum: c.KVKeepLogFileNum,
 		KVMaxBackgroundCompactions: c.KVMaxBackgroundCompactions, KVMaxBackgroundFlushes: c.KVMaxBackgroundFlushes,
 		KVMaxWriteBufferNumber:           c.KVMaxWriteBufferNumber,
@@ -176,6 +196,8 @@ type Pebble struct {
 	CacheSize             Size   `mapstructure:"cacheSize" yaml:"cacheSize"`
 	MemtableSize          Size   `mapstructure:"memtableSize" yaml:"memtableSize"`
 	CompactionConcurrency int    `mapstructure:"compactionConcurrency" yaml:"compactionConcurrency"`
+
+	WALMinSyncInterval time.Duration `mapstructure:"walMinSyncInterval" yaml:"walMinSyncInterval"`
 }
 
 type Bolt struct {
@@ -440,6 +462,9 @@ func (c *Config) validateStorage() error {
 		p := c.Storage.Pebble
 		if p.CompactionConcurrency < 1 {
 			return fmt.Errorf("storage.pebble.compactionConcurrency must be at least 1")
+		}
+		if p.WALMinSyncInterval < 0 {
+			return fmt.Errorf("storage.pebble.walMinSyncInterval must be nonnegative")
 		}
 		if p.Mode != "disk" && p.Mode != "memory" {
 			return fmt.Errorf("storage.pebble.mode must be disk or memory")
