@@ -68,7 +68,7 @@ rewrite. The option applies to clustered publishes.
 
 ### Pebble (default)
 
-LSM-tree engine (`storage.pebble.*`). Scans and iterators run on internal snapshots, so reads never block writes. Options: disk or in-memory mode (`vfs.NewMem()` — same code path, nothing persists, WAL auto-disabled), WAL toggle (auto-off in clustered mode — the Raft log is the WAL), block cache (default 16MiB) and memtable size (default 64MiB).
+LSM-tree engine (`storage.pebble.*`). Scans and iterators run on internal snapshots, so reads never block writes. Disk mode supports a WAL toggle for clustered nodes, a block cache (default 16MiB), and a memtable size setting (default 64MiB). With the disk WAL enabled, `walMinSyncInterval` defaults to `500us` and sets the minimum time between syncs. In-memory mode discards data on exit.
 
 Bounded `NewIter` calls remember verified empty prefixes in a small in-memory cache. Later snapshots can seek past those prefixes instead of repeatedly walking point tombstones in `First()`. Writes invalidate overlapping proofs before and after commit; inserts behind a discovery cursor remain visible on the next cyclic scan. Pending writes and old snapshots cannot certify a raced gap. The cache retains at most 64 ranges and 64 probes with bounds up to 256 bytes, and starts empty after restart. It changes neither the on-disk format, delivery polling/retry intervals, nor immutable payload-cache ownership. The first scan of an uncached range still pays the underlying traversal cost; scans over live receipts still examine them.
 

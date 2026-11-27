@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"sync/atomic"
+	"time"
 
 	"github.com/cockroachdb/pebble/v2"
 	"github.com/cockroachdb/pebble/v2/vfs"
@@ -64,6 +65,9 @@ func NewPebble(cfg config.Pebble, logger *zap.Logger) (*Pebble, error) {
 		dbOpts.FS = vfs.NewMem()
 		pebbleLogger.Info("Initializing Pebble DB in memory", zap.Bool("persist", false))
 	} else {
+		if !dbOpts.DisableWAL && cfg.WALMinSyncInterval > 0 {
+			dbOpts.WALMinSyncInterval = func() time.Duration { return cfg.WALMinSyncInterval }
+		}
 		pebbleLogger.Info("Initializing Pebble DB", zap.Bool("persist", true))
 	}
 

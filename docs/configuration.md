@@ -59,8 +59,15 @@ export FUTUREQ_CLUSTER_RAFT_INITIALMEMBERS='{1: "10.0.0.1:50005"}'
 
 ### cluster.raft.logDB
 
-All fields of Dragonboat's `LogDBConfig` are configurable in this block. Byte
-quantities use `B`, `KiB`, `MiB`, or `GiB`; optional byte settings accept `0B`.
+`backend` selects `tan` or `pebble` when the node first opens its Raft data
+directory. Tan is the default. Stormoar rejects a backend change against an
+existing directory. The two formats require separate Raft data directories.
+
+`pebbleWALMinSyncInterval` sets the minimum time between WAL syncs on each
+Pebble LogDB shard. It defaults to `500us`. Use `0s` to disable the delay.
+Tan ignores this setting. Changes take effect on restart.
+
+Byte quantities use `B`, `KiB`, `MiB`, or `GiB`. Optional byte settings accept `0B`.
 Environment overrides follow the nesting, for example
 `FUTUREQ_CLUSTER_RAFT_LOGDB_KVWRITEBUFFERSIZE=4MiB` and
 `FUTUREQ_CLUSTER_RAFT_LOGDB_WORKERS=4`.
@@ -69,7 +76,7 @@ Environment overrides follow the nesting, for example
 `shards` controls `LogDBConfig.Shards`. Changing either count requires fresh
 Raft storage; Dragonboat rejects incompatible saved partition settings.
 
-FutureQ uses the Tan backend, which directly consumes `kvWriteBufferSize` and
+Tan directly consumes `kvWriteBufferSize` and
 retains **16 buffers regardless of the worker setting**. The `16MiB` default
 therefore retains **256MiB per broker**. Oversized updates use temporary
 allocations. Other KV/cache/level options are passed through to Dragonboat but
@@ -78,6 +85,8 @@ are separate from application storage under `storage.pebble`.
 
 | Key below `cluster.raft.logDB` | Default |
 |---|---:|
+| `backend` | `tan` |
+| `pebbleWALMinSyncInterval` | `500us` |
 | `workers` | `16` |
 | `shards` | `16` |
 | `kvKeepLogFileNum` | `16` |
@@ -108,7 +117,8 @@ are separate from application storage under `storage.pebble`.
 | `storage.virtualShards`         | `256`        | Number of virtual delivery shards for new clustered publishes. Accepts powers of two from `1` through `65536`. The event leader reads this at startup. See [virtual delivery shards](storage.md#virtual-delivery-shards). |
 | `storage.pebble.mode`          | `disk`       | `disk` or `memory` (Pebble over an in-memory FS; nothing persists). |
 | `storage.pebble.dataDir`       | `./data`     | Pebble data directory. |
-| `storage.pebble.walEnabled`    | `true`       | Pebble WAL toggle. Automatically disabled in memory mode and in clustered mode (the Raft log is the WAL); may only be set `false` explicitly for clustered disk nodes. |
+| `storage.pebble.walEnabled`    | `true`       | Pebble WAL toggle for disk mode. Clustered disk nodes can set it to `false` and recover from the Raft log. |
+| `storage.pebble.walMinSyncInterval` | `500us` | Minimum time between WAL syncs in disk mode with the WAL enabled. Use `0s` to disable the delay. Changes take effect on restart. |
 | `storage.pebble.cacheSize`     | `16MiB`      | Block cache size. |
 | `storage.pebble.memtableSize`  | `64MiB`      | Memtable size. |
 | `storage.bolt.file`            | `./data/futureq.db` | bbolt database file (engine `bolt`). |
@@ -118,7 +128,7 @@ are separate from application storage under `storage.pebble`.
 
 | Key                          | Default  | Description |
 | ---------------------------- | -------- | ----------- |
-| `publish.minAckLevel`        | `quorum` | Broker-wide minimum acknowledgement durability. One of `quorum`, `leader`, `noAck`. Publish batches requesting a weaker level are rejected with `InvalidArgument`. See [ack levels](clustering.md#publish-ack-levels). |
+| `publish.minAckLevel`        | `quorum` | Broker-wide minimum acknowledgement durability. One of `quorum`, `leader`, `noAck`. Publish batches requesting a weaker level are rejected with `InvalidArgument`. Clustered `LEADER` requests require Tan. See [ack levels](clustering.md#publish-ack-levels). |
 | `publish.proposalTimeout`    | `5s`     | Upper bound for each Raft propose / leader-ack wait. Must be positive. |
 
 ## delivery

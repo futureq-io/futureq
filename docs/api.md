@@ -59,7 +59,7 @@ maximum is 256.
   messages and closes the stream with a gRPC error.
 - An empty batch returns a default (unsuccessful) ack and performs no write.
 - Client half-close (EOF) ends the stream cleanly.
-- Ack levels: `QUORUM` (default; returns after quorum commit and successful admission during apply), `LEADER` (returns after the leader durably persists the entry with frozen destinations — see [ack levels](clustering.md#publish-ack-levels)), `NO_ACK` (submission only, with preselected destinations). The broker's `publish.minAckLevel` floors what clients may request.
+- `QUORUM` (default) returns after quorum commit and successful admission during apply. `LEADER` returns after the leader durably persists the entry with frozen destinations and requires Tan in clustered mode. `NO_ACK` returns after submission with preselected destinations. The broker's `publish.minAckLevel` sets the minimum. See [publish ack levels](clustering.md#publish-ack-levels).
 - In Raft mode only the event-shard leader accepts writes; standalone always writes directly to storage with fsync.
 - Destinations are frozen at publication and persisted atomically with each
   payload. Every active durable group or universal subscription is included,

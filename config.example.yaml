@@ -36,6 +36,8 @@ cluster:
     snapshotEntries: 10000
     compactionOverhead: 5000
     logDB:
+      backend: tan # tan or pebble. Choose before using a new Raft data directory.
+      pebbleWALMinSyncInterval: 500µs # Pebble only. Use 0s to disable the delay.
       # Engine.ExecShards controls workers that persist Raft updates.
       # Changing workers/shards requires fresh Raft storage.
       workers: 16
@@ -71,6 +73,7 @@ storage:
     mode: disk
     dataDir: "./data"
     walEnabled: true
+    walMinSyncInterval: 500µs # Disk mode with WAL enabled. Use 0s to disable the delay.
     cacheSize: 16MiB
     memtableSize: 64MiB
     compactionConcurrency: 1 # Normal and upper compaction concurrency; delete-only compactions may exceed it.

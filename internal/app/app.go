@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"sync"
 	"syscall"
 	"time"
@@ -57,8 +56,7 @@ type App struct {
 	MetadataSM *metadata.MetadataStateMachine
 
 	// LeaderTracker tracks in-flight LEADER-ack proposals and fires when the
-	// leader's local Raft log has durably written them. Nil when Raft is
-	// disabled.
+	// leader's local Tan log has durably written them.
 	LeaderTracker *leaderpersist.Tracker
 }
 
@@ -114,40 +112,10 @@ func Init(cfg *config.Config, logger *zap.Logger) (*App, error) {
 	return a, nil
 }
 
-// StartRaft starts the Dragonboat NodeHost and both Raft groups.
-//
-// Must be called after WithRepositories() so the EventRepository is fully
-// initialised before the state machine factory captures it.
-//
-// Starts two Raft groups:
-//  1. Event shard (config.Cluster.ShardID) — replicates event data
-//  2. Metadata shard (metadata.MetadataShardID) — replicates cluster topology
-//
-// join controls Dragonboot bootstrap semantics:
-//   - false: bootstrap a new cluster using config.Cluster.Raft.InitialMembers, or
-//     restart from local data when members are empty.
-//   - true: join an existing cluster as an already-registered member
-//     (initialMembers must be empty; membership was registered via JoinCluster).
-//
-// The event state machine calls onDeleteKeys and onCompletedAttempts after
-// committing payload deletions and recipient completions respectively.
-func (a *App) StartRaft(join bool, onDeleteKeys func(keys [][]byte), onCompletedAttempts func([]raft.CompletedAttempt), onSnapshotRecovered func() error) error {
+// OpenRaft opens the NodeHost and its LogDB before choosing how to bootstrap
+// the local replicas.
+func (a *App) OpenRaft() error {
 	cfg := a.cfg
-	receiptCache := cfg.Delivery.ReceiptCache
-	receiptCacheBytes, err := receiptCache.Bytes()
-	if err != nil {
-		return fmt.Errorf("delivery.receiptCache.maxBytes: %w", err)
-	}
-
-	// Create the metadata service first — it needs to be registered as the
-	// event listener before NodeHost is created.
-	var metadataSvc *metadata.Service
-
-	// LeaderPersist tracks proposals that should be acked as soon as the
-	// leader has durably written them to its own Raft log. The LogDB
-	// decorator is what actually fires the notifications.
-	tracker := leaderpersist.NewTracker()
-
 	nhc := raftconfig.NodeHostConfig{
 		WALDir:         cfg.Cluster.Raft.DataDir,
 		NodeHostDir:    cfg.Cluster.Raft.DataDir,
@@ -155,7 +123,6 @@ func (a *App) StartRaft(join bool, onDeleteKeys func(keys [][]byte), onCompleted
 		RaftAddress:    cfg.Cluster.Raft.Advertise,
 		ListenAddress:  cfg.Cluster.Raft.Listen,
 	}
-	nhc.Expert.LogDBFactory = leaderpersist.NewFactory(tracker)
 	logDBConfig, err := cfg.Cluster.Raft.LogDB.DragonboatConfig()
 	if err != nil {
 		return err
@@ -163,6 +130,11 @@ func (a *App) StartRaft(join bool, onDeleteKeys func(keys [][]byte), onCompleted
 	nhc.Expert.LogDB = logDBConfig
 	nhc.Expert.Engine = raftconfig.GetDefaultEngineConfig()
 	nhc.Expert.Engine.ExecShards = cfg.Cluster.Raft.LogDB.Workers
+	var tracker *leaderpersist.Tracker
+	if cfg.Cluster.Raft.LogDB.Backend == config.LogDBTan {
+		tracker = leaderpersist.NewTracker()
+		nhc.Expert.LogDBFactory = leaderpersist.NewFactory(tracker)
+	}
 
 	// We need the NodeHost reference to create the propose function, but
 	// Dragonboat needs the listeners at creation time. Use a forward reference:
@@ -174,7 +146,7 @@ func (a *App) StartRaft(join bool, onDeleteKeys func(keys [][]byte), onCompleted
 		return err
 	}
 
-	metadataSvc = metadata.NewService(nil, proposeMetadata, a.Logger)
+	metadataSvc := metadata.NewService(nil, proposeMetadata, a.Logger)
 	metadataSvc.ConsumerReadPermit = cfg.Delivery.ReadPermit
 	if cfg.Delivery.ConsumerRemovalWorkers > 0 {
 		metadataSvc.ConsumerRemovalWorkers = cfg.Delivery.ConsumerRemovalWorkers
@@ -184,24 +156,38 @@ func (a *App) StartRaft(join bool, onDeleteKeys func(keys [][]byte), onCompleted
 
 	nh, err = dragonboat.NewNodeHost(nhc)
 	if err != nil {
-		return fmt.Errorf("failed to create dragonboat nodehost: %w", err)
+		return fmt.Errorf("open Raft NodeHost with %s LogDB in %q: %w", cfg.Cluster.Raft.LogDB.Backend, cfg.Cluster.Raft.DataDir, err)
 	}
 
 	a.NodeHost = nh
 	a.MetadataSvc = metadataSvc
 	a.LeaderTracker = tracker
 	metadataSvc.SetNodeHost(nh)
+	return nil
+}
 
-	// Members are only passed when bootstrapping a brand-new cluster.
-	// Dragonboot semantics:
-	//   - Fresh bootstrap: join=false + initialMembers populated
-	//   - Fresh join:      join=true  + empty members (registered via JoinCluster)
-	//   - Restart:         join=false + empty members (local data exists)
-	members := make(map[uint64]dragonboat.Target)
-	if !join && !a.hasRaftData() {
-		for k, v := range cfg.Cluster.Raft.InitialMembers {
-			members[k] = dragonboat.Target(v)
+// StartRaft starts the metadata and event replicas after OpenRaft and
+// WithRepositories. join applies to replicas without a local bootstrap record.
+func (a *App) StartRaft(join bool, onDeleteKeys func(keys [][]byte), onCompletedAttempts func([]raft.CompletedAttempt), onSnapshotRecovered func() error) error {
+	cfg := a.cfg
+	nh, metadataSvc := a.NodeHost, a.MetadataSvc
+	receiptCache := cfg.Delivery.ReceiptCache
+	receiptCacheBytes, err := receiptCache.Bytes()
+	if err != nil {
+		return fmt.Errorf("delivery.receiptCache.maxBytes: %w", err)
+	}
+
+	// Bootstrap records are per shard. A missing replica still needs the
+	// original bootstrap or join settings after an interrupted first start.
+	members := cfg.Cluster.Raft.InitialMembers
+	bootstrap := func(shardID uint64) (map[uint64]dragonboat.Target, bool) {
+		if nh.HasNodeInfo(shardID, cfg.Cluster.NodeID) {
+			return nil, false
 		}
+		if join {
+			return nil, true
+		}
+		return members, false
 	}
 
 	// ── Start the metadata Raft group ──────────────────────────────────────────
@@ -225,18 +211,8 @@ func (a *App) StartRaft(join bool, onDeleteKeys func(keys [][]byte), onCompleted
 		CompactionOverhead: 5, // compact aggressively since state is small
 	}
 
-	if err := nh.StartReplica(members, join, metadataFactory, metadataRC); err != nil {
-		// Dragonboat panics internally on ErrShardNotBootstrapped (the "restarted
-		// during a previous bootstrap attempt" case). The panic is recovered by
-		// dragonboat's own handler and returned here as an error. When we hit it,
-		// the LogDB is in a half-initialised state that hasRaftData() would treat
-		// as "existing cluster data" on the next restart, causing an infinite
-		// crash loop. Wipe the dir so the next start begins from a clean slate.
-		if errors.Is(err, dragonboat.ErrShardNotBootstrapped) {
-			a.Logger.Warn("raft bootstrap failed (shard not bootstrapped); wiping raft data dir to allow clean retry",
-				zap.String("path", cfg.Cluster.Raft.DataDir))
-			_ = os.RemoveAll(cfg.Cluster.Raft.DataDir)
-		}
+	metadataMembers, joinMetadata := bootstrap(metadataRC.ShardID)
+	if err := nh.StartReplica(metadataMembers, joinMetadata, metadataFactory, metadataRC); err != nil {
 		return fmt.Errorf("failed to start metadata raft group: %w", err)
 	}
 
@@ -262,12 +238,8 @@ func (a *App) StartRaft(join bool, onDeleteKeys func(keys [][]byte), onCompleted
 	eventFactory := raft.NewEventStateMachineFactoryWithReceiptCache(
 		a.DB, a.Repositories.Events, onDeleteKeys, onCompletedAttempts, onSnapshotRecovered, a.Logger, receiptCacheBytes, receiptCache.MaxEntries,
 	)
-	if err := nh.StartOnDiskReplica(members, join, eventFactory, eventRC); err != nil {
-		if errors.Is(err, dragonboat.ErrShardNotBootstrapped) {
-			a.Logger.Warn("event raft bootstrap failed (shard not bootstrapped); wiping raft data dir to allow clean retry",
-				zap.String("path", cfg.Cluster.Raft.DataDir))
-			_ = os.RemoveAll(cfg.Cluster.Raft.DataDir)
-		}
+	eventMembers, joinEvent := bootstrap(eventRC.ShardID)
+	if err := nh.StartOnDiskReplica(eventMembers, joinEvent, eventFactory, eventRC); err != nil {
 		return fmt.Errorf("failed to start event raft group: %w", err)
 	}
 
@@ -305,22 +277,11 @@ func (a *App) StartRaft(join bool, onDeleteKeys func(keys [][]byte), onCompleted
 	return nil
 }
 
-// HasRaftData reports whether local Raft data exists for this node.
-// Used by the start command to distinguish a restart from a fresh join.
+// HasRaftData reports whether the open NodeHost has a local bootstrap record.
 func (a *App) HasRaftData() bool {
-	return a.hasRaftData()
-}
-
-// hasRaftData returns true if the Raft data directory contains a previously
-// bootstrapped LogDB — meaning this node has been part of a cluster before.
-// A bare directory (created by a failed first bootstrap attempt) is NOT
-// treated as existing data; Dragonboat will retry the bootstrap from scratch.
-func (a *App) hasRaftData() bool {
-	// Dragonboat's sharded-pebble LogDB stores each shard in a logdb-N
-	// subdirectory. The first shard writes a MANIFEST once initialised.
-	manifest := filepath.Join(a.cfg.Cluster.Raft.DataDir, "logdb-0", "MANIFEST-000001")
-	_, err := os.Stat(manifest)
-	return err == nil
+	cl := a.cfg.Cluster
+	return a.NodeHost != nil && (a.NodeHost.HasNodeInfo(metadata.MetadataShardID, cl.NodeID) ||
+		a.NodeHost.HasNodeInfo(cl.ShardID, cl.NodeID))
 }
 
 // Config returns the application configuration.
