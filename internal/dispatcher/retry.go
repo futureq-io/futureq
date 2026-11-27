@@ -95,8 +95,8 @@ func (l *DeliveryLedger) releaseManualRetryOutcomeLocked(id retryIdentity) {
 	}
 }
 
-// AuthorizeRetrySend holds capacity before reserving the attempt. For a
-// message with a TTL, protection continues until BeginRetryTransport.
+// AuthorizeRetrySend holds capacity before reserving the attempt and protects
+// an authorized attempt from expiry until BeginRetryTransport.
 func (l *DeliveryLedger) AuthorizeRetrySend(streamCtx context.Context, start *deliverypb.RetryCommand, ackWindow time.Duration, prepare func(uint64) (bool, error), checkTransport func() (time.Time, error)) (authorized bool, err error) {
 	target := start.Attempts[0]
 	id := identifyRetry(target)
@@ -126,19 +126,16 @@ func (l *DeliveryLedger) AuthorizeRetrySend(streamCtx context.Context, start *de
 	recovery := l.retry.recovery
 	l.retry.mu.Unlock()
 	needsRefund := true
-	holdForFirstFrame := false
 	defer func() {
-		if needsRefund && !authorized {
+		if authorized {
+			return
+		}
+		if needsRefund {
 			l.refundUnsentRetry(target)
 			return
 		}
 		l.retry.mu.Lock()
-		if !holdForFirstFrame {
-			delete(l.retry.authorizing, id)
-		}
-		if !authorized {
-			l.removeRetryTransportLocked(id)
-		}
+		l.removeRetryTransportLocked(id)
 		l.retry.mu.Unlock()
 	}()
 
@@ -195,7 +192,6 @@ func (l *DeliveryLedger) AuthorizeRetrySend(streamCtx context.Context, start *de
 	if expiresAtMs != 0 && time.Now().UnixMilli() >= expiresAtMs {
 		return false, nil
 	}
-	holdForFirstFrame = expiresAtMs != 0
 	// The durable deadline is set before SENT. The local owner gives the
 	// consumer its full monotonic ACK window starting at transport.
 	transports[id] = retryTransport{
@@ -212,30 +208,22 @@ func (l *DeliveryLedger) BeginRetryTransport(tag []byte, canSend func() bool) bo
 	key := [utils.EventKeySize]byte(id[:utils.EventKeySize])
 	l.retry.mu.Lock()
 	transport, exists := l.retry.transports[key][id]
+	_, held := l.retry.authorizing[id]
 	_, expiring := l.retry.expiring[id]
-	if !exists || expiring {
+	if !held || !exists || expiring {
 		delete(l.retry.authorizing, id)
 		l.retry.mu.Unlock()
 		return false
 	}
 	permitted := canSend() && l.retryOwnerActive()
 	now := time.Now()
-	beforeDeadline := now.Before(transport.deadline)
-	if permitted && beforeDeadline &&
+	if permitted && now.Before(transport.deadline) &&
 		(transport.messageExpiresAtMs == 0 || now.UnixMilli() < transport.messageExpiresAtMs) {
 		delete(l.retry.authorizing, id)
 		l.retry.mu.Unlock()
 		return true
 	}
-	// Leave a timed-out attempt eligible for expiry unless authorization
-	// still holds it for a TTL check at the first frame.
-	if _, held := l.retry.authorizing[id]; !held && !beforeDeadline {
-		l.retry.mu.Unlock()
-		return false
-	}
-	// Keep expiry out until the refund commits or is queued. Attempts
-	// without a TTL released their initial authorization protection.
-	l.retry.authorizing[id] = struct{}{}
+	// Keep expiry out until the refund commits or is queued.
 	l.retry.mu.Unlock()
 	l.refundUnsentRetry(&deliverypb.DeliveryAttemptTarget{
 		Key: tag[:utils.EventKeySize], Recipient: transport.recipient, Token: tag[utils.EventKeySize:],
@@ -286,6 +274,7 @@ func (l *DeliveryLedger) onRetryTransportDeadline(id retryIdentity) {
 }
 
 func (l *DeliveryLedger) removeRetryTransportLocked(id retryIdentity) {
+	delete(l.retry.authorizing, id)
 	key := [utils.EventKeySize]byte(id[:utils.EventKeySize])
 	transports := l.retry.transports[key]
 	if timer := transports[id].timer; timer != nil {
@@ -312,6 +301,7 @@ func (l *DeliveryLedger) RemoveRetryTransports(keys [][]byte) {
 			}
 			l.releaseRetryAutoACKLocked(id)
 			l.releaseManualRetryOutcomeLocked(id)
+			delete(l.retry.authorizing, id)
 			delete(l.retry.refunds, id)
 		}
 		delete(l.retry.transports, eventKey)

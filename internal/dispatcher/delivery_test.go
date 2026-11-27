@@ -52,6 +52,13 @@ func (s *RetryExpirySuite) storeRetryFixture(db storage.DB, eventID uint64, dead
 	}
 }
 
+func (s *RetryExpirySuite) beginRetryTransport(ledger *DeliveryLedger, start *deliverypb.RetryCommand) {
+	s.T().Helper()
+	target := start.Attempts[0]
+	tag := append(bytes.Clone(target.Key), target.Token...)
+	s.Require().True(ledger.BeginRetryTransport(tag, func() bool { return true }))
+}
+
 func (s *RetryExpirySuite) TestAuthorizationCapacityIsCheckedBeforeReservation() {
 	db, err := storage.NewPebble(config.Pebble{Mode: "memory"}, zap.NewNop())
 	s.Require().NoError(err)
@@ -60,6 +67,7 @@ func (s *RetryExpirySuite) TestAuthorizationCapacityIsCheckedBeforeReservation()
 	ledger.ConfigureRetryOutcomes(1)
 	deadline := time.Now().Add(time.Minute)
 	first, second := s.storeRetryFixture(db, 1, deadline), s.storeRetryFixture(db, 2, deadline)
+	defer ledger.RemoveRetryTransports([][]byte{first.Attempts[0].Key, second.Attempts[0].Key})
 	entered, finish := make(chan struct{}), make(chan struct{})
 	done := make(chan error, 1)
 	ready := func() (time.Time, error) { return deadline, nil }
@@ -98,6 +106,13 @@ func (s *RetryExpirySuite) TestAuthorizationCapacityIsCheckedBeforeReservation()
 	close(finish)
 	s.NoError(<-done)
 	finish = nil
+	allowed, err = ledger.AuthorizeRetrySend(context.Background(), second, time.Minute, func(uint64) (bool, error) {
+		s.Fail("second authorization should wait for the first transport decision")
+		return true, nil
+	}, ready)
+	s.Require().NoError(err)
+	s.False(allowed)
+	s.beginRetryTransport(ledger, first)
 	allowed, err = ledger.AuthorizeRetrySend(context.Background(), second, time.Minute, func(attempt uint64) (bool, error) {
 		s.Equal(uint64(1), attempt)
 		return true, nil
@@ -151,19 +166,7 @@ func (s *RetryExpirySuite) TestFirstFrameRejectedAfterAttemptTimeoutWithoutTTL()
 	s.Require().NoError(err)
 	defer db.Close() //nolint:errcheck
 	ctx := context.Background()
-	local := NewDeliveryLedger(db, nil, nil, nil)
-	claimed, commit := make(chan struct{}), make(chan struct{})
-	ledger := NewDeliveryLedger(db, nil, nil, func(raw []byte) (statemachine.Result, error) {
-		var cmd deliverypb.RetryCommand
-		if err := proto.Unmarshal(raw[1:], &cmd); err != nil {
-			return statemachine.Result{}, err
-		}
-		if cmd.Operation == deliverypb.RetryCommand_EXPIRE {
-			close(claimed)
-			<-commit
-		}
-		return local.applyRetryResult(ctx, &cmd)
-	})
+	ledger := NewDeliveryLedger(db, nil, nil, nil)
 	ledger.ConfigureRetryOutcomes(1)
 	start := s.storeRetryFixture(db, 1, time.Now().Add(time.Minute))
 	target := start.Attempts[0]
@@ -180,33 +183,30 @@ func (s *RetryExpirySuite) TestFirstFrameRejectedAfterAttemptTimeoutWithoutTTL()
 	s.Require().True(allowed)
 
 	time.Sleep(time.Until(deadline))
+	s.Require().NoError(ledger.expireDueRetryAttempts(ctx, time.Now().UnixMilli(), nil))
+	state, err := raft.ReadDeliveryState(db, target.Key)
+	s.Require().NoError(err)
+	s.True(state.HasActiveAttempt(target.Recipient, target.Token), "expiry must wait for the first-frame decision")
+
 	tag := append(bytes.Clone(target.Key), target.Token...)
-	canSend := func() bool { return true }
-	s.False(ledger.BeginRetryTransport(tag, canSend), "the local ACK deadline ended")
-	done := make(chan struct{})
-	var expiryErr error
-	go func() {
-		defer close(done)
-		expiryErr = ledger.expireDueRetryAttempts(ctx, time.Now().UnixMilli(), nil)
-	}()
-	commitExpiry := sync.OnceFunc(func() { close(commit) })
-	defer func() {
-		commitExpiry()
-		<-done
-	}()
-	select {
-	case <-claimed:
-	case <-time.After(time.Second):
-		s.FailNow("expiry did not claim the attempt")
-	}
-	s.False(ledger.BeginRetryTransport(tag, canSend), "expiry owns the attempt even before its proposal commits")
-	commitExpiry()
-	<-done
-	s.Require().NoError(expiryErr)
+	s.False(ledger.BeginRetryTransport(tag, func() bool { return true }), "the local ACK deadline ended")
+	ledger.AbandonManualRetryOutcome(tag)
+	s.Require().NoError(ledger.expireDueRetryAttempts(ctx, time.Now().UnixMilli(), nil))
+	state, err = raft.ReadDeliveryState(db, target.Key)
+	s.Require().NoError(err)
+	s.True(state.Ready(target.Recipient), "the unsent attempt must be refunded")
 	page, err := (raft.DeadLetterQuery{Topic: "orders", Limit: 1}).Read(db)
 	s.Require().NoError(err)
-	s.Require().Len(page.Page.Entries, 1)
-	s.Equal(pb.DeadLetterReason_DEAD_LETTER_REASON_TIMEOUT, page.Page.Entries[0].GetReason())
+	s.Empty(page.Page.Entries)
+
+	redelivery := proto.CloneOf(start)
+	now := time.Now()
+	redelivery.NowMs = now.UnixMilli()
+	redelivery.Attempts[0].DeadlineMs = now.Add(time.Minute).UnixMilli()
+	redelivery.Attempts[0].Token = bytes.Repeat([]byte{2}, raft.AttemptTokenSize)
+	attempt, err := ledger.ApplyRetry(redelivery)
+	s.Require().NoError(err)
+	s.Equal(uint64(1), attempt, "the next send still has its initial attempt")
 }
 
 func (s *RetryExpirySuite) TestExpiredFirstFrameStaysProtectedUntilRefundCommits() {
@@ -380,6 +380,7 @@ func (s *RetryExpirySuite) TestStalledRefundDoesNotBlockUnrelatedExpiry() {
 	allowed, err = ledger.AuthorizeRetrySend(context.Background(), second, 600*time.Millisecond, prepared, func() (time.Time, error) { return deadline, nil })
 	s.Require().NoError(err)
 	s.Require().True(allowed)
+	s.beginRetryTransport(ledger, second)
 	ctx, cancel := context.WithCancel(context.Background())
 	var workers sync.WaitGroup
 	workers.Go(func() { ledger.RunRetryExpiry(ctx, time.Millisecond, nil, logger) })
@@ -726,6 +727,7 @@ func (s *RetryExpirySuite) TestSnapshotRecoveryReleasesOnlyMissingManualSlots() 
 	s.Len(ledger.retry.manualSlots, 1)
 	s.Contains(ledger.retry.manualSlots, identifyRetry(retained.Attempts[0]))
 	s.NotContains(ledger.retry.manualSlots, staleID)
+	s.NotContains(ledger.retry.authorizing, staleID)
 	s.False(staleTimer.Stop(), "recovery must have stopped the stale timer")
 	s.True(authorize(newDelivery), "the restored broker can use the freed slot")
 }
@@ -746,6 +748,7 @@ func (s *RetryExpirySuite) TestShutdownReleasesManualSlotWhenACKWindowEnds() {
 		func() (time.Time, error) { return time.Now().Add(ackWindow), nil })
 	s.Require().NoError(err)
 	s.Require().True(allowed)
+	s.beginRetryTransport(ledger, start)
 	ledger.StopRetryOutcomeAdmission()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -1003,6 +1006,7 @@ func (s *RetryExpirySuite) TestManualACKCommitsWhileAutoACKHoldsItsOnlySlot() {
 			func() (time.Time, error) { return deadline, nil })
 		s.Require().NoError(err)
 		s.Require().True(allowed)
+		s.beginRetryTransport(ledger, start)
 	}
 	ack := func(start *deliverypb.RetryCommand) *deliverypb.RetryCommand {
 		target := start.Attempts[0]
@@ -1117,6 +1121,7 @@ func (s *RetryExpirySuite) TestManualACKsCommitWhileBothAutomaticWorkersAreStall
 		allowed, err := ledger.AuthorizeRetrySend(context.Background(), start, time.Minute, prepare, ready)
 		s.Require().NoError(err)
 		s.Require().True(allowed)
+		s.beginRetryTransport(ledger, start)
 		s.Require().True(automatic.Finish(true))
 		wait(autoStarted, "an automatic worker did not start its proposal")
 	}
@@ -1129,6 +1134,7 @@ func (s *RetryExpirySuite) TestManualACKsCommitWhileBothAutomaticWorkersAreStall
 	allowed, err := ledger.AuthorizeManualRetrySend(ctx, manualA, time.Minute, prepare, ready)
 	s.Require().NoError(err)
 	s.Require().True(allowed)
+	s.beginRetryTransport(ledger, manualA)
 	allowed, err = ledger.AuthorizeManualRetrySend(ctx, manualB, time.Minute, prepare, ready)
 	s.Require().NoError(err)
 	s.False(allowed, "a delivery must wait when its outcome capacity is reserved")
@@ -1139,6 +1145,7 @@ func (s *RetryExpirySuite) TestManualACKsCommitWhileBothAutomaticWorkersAreStall
 	allowed, err = ledger.AuthorizeManualRetrySend(ctx, manualB, time.Minute, prepare, ready)
 	s.Require().NoError(err)
 	s.Require().True(allowed)
+	s.beginRetryTransport(ledger, manualB)
 	commitManual(manualB)
 
 	ledger.StopRetryOutcomeAdmission()
