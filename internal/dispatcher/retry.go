@@ -135,7 +135,8 @@ func (l *DeliveryLedger) AuthorizeRetrySend(streamCtx context.Context, start *de
 				}},
 			}
 			// Hold the protection until this commits or is transferred to
-			// the refund worker. Refunds bypass the consumer outcome queue.
+			// the refund worker. The broker-scoped proposal survives stream
+			// cancellation, and refunds bypass the consumer outcome queue.
 			if _, err := l.ApplyRetry(cancel); err != nil {
 				refund = cancel
 			}
@@ -156,27 +157,33 @@ func (l *DeliveryLedger) AuthorizeRetrySend(streamCtx context.Context, start *de
 		l.retry.mu.Unlock()
 	}()
 
-	attempt, err := l.ApplyRetry(start)
-	if err != nil {
-		return false, err
-	}
-	if attempt == 0 {
+	attempt, err := l.applyRetry(streamCtx, start)
+	if err == nil && attempt == 0 {
 		needsRefund = false
 		return false, nil
+	}
+	if streamCtx.Err() != nil {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
 	}
 	prepared, err := prepare(attempt)
 	if !prepared || err != nil || streamCtx.Err() != nil {
 		return false, err
 	}
 	now := time.Now()
-	result, err := l.ApplyRetry(&deliverypb.RetryCommand{
+	result, err := l.applyRetry(streamCtx, &deliverypb.RetryCommand{
 		Operation: deliverypb.RetryCommand_SENT, NowMs: now.UnixMilli(),
 		Attempts: []*deliverypb.DeliveryAttemptTarget{{
 			Key: target.Key, Recipient: target.Recipient, Token: target.Token,
 			DeadlineMs: max(now.UnixMilli()+1, now.Add(ackWindow).UnixMilli()),
 		}},
 	})
-	if err != nil || result == 0 || streamCtx.Err() != nil {
+	if streamCtx.Err() != nil {
+		return false, nil
+	}
+	if err != nil || result == 0 {
 		return false, err
 	}
 	transportDeadline, err := checkTransport()

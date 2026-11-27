@@ -106,6 +106,84 @@ func (s *RetryExpirySuite) TestAuthorizationCapacityIsCheckedBeforeReservation()
 	s.True(allowed)
 }
 
+func (s *RetryExpirySuite) TestDisconnectCancelsAuthorizationWaitAndRefunds() {
+	for _, stage := range []deliverypb.RetryCommand_Operation{deliverypb.RetryCommand_START, deliverypb.RetryCommand_SENT} {
+		s.Run(stage.String(), func() {
+			db, err := storage.NewPebble(config.Pebble{Mode: "memory"}, zap.NewNop())
+			s.Require().NoError(err)
+			defer db.Close() //nolint:errcheck
+			deadline := time.Now().Add(time.Minute)
+			first, second := s.storeRetryFixture(db, 1, deadline), s.storeRetryFixture(db, 2, deadline)
+			firstTarget, secondTarget := first.Attempts[0], second.Attempts[0]
+			local := NewDeliveryLedger(db, nil, nil, nil)
+			brokerCtx, stopBroker := context.WithCancel(context.Background())
+			streamCtx, disconnect := context.WithCancel(brokerCtx)
+			defer disconnect()
+			entered := make(chan struct{})
+			propose := func(ctx context.Context, raw []byte) (statemachine.Result, error) {
+				if err := ctx.Err(); err != nil {
+					return statemachine.Result{}, err
+				}
+				var cmd deliverypb.RetryCommand
+				if err := proto.Unmarshal(raw[1:], &cmd); err != nil {
+					return statemachine.Result{}, err
+				}
+				value, err := local.ApplyRetry(&cmd)
+				if err == nil && value != 0 && cmd.Operation == stage && bytes.Equal(cmd.Attempts[0].Key, firstTarget.Key) {
+					// Raft may already have applied the command when its
+					// caller cancels the wait for the result.
+					close(entered)
+					<-ctx.Done()
+					return statemachine.Result{}, ctx.Err()
+				}
+				return statemachine.Result{Value: value}, err
+			}
+			ledger := NewDeliveryLedger(db, nil, nil, func(raw []byte) (statemachine.Result, error) {
+				return propose(brokerCtx, raw)
+			})
+			ledger.ProposeContext = propose
+			ledger.ConfigureRetryOutcomes(1)
+			defer ledger.RemoveRetryTransports([][]byte{firstTarget.Key, secondTarget.Key})
+			prepare := func(uint64) (bool, error) { return true, nil }
+			ready := func() (time.Time, error) { return deadline, nil }
+			type authorization struct {
+				allowed bool
+				err     error
+			}
+			finished := make(chan struct{})
+			result := make(chan authorization, 1)
+			go func() {
+				defer close(finished)
+				allowed, err := ledger.AuthorizeRetrySend(streamCtx, first, time.Minute, prepare, ready)
+				result <- authorization{allowed, err}
+			}()
+			defer func() { stopBroker(); <-finished }()
+			select {
+			case <-entered:
+			case <-time.After(time.Second):
+				s.FailNow("the first proposal did not start")
+			}
+			allowed, err := ledger.AuthorizeRetrySend(brokerCtx, second, time.Minute, prepare, ready)
+			s.Require().NoError(err)
+			s.False(allowed, "the outstanding proposal occupies the only slot")
+			disconnect()
+			select {
+			case outcome := <-result:
+				s.NoError(outcome.err)
+				s.False(outcome.allowed)
+			case <-time.After(time.Second):
+				s.FailNow("disconnect did not cancel the proposal wait")
+			}
+			state, err := raft.ReadDeliveryState(db, firstTarget.Key)
+			s.Require().NoError(err)
+			s.True(state.Ready(firstTarget.Recipient), "the refund must outlive the disconnected stream")
+			allowed, err = ledger.AuthorizeRetrySend(brokerCtx, second, time.Minute, prepare, ready)
+			s.Require().NoError(err)
+			s.True(allowed, "the second delivery can use the freed authorization slot")
+		})
+	}
+}
+
 func (s *RetryExpirySuite) TestStalledRefundDoesNotBlockUnrelatedExpiry() {
 	logger := zap.NewNop()
 	db, err := storage.NewPebble(config.Pebble{Mode: "memory"}, logger)
@@ -258,7 +336,7 @@ func (s *RetryExpirySuite) TestSlowRefundDoesNotBlockAnotherDuringShutdown() {
 		if err := proto.Unmarshal(raw[1:], &cmd); err != nil {
 			return statemachine.Result{}, err
 		}
-		if bytes.Equal(cmd.Attempts[0].Key, first.Attempts[0].Key) {
+		if cmd.Operation == deliverypb.RetryCommand_CANCEL_RESERVATION && bytes.Equal(cmd.Attempts[0].Key, first.Attempts[0].Key) {
 			close(firstStarted)
 			<-ctx.Done()
 			return statemachine.Result{}, ctx.Err()
@@ -833,7 +911,7 @@ func (s *RetryExpirySuite) TestManualACKsCommitWhileBothAutomaticWorkersAreStall
 		if err := proto.Unmarshal(raw[1:], &cmd); err != nil {
 			return statemachine.Result{}, err
 		}
-		if key := cmd.Attempts[0].Key; bytes.Equal(key, keys[0]) || bytes.Equal(key, keys[1]) {
+		if key := cmd.Attempts[0].Key; cmd.Operation == deliverypb.RetryCommand_ACK && (bytes.Equal(key, keys[0]) || bytes.Equal(key, keys[1])) {
 			autoStarted <- struct{}{}
 			select {
 			case <-unblock:
