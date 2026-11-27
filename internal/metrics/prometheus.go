@@ -149,6 +149,9 @@ var (
 	DeliveryGRPCSendsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "futureq_delivery_grpc_sends_total", Help: "Successful gRPC delivery sends.",
 	}, []string{"topic"})
+	DeadLetteredTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "futureq_dead_lettered_total", Help: "Subscription deliveries durably moved to the dead-letter queue.",
+	}, []string{"reason"})
 
 	// DeliveryLatencyMs preserves the legacy candidate-selection timestamp.
 	DeliveryLatencyMs = promauto.NewHistogramVec(prometheus.HistogramOpts{

@@ -447,7 +447,7 @@ func (h *Hub) DispatchPrepared(topic string, msg *pb.QueueMessage, deliveryTag [
 
 	// Dispatch to each group — strategy picks one consumer per group.
 	for gid, consumers := range groups {
-		if manifest != nil && !manifest.Needs(metadata.DeliveryRecipient(gid, "")) {
+		if manifest != nil && !manifest.Ready(metadata.DeliveryRecipient(gid, "")) {
 			continue
 		}
 		var selected *ConsumerEntry
@@ -473,7 +473,7 @@ func (h *Hub) DispatchPrepared(topic string, msg *pb.QueueMessage, deliveryTag [
 
 	// Dispatch to all universal consumers.
 	for _, c := range universal {
-		if manifest != nil && !manifest.Needs(metadata.DeliveryRecipient("", c.ID)) {
+		if manifest != nil && !manifest.Ready(metadata.DeliveryRecipient("", c.ID)) {
 			continue
 		}
 		if h.trySend(c, msg, deliveryTag) == sendAccepted {
@@ -598,7 +598,7 @@ func (h *Hub) enqueueLocked(c *ConsumerEntry, msg *pb.QueueMessage, deliveryTag 
 	// timeout, even if the same key has since been delivered to this stream again.
 	queued := &pb.QueueMessage{
 		Topic: msg.Topic, Payload: msg.Payload, DeliveryTag: deliveryTag,
-		EnqueuedAtUnixMs: msg.EnqueuedAtUnixMs, DelayMs: msg.DelayMs,
+		EnqueuedAtUnixMs: msg.EnqueuedAtUnixMs, DelayMs: msg.DelayMs, MaxRetries: msg.MaxRetries,
 	}
 	// Capture before the channel handoff, but observe only successful enqueues.
 	// This excludes time waiting in the sender queue and inside stream.Send.
@@ -983,6 +983,34 @@ func (h *Hub) PermitNeedsRenewal(budget time.Duration) bool {
 // attempt. ACKs are accepted only after this point. The in-flight drain keeps
 // rebalances safe while the network send runs outside these locks.
 func (h *Hub) BeginSend(consumerID string, msg *pb.QueueMessage) bool {
+	return h.beginSend(consumerID, msg, nil, time.Time{})
+}
+
+func (h *Hub) BeginRetrySend(consumerID string, msg *pb.QueueMessage, token []byte, deadline time.Time) bool {
+	return h.beginSend(consumerID, msg, token, deadline)
+}
+
+// ActivateRetrySend starts the ACK window after durable authorization.
+func (h *Hub) ActivateRetrySend(consumerID string, msg *pb.QueueMessage, token []byte, deadline time.Time) bool {
+	h.deliveryMu.RLock()
+	defer h.deliveryMu.RUnlock()
+	if !h.permitted() {
+		return false
+	}
+	h.inFlightMu.Lock()
+	defer h.inFlightMu.Unlock()
+	key := string(msg.DeliveryTag)
+	record, exists := h.deliveryRecords[consumerID][key]
+	if !exists || record.message != msg || !bytes.Equal(record.token, token) ||
+		!time.Now().Before(record.expires) || (h.version != nil && record.epoch != h.permitEpoch) {
+		return false
+	}
+	record.expires = deadline
+	h.deliveryRecords[consumerID][key] = record
+	return true
+}
+
+func (h *Hub) beginSend(consumerID string, msg *pb.QueueMessage, token []byte, deadline time.Time) bool {
 	h.deliveryMu.RLock()
 	defer h.deliveryMu.RUnlock()
 	if !h.permitted() {
@@ -995,6 +1023,9 @@ func (h *Hub) BeginSend(consumerID string, msg *pb.QueueMessage) bool {
 	if !exists || record.sending || record.ackPending || record.message != msg || !time.Now().Before(record.expires) || (h.version != nil && record.epoch != h.permitEpoch) {
 		return false
 	}
+	if msg.MaxRetries != nil && (len(token) != raft.AttemptTokenSize || !time.Now().Before(deadline)) {
+		return false
+	}
 	if time.Now().UnixMilli() < msg.EnqueuedAtUnixMs+msg.DelayMs {
 		return false
 	}
@@ -1002,6 +1033,10 @@ func (h *Hub) BeginSend(consumerID string, msg *pb.QueueMessage) bool {
 	// The queue has its own bounded lifetime. Once a send starts, grant a full
 	// ACK window so time buffered behind another send does not shorten it.
 	record.expires = time.Now().Add(h.inFlightTimeout)
+	if len(token) != 0 {
+		record.token = token
+		record.expires = deadline
+	}
 	h.deliveryRecords[consumerID][string(msg.DeliveryTag)] = record
 	return true
 }
@@ -1034,7 +1069,7 @@ func (h *Hub) MarkAcknowledgedSent(consumerID string, key []byte) bool {
 	h.inFlightMu.Lock()
 	defer h.inFlightMu.Unlock()
 	record, exists := h.deliveryRecords[consumerID][string(key)]
-	if !exists || !record.sending || record.ackPending {
+	if !exists || !record.sending || record.ackPending || record.message.MaxRetries != nil {
 		return false
 	}
 	record.ackPending = true
@@ -1082,9 +1117,35 @@ func (h *Hub) AcknowledgeSent(consumerID string, key []byte) bool {
 	h.inFlightMu.Lock()
 	defer h.inFlightMu.Unlock()
 	record, exists := h.deliveryRecords[consumerID][string(key)]
-	if !exists || !record.sending || record.ackPending {
+	if !exists || !record.sending || record.ackPending || record.message.MaxRetries != nil {
 		return false
 	}
+	h.releaseSentLocked(consumerID, key)
+	return true
+}
+
+// MarkRetryOutcome accepts only the token associated with the current send.
+func (h *Hub) MarkRetryOutcome(consumerID string, key, token []byte) bool {
+	h.inFlightMu.Lock()
+	defer h.inFlightMu.Unlock()
+	record, exists := h.deliveryRecords[consumerID][string(key)]
+	if !exists || !record.sending || record.ackPending || !bytes.Equal(record.token, token) || !time.Now().Before(record.expires) {
+		return false
+	}
+	record.ackPending = true
+	h.deliveryRecords[consumerID][string(key)] = record
+	return true
+}
+
+func (h *Hub) ReleaseRetrySend(consumerID string, key, token []byte) {
+	h.inFlightMu.Lock()
+	defer h.inFlightMu.Unlock()
+	if record, exists := h.deliveryRecords[consumerID][string(key)]; exists && bytes.Equal(record.token, token) {
+		h.releaseSentLocked(consumerID, key)
+	}
+}
+
+func (h *Hub) releaseSentLocked(consumerID string, key []byte) {
 	h.removeDeliveryRecordLocked(consumerID, string(key))
 	keys := h.inFlightByConsumer[consumerID]
 	for i, pending := range keys {
@@ -1093,7 +1154,12 @@ func (h *Hub) AcknowledgeSent(consumerID string, key []byte) bool {
 			break
 		}
 	}
-	return true
+}
+
+func (h *Hub) AttemptTimeout() time.Duration {
+	h.deliveryMu.RLock()
+	defer h.deliveryMu.RUnlock()
+	return h.inFlightTimeout
 }
 
 func (h *Hub) ObserveQueues() {

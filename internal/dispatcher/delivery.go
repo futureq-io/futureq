@@ -26,7 +26,10 @@ type DeliveryLedger struct {
 	StandaloneReceipts *raft.StandaloneReceiptCache
 	// Installed before Run; allows a bounded preparation job to cancel its
 	// Raft wait without changing the asynchronous ACK retry path.
-	ProposeContext func(context.Context, []byte) (statemachine.Result, error)
+	ProposeContext       func(context.Context, []byte) (statemachine.Result, error)
+	retryOutcomes        chan retryOutcome
+	retryAutoACKOutcomes chan retryOutcome
+	retry                retryCoordination
 }
 
 // PublishedBatch is the production delivery path. Missing or unbound receipts
@@ -268,8 +271,12 @@ func (l *DeliveryLedger) applyLocal(mode storage.SyncMode, apply func(*raft.Deli
 	if l.StandaloneReceipts != nil {
 		l.StandaloneReceipts.CommitBatch(delivery)
 	}
-	if len(deleted) > 0 && l.OnDelete != nil {
-		l.OnDelete(deleted)
+	l.CompleteRetryAttempts(delivery.CompletedAttempts())
+	if len(deleted) > 0 {
+		l.RemoveRetryTransports(deleted)
+		if l.OnDelete != nil {
+			l.OnDelete(deleted)
+		}
 	}
 	return nil
 }
@@ -288,6 +295,7 @@ func (l *DeliveryLedger) DeleteKeys(keys [][]byte) error {
 	if l.StandaloneReceipts != nil {
 		l.StandaloneReceipts.Delete(keys)
 	}
+	l.RemoveRetryTransports(keys)
 	return nil
 }
 

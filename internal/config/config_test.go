@@ -18,6 +18,62 @@ func TestConfigSuite(t *testing.T) {
 	suite.Run(t, new(ConfigSuite))
 }
 
+func (s *ConfigSuite) TestRetryOwnerLeaseConfiguration() {
+	cfg, err := Load("")
+	s.Require().NoError(err)
+	s.Equal(15*time.Second, cfg.Delivery.RetryOwnerLease)
+
+	path := s.writeConfig("delivery:\n  retryOwnerLease: 24s\n")
+	cfg, err = Load(path)
+	s.Require().NoError(err)
+	s.Equal(24*time.Second, cfg.Delivery.RetryOwnerLease)
+
+	s.T().Setenv("FUTUREQ_DELIVERY_RETRYOWNERLEASE", "30s")
+	cfg, err = Load(path)
+	s.Require().NoError(err)
+	s.Equal(30*time.Second, cfg.Delivery.RetryOwnerLease)
+
+	for _, value := range []string{"0s", "-1s", "1500us"} {
+		s.T().Setenv("FUTUREQ_DELIVERY_RETRYOWNERLEASE", value)
+		_, err = Load(path)
+		s.Require().ErrorContains(err, "delivery.retryOwnerLease must be a positive whole number of milliseconds")
+	}
+}
+
+func (s *ConfigSuite) TestRetryOwnerLeaseLeavesTimeForClusterRenewal() {
+	path := s.writeConfig("cluster:\n  enabled: true\n  nodeId: 1\n  raft:\n    advertise: 'node1.example:50005'\n    initialMembers: {1: 'node1.example:50005'}\napi:\n  grpc:\n    advertise: 'node1.example:8443'\npublish:\n  proposalTimeout: 8s\n")
+	s.T().Setenv("FUTUREQ_DELIVERY_RETRYOWNERLEASE", "23999ms")
+	_, err := Load(path)
+	s.Require().ErrorContains(err, "at least three times publish.proposalTimeout")
+
+	s.T().Setenv("FUTUREQ_DELIVERY_RETRYOWNERLEASE", "24s")
+	cfg, err := Load(path)
+	s.Require().NoError(err)
+	s.Equal(24*time.Second, cfg.Delivery.RetryOwnerLease)
+}
+
+func (s *ConfigSuite) TestRetryOwnerMaxClockSkewConfiguration() {
+	cfg, err := Load("")
+	s.Require().NoError(err)
+	s.Equal(2*time.Second, cfg.Delivery.RetryOwnerMaxClockSkew)
+
+	path := s.writeConfig("delivery:\n  retryOwnerMaxClockSkew: 1500ms\n")
+	cfg, err = Load(path)
+	s.Require().NoError(err)
+	s.Equal(1500*time.Millisecond, cfg.Delivery.RetryOwnerMaxClockSkew)
+
+	s.T().Setenv("FUTUREQ_DELIVERY_RETRYOWNERMAXCLOCKSKEW", "0s")
+	cfg, err = Load(path)
+	s.Require().NoError(err)
+	s.Zero(cfg.Delivery.RetryOwnerMaxClockSkew)
+
+	for _, value := range []string{"-1ms", "1500us"} {
+		s.T().Setenv("FUTUREQ_DELIVERY_RETRYOWNERMAXCLOCKSKEW", value)
+		_, err = Load(path)
+		s.Require().ErrorContains(err, "delivery.retryOwnerMaxClockSkew must be a nonnegative whole number of milliseconds")
+	}
+}
+
 func (s *ConfigSuite) TestVirtualShardCountMinimum() {
 	cfg, err := Load(s.writeConfig("storage:\n  virtualShards: 1\n"))
 	s.Require().NoError(err)
@@ -148,6 +204,7 @@ func (s *ConfigSuite) TestRejectsUnknownAndInvalidValues() {
 		{"unknown nested key", "api:\n  grpc:\n    maxConns: 10\n", "maxconns"},
 		{"version", "configVersion: 2\n", "configVersion"},
 		{"size", "api:\n  grpc:\n    maxSendMessageSize: 0KiB\n", "maxSendMessageSize"},
+		{"send limit below DLQ minimum", "api:\n  grpc:\n    maxSendMessageSize: 89B\n", "maxSendMessageSize must be at least 90B"},
 		{"missing advertise", "cluster:\n  enabled: true\n", "api.grpc.advertise"},
 		{"unspecified advertise", "cluster:\n  enabled: true\napi:\n  grpc:\n    advertise: '0.0.0.0:8443'\n", "api.grpc.advertise"},
 		{"bootstrap and join", "cluster:\n  enabled: true\n  joinSeeds: ['node2.example:8443']\n  raft:\n    advertise: 'node1.example:50005'\n    initialMembers: {1: 'node1.example:50005'}\napi:\n  grpc:\n    advertise: 'node1.example:8443'\n", "cannot both be set"},
@@ -162,6 +219,12 @@ func (s *ConfigSuite) TestRejectsUnknownAndInvalidValues() {
 			s.Require().ErrorContains(err, tt.want)
 		})
 	}
+}
+
+func (s *ConfigSuite) TestMinimumGRPCSendLimit() {
+	cfg, err := Load(s.writeConfig("api:\n  grpc:\n    maxSendMessageSize: 90B\n"))
+	s.Require().NoError(err)
+	s.Equal(Size("90B"), cfg.API.GRPC.MaxSendMessageSize)
 }
 
 func (s *ConfigSuite) TestMemoryPebbleAndBolt() {

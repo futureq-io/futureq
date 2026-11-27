@@ -39,6 +39,11 @@ type EventStateMachine struct {
 	// of each deleted key. Used to remove entries from the dispatcher's in-flight
 	// map. Safe to be nil.
 	OnDeleteKeys func(keys [][]byte)
+	// OnCompletedAttempts releases recipient-specific transport tracking after
+	// commit, including when the event still has other recipients.
+	OnCompletedAttempts func([]CompletedAttempt)
+	// OnSnapshotRecovered reconciles local delivery state with restored receipts.
+	OnSnapshotRecovered func() error
 }
 
 // NewEventStateMachineFactory returns the factory function that Dragonboat
@@ -46,20 +51,22 @@ type EventStateMachine struct {
 func NewEventStateMachineFactory(db storage.DB, repo *repository.EventRepository, onDeleteKeys func(keys [][]byte), logger *zap.Logger) func(uint64, uint64) statemachine.IOnDiskStateMachine {
 	limits := config.DefaultDelivery().ReceiptCache
 	maxBytes, _ := limits.Bytes()
-	return NewEventStateMachineFactoryWithReceiptCache(db, repo, onDeleteKeys, logger, maxBytes, limits.MaxEntries)
+	return NewEventStateMachineFactoryWithReceiptCache(db, repo, onDeleteKeys, nil, nil, logger, maxBytes, limits.MaxEntries)
 }
 
 // NewEventStateMachineFactoryWithReceiptCache uses validated per-replica cache limits.
-func NewEventStateMachineFactoryWithReceiptCache(db storage.DB, repo *repository.EventRepository, onDeleteKeys func(keys [][]byte), logger *zap.Logger, maxBytes int64, maxEntries int) func(uint64, uint64) statemachine.IOnDiskStateMachine {
+func NewEventStateMachineFactoryWithReceiptCache(db storage.DB, repo *repository.EventRepository, onDeleteKeys func(keys [][]byte), onCompletedAttempts func([]CompletedAttempt), onSnapshotRecovered func() error, logger *zap.Logger, maxBytes int64, maxEntries int) func(uint64, uint64) statemachine.IOnDiskStateMachine {
 	return func(clusterID uint64, nodeID uint64) statemachine.IOnDiskStateMachine {
 		return &EventStateMachine{
-			clusterID:    clusterID,
-			nodeID:       nodeID,
-			db:           db,
-			repo:         repo,
-			logger:       logger.Named("event_sm"),
-			receipts:     newReceiptCache(maxBytes, maxEntries),
-			OnDeleteKeys: onDeleteKeys,
+			clusterID:           clusterID,
+			nodeID:              nodeID,
+			db:                  db,
+			repo:                repo,
+			logger:              logger.Named("event_sm"),
+			receipts:            newReceiptCache(maxBytes, maxEntries),
+			OnDeleteKeys:        onDeleteKeys,
+			OnCompletedAttempts: onCompletedAttempts,
+			OnSnapshotRecovered: onSnapshotRecovered,
 		}
 	}
 }
@@ -185,6 +192,10 @@ func (s *EventStateMachine) applyEntry(batch storage.Batch, delivery *DeliveryBa
 		result, deleted, err := delivery.Apply(cmd)
 		return result, deleted, 0, err
 
+	case RetryDeliveryCmd:
+		result, deleted, err := delivery.ApplyRetry(cmd)
+		return result, deleted, 0, err
+
 	default:
 		return statemachine.Result{}, nil, 0, fmt.Errorf("raft: unknown command type: %d", cmd[0])
 	}
@@ -238,6 +249,9 @@ func (s *EventStateMachine) Update(entries []statemachine.Entry) ([]statemachine
 	s.lastPersistedID = lastID
 	s.repo.ObserveID(lastID)
 
+	if s.OnCompletedAttempts != nil && len(delivery.CompletedAttempts()) != 0 {
+		s.OnCompletedAttempts(delivery.CompletedAttempts())
+	}
 	if s.OnDeleteKeys != nil && len(allDeletedKeys) > 0 {
 		s.OnDeleteKeys(allDeletedKeys)
 	}
@@ -410,6 +424,11 @@ func (s *EventStateMachine) RecoverFromSnapshot(r io.Reader, stopc <-chan struct
 	lastID, err := s.readStoredUint64(repository.LastIDKey)
 	if err != nil {
 		return err
+	}
+	if s.OnSnapshotRecovered != nil {
+		if err := s.OnSnapshotRecovered(); err != nil {
+			return fmt.Errorf("raft: reconcile restored delivery attempts: %w", err)
+		}
 	}
 	s.lastApplied = index
 	s.lastPersistedID = lastID

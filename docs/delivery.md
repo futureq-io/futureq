@@ -2,12 +2,10 @@
 
 Consumers use manual ACK/NACK by default. An explicitly requested auto-ack stream
 requires `delivery.subscriptions.allowAutoAck: true`. After a successful gRPC
-send, the sender queues that recipient's completion through the usual batched
-ACK ledger. It does not wait for the application's handler. Failed sends remain
-pending, persistence failures retry, and independent recipients retain their
-copies. Manual ACKs and NACKs on auto-ack streams are ignored, including while a
-send is still blocked. A crash before completion commits can cause duplicates;
-handler failures cannot request redelivery after an auto-ack send.
+send, the sender records that recipient's completion without waiting for the
+application's handler. Failed sends remain pending and other recipients retain
+their copies. Manual ACKs and NACKs on auto-ack streams are ignored. A crash
+before completion commits can cause duplicates.
 
 ```text
  storage ──range scan──▶ Dispatcher ──▶ Hub ──▶ consumer channels
@@ -131,6 +129,62 @@ Consumer registration and rebalance activation retain their completion checks.
 - Failed batches are re-queued and retried on the next flush (`delete_failures_total` tracks failures).
 - After a successful ACK flush, the hub releases tracking for the committed recipients, allowing the rebalance drain to proceed. The shared payload is deleted only after all required recipients complete. Successful explicit deletions clear tracking for the deleted keys.
 
+## Retry limits and dead letters
+
+For a publish with `max_retries`, the broker reserves a recipient-specific
+attempt and durably charges it before calling gRPC Send. The reservation
+deadline includes two `publish.proposalTimeout` windows and one
+`delivery.inFlightTimeout` window. Disconnecting cancels the broker's wait
+for the authorization proposals. Refund proposals can still commit after
+the stream closes. Raft checks the message TTL when authorizing the send.
+The sender checks it again after authorization and before each frame. If the
+TTL expires before the first frame, the broker refunds the attempt.
+The full ACK window starts when the
+sender is ready to enter transport, after authorization commits and the
+sender checks its permit and reservation deadline. If either check fails, it
+refunds the unsent attempt. Once the sender enters transport, the attempt
+retains its number through stalls, failures, and broker crashes. Each attempt
+has a distinct tag, so a delayed ACK or NACK cannot settle a later attempt.
+A failed refund stays protected from expiry while a bounded worker pool retries
+refunds independently. The broker reserves capacity for authorization and refunds
+before creating an attempt, using `delivery.ackQueueCapacity` as the bound
+for this work and independently for the ACK queue. Chunked sends prepare and
+validate the first frame while the attempt is still protected for a refund.
+The broker checks every later frame and ends the stream if the delivery is
+no longer eligible.
+
+The broker queues outcomes for asynchronous persistence and releases local
+tracking after commit. While a broker owns an attempt, outcomes it accepts
+into a queue take precedence over expiry. Retry-limited deliveries have
+separate manual and automatic outcome queues and persistence workers.
+Each queue reserves capacity before the broker charges an attempt and
+counts its outstanding reservations toward `delivery.ackQueueCapacity`.
+A manual ACK or NACK uses its reserved slot when received. An automatic
+ACK uses its slot after transport succeeds. Snapshot recovery releases slots
+for attempts missing from the restored receipts. On graceful shutdown, the
+broker stops granting new reservations and honors active reservations within
+the shutdown window. Closing a consumer stream releases its unused manual
+slots, and its durable attempts keep their expiry deadlines. The broker keeps
+proposals and lease renewal active while it drains accepted outcomes and
+refunds unsent attempts. Clustered brokers renew
+`delivery.retryOwnerLease` every fifth of its duration (every 3 seconds by
+default). Leaders wait an additional `delivery.retryOwnerMaxClockSkew`
+(default 2 seconds) before recovering another broker's expired attempts.
+The margin covers the maximum wall-clock difference between brokers.
+An outage that prevents outcomes from committing before recovery can still
+result in a retry or a dead letter.
+
+Deadline scans drain expired attempts in bounded batches, including when no
+workers are connected. Expiry releases the matching local slot on every replica
+after commit. Deletion removes the durable retry deadlines with the
+receipt and stops local transport timers after commit. A final NACK or timeout
+atomically archives the payload and marks that subscription's delivery
+complete. Other subscriptions keep their independent retry budgets. Message
+TTL and unsubscribing can discard pending deliveries before they are
+dead-lettered. Retiring a subscription stops its transport timers when cleanup
+commits, while other recipients keep their ACK windows. See the
+[dead-letter queue API](api.md#dead-letter-queue) for retention and retrieval.
+
 ## TTL janitor
 
 The dispatcher's inline TTL check only covers topics with live consumers. The janitor sweeps the **entire database** every `delivery.ttlsweepInterval` (default 60s), skips non-event keys (metadata, indexes), and routes expired messages to the deleter — so TTL messages with zero consumers still get cleaned up.
@@ -139,4 +193,4 @@ The dispatcher's inline TTL check only covers topics with live consumers. The ja
 
 !!! warning "At-least-once"
 
-    A message is re-dispatched if the consumer never ACKs (timeout), NACKs, or disconnects. Consumers must be idempotent. Duplicate delivery is also possible across a leader failover window in rare cases. There is no exactly-once mode and no per-message dedup at the consume path.
+    A message is eligible for redelivery after a NACK, timeout, or disconnect while the subscription has retry budget. Consumers must handle duplicates, including across leader failover.

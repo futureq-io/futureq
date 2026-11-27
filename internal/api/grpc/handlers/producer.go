@@ -119,6 +119,14 @@ func (ph *ProducerHandler) processBatch(ctx context.Context, batch *pb.PublishBa
 	}
 
 	nowMs := time.Now().UnixMilli()
+	if maxSize, _ := app.A.Config().API.GRPC.MaxSendMessageSize.Bytes(); maxSize > 0 {
+		for i, message := range batch.Messages {
+			if !deliveryFrameFits(int(maxSize), message.Topic, message.Payload, nowMs, message.DelayMs, message.MaxRetries) {
+				return &pb.PublishBatchAck{Success: false}, status.Errorf(codes.ResourceExhausted,
+					"message %d exceeds the gRPC delivery frame limit of %d bytes", i, maxSize)
+			}
+		}
+	}
 	var receipts map[string][]byte
 	// Quorum publishes decide admission in the ordered event state machine.
 	// Standalone and early ACKs must bind destinations before storing/submitting.
@@ -150,6 +158,22 @@ func (ph *ProducerHandler) processBatch(ctx context.Context, batch *pb.PublishBa
 	metrics.PublishLatencyMs.WithLabelValues(topicLabel, ackLevel.String()).Observe(float64(time.Since(start).Milliseconds()))
 
 	return &pb.PublishBatchAck{Success: true}, nil
+}
+
+func deliveryFrameFits(limit int, topic string, payload []byte, enqueuedAt, delay int64, retries *uint32) bool {
+	if limit <= 0 {
+		return true
+	}
+	var tag [utils.EventKeySize + raft.AttemptTokenSize]byte
+	frame := &pb.QueueMessage{
+		Topic: topic, Payload: payload, EnqueuedAtUnixMs: enqueuedAt, DelayMs: delay,
+		DeliveryTag: tag[:utils.EventKeySize], MaxRetries: retries,
+	}
+	if retries != nil {
+		frame.DeliveryTag = tag[:]
+		frame.Attempt = uint64(*retries) + 1
+	}
+	return proto.Size(frame) <= limit
 }
 
 // TODO: this is shit. we need to know how many messagers are per topic
@@ -208,6 +232,7 @@ func (ph *ProducerHandler) marshalMessages(
 			DelayMs:          msg.DelayMs,
 			TtlMs:            msg.TtlMs,
 			Indexes:          msg.Indexes,
+			MaxRetries:       msg.MaxRetries,
 		}
 
 		if err := fn(stored); err != nil {

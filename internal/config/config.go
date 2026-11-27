@@ -215,6 +215,8 @@ type Delivery struct {
 	PreloadLookahead           time.Duration `mapstructure:"preloadLookahead" yaml:"preloadLookahead"`
 	PreloadMaxMessages         int           `mapstructure:"preloadMaxMessages" yaml:"preloadMaxMessages"`
 	InFlightTimeout            time.Duration `mapstructure:"inFlightTimeout" yaml:"inFlightTimeout"`
+	RetryOwnerLease            time.Duration `mapstructure:"retryOwnerLease" yaml:"retryOwnerLease"`
+	RetryOwnerMaxClockSkew     time.Duration `mapstructure:"retryOwnerMaxClockSkew" yaml:"retryOwnerMaxClockSkew"`
 	ReadPermit                 time.Duration `mapstructure:"readPermit" yaml:"readPermit"`
 	DeleteBatchInterval        time.Duration `mapstructure:"deleteBatchInterval" yaml:"deleteBatchInterval"`
 	DeleteWorkers              int           `mapstructure:"deleteWorkers" yaml:"deleteWorkers"`
@@ -366,6 +368,8 @@ func validAddress(address string, advertised bool) bool {
 }
 
 func (c *Config) validateAPI() error {
+	// A compact DLQ page with one entry and a continuation cursor needs 90 bytes.
+	const minSendBytes = 90
 	g := c.API.GRPC
 	if !validAddress(g.Listen, false) {
 		return fmt.Errorf("api.grpc.listen must be a host:port address")
@@ -380,6 +384,9 @@ func (c *Config) validateAPI() error {
 		bytes, err := size.Bytes()
 		if err != nil || bytes > int64(int(^uint(0)>>1)) {
 			return fmt.Errorf("api.grpc.%s must be a positive supported size: %v", name, err)
+		}
+		if name == "maxSendMessageSize" && bytes < minSendBytes {
+			return fmt.Errorf("api.grpc.maxSendMessageSize must be at least %dB for dead letter pagination", minSendBytes)
 		}
 	}
 	return nil
@@ -487,6 +494,16 @@ func (c *Config) validatePublishAndDelivery() error {
 	}
 
 	d := c.Delivery
+	if d.RetryOwnerLease <= 0 || d.RetryOwnerLease%time.Millisecond != 0 {
+		return fmt.Errorf("delivery.retryOwnerLease must be a positive whole number of milliseconds")
+	}
+	if d.RetryOwnerMaxClockSkew < 0 || d.RetryOwnerMaxClockSkew%time.Millisecond != 0 {
+		return fmt.Errorf("delivery.retryOwnerMaxClockSkew must be a nonnegative whole number of milliseconds")
+	}
+	// Keep enough time for renewal to recover from a timed-out proposal.
+	if c.Cluster.Enabled && d.RetryOwnerLease/3 < c.Publish.ProposalTimeout {
+		return fmt.Errorf("delivery.retryOwnerLease must be at least three times publish.proposalTimeout in cluster mode")
+	}
 	switch d.HeapType {
 	case HeapBinary, Heap4Ary, Heap8Ary:
 	default:

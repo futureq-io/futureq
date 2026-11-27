@@ -7,6 +7,7 @@ import (
 	"context"
 	stdLogger "log"
 	"runtime"
+	"sync"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -122,24 +123,34 @@ func startRun(cmd *cobra.Command, _ []string) {
 			return a.MetadataSM.DeliveryRecipients(topic)
 		}
 		proposeDelivery = func(cmd []byte) (statemachine.Result, error) {
-			ctx, cancel := context.WithTimeout(a.Ctx, cfg.Publish.ProposalTimeout)
+			parent := a.Ctx
+			select {
+			case <-a.Ctx.Done():
+				// An authorization interrupted by shutdown can still refund
+				// its reservation while Raft is available.
+				parent = a.ShutCtx
+			default:
+			}
+			ctx, cancel := context.WithTimeout(parent, cfg.Publish.ProposalTimeout)
 			defer cancel()
 			return a.NodeHost.SyncPropose(ctx, a.NodeHost.GetNoOPSession(cfg.Cluster.ShardID), cmd)
 		}
 	}
 
 	ledger := dispatcher.NewDeliveryLedger(a.DB, recipients, deleteBackend, proposeDelivery)
-	var standalonePublishLedger *dispatcher.DeliveryLedger
 	if cfg.Cluster.Enabled {
+		ledger.SetRetryOwner(cfg.Cluster.NodeID)
 		ledger.ProposeContext = func(ctx context.Context, cmd []byte) (statemachine.Result, error) {
+			ctx, cancel := context.WithTimeout(ctx, cfg.Publish.ProposalTimeout)
+			defer cancel()
 			return a.NodeHost.SyncPropose(ctx, a.NodeHost.GetNoOPSession(cfg.Cluster.ShardID), cmd)
 		}
 	} else if maxBytes, _ := cfg.Delivery.ReceiptCache.MaxBytes.Bytes(); maxBytes > 0 {
 		ledger.StandaloneReceipts = raft.NewStandaloneReceiptCache(maxBytes, cfg.Delivery.ReceiptCache.MaxEntries)
-		standalonePublishLedger = ledger
 	}
 	deleter := dispatcher.NewDeleter(ledger, deleteInterval, logger)
 	deleter.AckQueueCapacity = cfg.Delivery.AckQueueCapacity
+	ledger.ConfigureRetryOutcomes(cfg.Delivery.AckQueueCapacity)
 	if cfg.Cluster.Enabled {
 		// Overlap consensus waits without releasing tracking before commit
 		// or accumulating unbounded proposal goroutines during quorum loss.
@@ -201,9 +212,9 @@ func startRun(cmd *cobra.Command, _ []string) {
 	// removed immediately without waiting for the next scan pass.
 	if cfg.Cluster.Enabled {
 		if err := a.StartRaft(joining, func(keys [][]byte) {
-			disp.RemoveInFlightBatch(keys)
-			hub.RemoveDeletedBatch(keys)
-		}); err != nil {
+			ledger.RemoveRetryTransports(keys)
+			ledger.OnDelete(keys)
+		}, ledger.CompleteRetryAttempts, ledger.ReconcileRetryAttempts); err != nil {
 			logger.Fatal("failed to start raft", zap.Error(err))
 		}
 		hub.SetGroupMembership(a.MetadataSM.ConsumerGroup)
@@ -253,8 +264,20 @@ func startRun(cmd *cobra.Command, _ []string) {
 		janitor.Run(a.Ctx)
 	}()
 
+	a.RegisterComponentWithShutdown()
+	go func() {
+		defer a.ComponentShutdownDone()
+		ledger.RunRetryExpiry(a.Ctx, dispatchInterval, a.Subscriptions.IsLeader, logger)
+	}()
+
+	a.RegisterComponentWithShutdown()
+	go func() {
+		defer a.ComponentShutdownDone()
+		runRetryWorkers(a, ledger, max(2, deleter.MaxConcurrentFlushes), logger)
+	}()
+
 	// ── gRPC server ───────────────────────────────────────────────────────────
-	grpcserver.New(cfg.API.GRPC, hub, deleter, logger, standalonePublishLedger).
+	grpcserver.New(cfg.API.GRPC, hub, deleter, logger, ledger).
 		Listen().
 		WaitForShutdown(a.Ctx)
 
@@ -262,6 +285,38 @@ func startRun(cmd *cobra.Command, _ []string) {
 	if err := a.WithGracefulShutdown(); err != nil {
 		logger.Fatal("failed to graceful shutdown", zap.Error(err))
 	}
+}
+
+// Keep the owner and Raft proposal context alive until outcomes and refunds drain.
+func runRetryWorkers(a *app.App, ledger *dispatcher.DeliveryLedger, workers int, logger *zap.Logger) {
+	ctx, cancel := context.WithCancel(context.WithoutCancel(a.Ctx))
+	ownerDone := make(chan struct{})
+	go func() {
+		defer close(ownerDone)
+		if a.Config().Cluster.Enabled {
+			cfg := a.Config().Delivery
+			ledger.RunRetryOwner(ctx, cfg.RetryOwnerLease, cfg.RetryOwnerMaxClockSkew, logger)
+		}
+	}()
+	drainDone := make(chan struct{})
+	go func() {
+		defer close(drainDone)
+		var group sync.WaitGroup
+		group.Go(func() { ledger.RunRetryOutcomes(ctx, workers, logger) })
+		group.Go(func() { ledger.RunRetryRefunds(ctx, a.Config().Delivery.DispatchPollInterval, logger) })
+		group.Wait()
+	}()
+
+	<-a.Ctx.Done()
+	ledger.StopRetryOutcomeAdmission()
+	select {
+	case <-drainDone:
+	case <-a.ShutCtx.Done():
+		logger.Warn("delivery retry drain timed out with outcomes or refunds still pending")
+	}
+	cancel()
+	<-drainDone
+	<-ownerDone
 }
 
 // consumerMetadataLoop drains deliveries, reconciles subscriptions, and fences

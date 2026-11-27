@@ -122,6 +122,10 @@ func (c *receiptCache) store(key string, state *DeliveryState) {
 	for _, recipient := range state.Recipients {
 		size += int64(len(recipient))
 	}
+	if state.attempts != nil {
+		// A map can retain slots from already-completed recipients.
+		size += 64 + 32*int64(len(state.Recipients)) + 160*int64(len(state.attempts))
+	}
 	if size > c.maxBytes {
 		c.budgetRejects++
 		if sameKey {

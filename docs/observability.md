@@ -52,6 +52,7 @@ lateness histograms use milliseconds.
 | `messages_expired_total`     | counter   | topic, source (`dispatcher\|janitor`) | Accepted TTL deletion requests on this node, attributed to the source that queued each request. Repeated scans and failed flush retries are deduplicated while a deletion is pending. Not committed deletes or globally unique messages. |
 | `active_consumers`            | gauge     | topic, group_id | Connected consumers |
 | `consumer_ack_total`          | counter   | topic, group_id, success | ACK/NACK frames received |
+| `dead_lettered_total`        | counter   | reason (`nack`, `timeout`) | Subscription deliveries moved to the durable dead-letter queue. |
 | `delete_batch_size`           | histogram | —      | Keys per delete flush |
 | `delete_failures_total`      | counter   | —      | Failed delete flushes (retried) |
 

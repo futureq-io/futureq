@@ -512,7 +512,7 @@ func (d *Dispatcher) deliverChunk(chunk deliveryChunk, states map[string]*raft.D
 		if now < msg.EnqueuedAtUnixMs+msg.DelayMs {
 			continue
 		}
-		queued := &pb.QueueMessage{Topic: msg.Topic, Payload: msg.Payload, DeliveryTag: item.Key, EnqueuedAtUnixMs: msg.EnqueuedAtUnixMs, DelayMs: msg.DelayMs}
+		queued := &pb.QueueMessage{Topic: msg.Topic, Payload: msg.Payload, DeliveryTag: item.Key, EnqueuedAtUnixMs: msg.EnqueuedAtUnixMs, DelayMs: msg.DelayMs, MaxRetries: msg.MaxRetries}
 		if chunk.generation != nil && !chunk.generation.Load() {
 			break
 		}

@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"io"
 	"net"
 	"strings"
 	"testing"
@@ -11,15 +12,487 @@ import (
 	"github.com/futureq-io/futureq/internal/dispatcher"
 	raft "github.com/futureq-io/futureq/internal/raft/event"
 	"github.com/futureq-io/futureq/internal/storage"
+	"github.com/futureq-io/futureq/pkg/utils"
 	pb "github.com/futureq-io/protocol/proto/go"
+	deliverypb "github.com/futureq-io/protocol/proto/go/delivery"
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
+	"github.com/stretchr/testify/suite"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
+	"google.golang.org/protobuf/proto"
 )
+
+type DeadLetterDeliverySuite struct{ suite.Suite }
+
+func TestDeadLetterDeliverySuite(t *testing.T) {
+	suite.Run(t, new(DeadLetterDeliverySuite))
+}
+
+func (s *DeadLetterDeliverySuite) TestListDeadLettersUsesConfiguredFrameBudget() {
+	a, _, producer, _ := openPublishTest(s.T(), "pebble")
+	const limit = 16 << 10
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	group := strings.Repeat("w", 3600)
+	subscription, err := a.Subscriptions.Create(ctx, "orders", group, "")
+	s.Require().NoError(err)
+	for range 5 {
+		ack, err := producer.processBatch(ctx, &pb.PublishBatch{Messages: []*pb.PublishMessage{{
+			Topic: "orders", MaxRetries: new(uint32(0)),
+		}}})
+		s.Require().NoError(err)
+		s.Require().True(ack.GetSuccess())
+	}
+	ledger := dispatcher.NewDeliveryLedger(a.DB, nil, nil, nil)
+	for _, key := range publishedKeys(s.T(), a.DB) {
+		s.archiveFinalNack(ledger, key, subscription.Recipient)
+	}
+	full, err := (raft.DeadLetterQuery{Topic: "orders", Limit: 100}).Read(a.DB)
+	s.Require().NoError(err)
+	s.Greater(proto.Size(full.Page), limit)
+
+	listener := bufconn.Listen(1 << 20)
+	defer listener.Close() //nolint:errcheck
+	server := grpc.NewServer(grpc.MaxSendMsgSize(limit))
+	defer server.Stop()
+	pb.RegisterFutureQDeadLetterServer(server, &DeadLetterHandler{Ledger: ledger, MaxSendBytes: limit})
+	go func() { _ = server.Serve(listener) }()
+	conn, err := grpc.NewClient("passthrough:///dead-letter-pages", grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) {
+		return listener.DialContext(ctx)
+	}), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	s.Require().NoError(err)
+	defer conn.Close() //nolint:errcheck
+	client := pb.NewFutureQDeadLetterClient(conn)
+	page, err := client.ListDeadLetters(ctx, &pb.ListDeadLettersRequest{Topic: "orders"})
+	s.Require().NoError(err)
+	s.Require().Len(page.Entries, 4)
+	s.Require().NotEmpty(page.NextPageToken)
+	s.LessOrEqual(proto.Size(page), limit)
+	next, err := client.ListDeadLetters(ctx, &pb.ListDeadLettersRequest{Topic: "orders", PageToken: page.NextPageToken})
+	s.Require().NoError(err)
+	s.Require().Len(next.Entries, 1)
+	s.Empty(next.NextPageToken)
+	for i, entry := range append(page.Entries, next.Entries...) {
+		s.Equal(full.Page.Entries[i].Id, entry.Id)
+	}
+}
+
+func (s *DeadLetterDeliverySuite) TestOversizedSummaryStillAllowsListingLaterIDs() {
+	a, _, producer, _ := openPublishTest(s.T(), "pebble")
+	ledger := dispatcher.NewDeliveryLedger(a.DB, nil, nil, nil)
+	ctx := context.Background()
+	large := strings.Repeat("w", 3000)
+	for _, group := range []string{large, "later"} {
+		subscription, err := a.Subscriptions.Create(ctx, "orders", group, "")
+		s.Require().NoError(err)
+		ack, err := producer.processBatch(ctx, &pb.PublishBatch{Messages: []*pb.PublishMessage{{
+			Topic: "orders", MaxRetries: new(uint32(0)),
+		}}})
+		s.Require().NoError(err)
+		s.Require().True(ack.GetSuccess())
+		keys := publishedKeys(s.T(), a.DB)
+		s.Require().Len(keys, 1)
+		s.archiveFinalNack(ledger, keys[0], subscription.Recipient)
+	}
+
+	const sendLimit = 1 << 10
+	h := &DeadLetterHandler{Ledger: ledger, MaxSendBytes: sendLimit}
+	request := &pb.ListDeadLettersRequest{Topic: "orders", PageSize: 1}
+	page, err := h.ListDeadLetters(ctx, request)
+	s.Require().NoError(err)
+	s.Require().Len(page.Entries, 1)
+	s.True(page.Entries[0].GetIdentityOmitted())
+	s.Empty(page.Entries[0].GetGroupId())
+	s.LessOrEqual(proto.Size(page), sendLimit)
+	s.Require().NotEmpty(page.NextPageToken)
+	request.PageToken = page.NextPageToken
+	next, err := h.ListDeadLetters(ctx, request)
+	s.Require().NoError(err)
+	s.Require().Len(next.Entries, 1)
+	s.Equal("later", next.Entries[0].GetGroupId())
+	s.False(next.Entries[0].GetIdentityOmitted())
+	s.Empty(next.GetNextPageToken())
+
+	full, err := (raft.DeadLetterQuery{Topic: "orders", ID: page.Entries[0].GetId()}).Read(a.DB)
+	s.Require().NoError(err)
+	s.Equal(large, full.Entry.GetSummary().GetGroupId())
+	s.False(full.Entry.GetSummary().GetIdentityOmitted())
+}
+
+func (s *DeadLetterDeliverySuite) TestSummaryAndCursorFitSmallSendLimits() {
+	a, _, producer, _ := openPublishTest(s.T(), "pebble")
+	ledger := dispatcher.NewDeliveryLedger(a.DB, nil, nil, nil)
+	ctx := context.Background()
+	topic := strings.Repeat("t", 95)
+	s.Require().NoError(a.Subscriptions.CreateTopic(ctx, topic, nil))
+	subscription, err := a.Subscriptions.Create(ctx, topic, "w", "")
+	s.Require().NoError(err)
+	for range 2 {
+		ack, err := producer.processBatch(ctx, &pb.PublishBatch{Messages: []*pb.PublishMessage{{
+			Topic: topic, MaxRetries: new(uint32(0)),
+		}}})
+		s.Require().NoError(err)
+		s.Require().True(ack.GetSuccess())
+		keys := publishedKeys(s.T(), a.DB)
+		s.Require().Len(keys, 1)
+		s.archiveFinalNack(ledger, keys[0], subscription.Recipient)
+	}
+	original, err := (raft.DeadLetterQuery{Topic: topic, Limit: 2}).Read(a.DB)
+	s.Require().NoError(err)
+	s.Require().Len(original.Page.Entries, 2)
+	first := proto.CloneOf(original.Page.Entries[0])
+	first.GroupId = ""
+	first.IdentityOmitted = true
+	s.Require().Greater(proto.Size(&pb.ListDeadLettersResponse{
+		Entries: []*pb.DeadLetterSummary{first}, NextPageToken: first.GetId(),
+	}), 256, "dropping the group name alone does not fit")
+
+	for _, tc := range []struct {
+		name     string
+		limit    int
+		pageSize uint32
+	}{
+		{"256-byte-frame", 256, 1},
+		{"128-byte-frame", 128, 1},
+		{"128-byte-frame-default-size", 128, 0},
+		{"96-byte-frame", 96, 1},
+		{"91-byte-frame", 91, 1},
+		{"90-byte-frame", 90, 1},
+	} {
+		s.Run(tc.name, func() {
+			listener := bufconn.Listen(1 << 20)
+			defer listener.Close() //nolint:errcheck
+			server := grpc.NewServer(grpc.MaxSendMsgSize(tc.limit))
+			defer server.Stop()
+			pb.RegisterFutureQDeadLetterServer(server, &DeadLetterHandler{Ledger: ledger, MaxSendBytes: tc.limit})
+			go func() { _ = server.Serve(listener) }()
+			conn, err := grpc.NewClient("passthrough:///dead-letter-pages", grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) {
+				return listener.DialContext(ctx)
+			}), grpc.WithTransportCredentials(insecure.NewCredentials()))
+			s.Require().NoError(err)
+			defer conn.Close() //nolint:errcheck
+			client := pb.NewFutureQDeadLetterClient(conn)
+			ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			defer cancel()
+			request := &pb.ListDeadLettersRequest{Topic: topic, PageSize: tc.pageSize}
+			var compactID []byte
+			for i, entry := range original.Page.Entries {
+				page, err := client.ListDeadLetters(ctx, request)
+				s.Require().NoError(err)
+				s.Require().Len(page.Entries, 1)
+				s.LessOrEqual(proto.Size(page), tc.limit)
+				id := page.Entries[0].GetId()
+				if tc.limit <= 96 && i == 0 {
+					s.Less(len(id), len(entry.GetId()))
+					canonicalID, err := raft.ParseDeadLetterPageToken(topic, id)
+					s.Require().NoError(err)
+					s.Equal(entry.GetId(), canonicalID)
+					compactID = id
+				} else {
+					s.Equal(entry.GetId(), id)
+				}
+				if i == 0 {
+					s.True(page.Entries[0].GetIdentityOmitted())
+					if tc.limit <= 91 {
+						s.Equal(90, proto.Size(page))
+					}
+					token := page.GetNextPageToken()
+					canonicalID, err := raft.ParseDeadLetterPageToken(topic, token)
+					s.Require().NoError(err)
+					s.Equal(entry.GetId(), canonicalID)
+					if tc.limit <= 128 {
+						s.Less(len(token), len(canonicalID))
+						_, err := client.ListDeadLetters(ctx, &pb.ListDeadLettersRequest{Topic: "orders", PageToken: token})
+						s.Equal(codes.InvalidArgument, status.Code(err))
+					}
+				} else {
+					s.Empty(page.GetNextPageToken())
+				}
+				request.PageToken = page.GetNextPageToken()
+			}
+			if tc.limit == 90 {
+				firstID := original.Page.Entries[0].GetId()
+				generation := uuid.MustParse(strings.TrimPrefix(subscription.Recipient, "g:s:"))
+				legacyToken := append(append([]byte{}, firstID[:utils.EventKeySize]...), 0)
+				legacyToken = append(legacyToken, generation[:]...)
+				next, err := client.ListDeadLetters(ctx, &pb.ListDeadLettersRequest{Topic: topic, PageSize: 1, PageToken: legacyToken})
+				s.Require().NoError(err)
+				s.Require().Len(next.Entries, 1)
+				s.Equal(original.Page.Entries[1].GetId(), next.Entries[0].GetId())
+
+				record := &pb.DeadLetterRequest{Topic: topic, Id: compactID}
+				stream, err := client.GetDeadLetter(ctx, record)
+				s.Require().NoError(err)
+				var data []byte
+				for {
+					chunk, err := stream.Recv()
+					if err == io.EOF {
+						break
+					}
+					s.Require().NoError(err)
+					data = append(data, chunk.GetData()...)
+				}
+				entry := new(pb.DeadLetter)
+				s.Require().NoError(proto.Unmarshal(data, entry))
+				s.Equal(compactID, entry.GetSummary().GetId())
+				s.Equal("w", entry.GetSummary().GetGroupId())
+				_, err = client.DeleteDeadLetter(ctx, record)
+				s.Require().NoError(err)
+				next, err = client.ListDeadLetters(ctx, &pb.ListDeadLettersRequest{Topic: topic, PageSize: 1})
+				s.Require().NoError(err)
+				s.Require().Len(next.Entries, 1)
+				s.Equal(original.Page.Entries[1].GetId(), next.Entries[0].GetId())
+				s.Empty(next.NextPageToken)
+			}
+		})
+	}
+}
+
+func (s *DeadLetterDeliverySuite) archiveFinalNack(ledger *dispatcher.DeliveryLedger, key []byte, recipient string) {
+	target := &deliverypb.DeliveryAttemptTarget{
+		Key: key, Recipient: recipient, Token: make([]byte, raft.AttemptTokenSize), DeadlineMs: 110,
+	}
+	value, err := ledger.ApplyRetry(&deliverypb.RetryCommand{
+		Operation: deliverypb.RetryCommand_START, NowMs: 100, Attempts: []*deliverypb.DeliveryAttemptTarget{target},
+	})
+	s.Require().NoError(err)
+	s.Require().Equal(uint64(1), value)
+	value, err = ledger.ApplyRetry(&deliverypb.RetryCommand{
+		Operation: deliverypb.RetryCommand_SENT, NowMs: 100, Attempts: []*deliverypb.DeliveryAttemptTarget{target},
+	})
+	s.Require().NoError(err)
+	s.Require().Equal(uint64(1), value)
+	target.DeadlineMs = 0
+	value, err = ledger.ApplyRetry(&deliverypb.RetryCommand{
+		Operation: deliverypb.RetryCommand_NACK, NowMs: 101, Attempts: []*deliverypb.DeliveryAttemptTarget{target},
+	})
+	s.Require().NoError(err)
+	s.Require().Equal(uint64(1), value)
+}
+
+func (s *DeadLetterDeliverySuite) TestDeadLetterAfterNACKOrDisconnect() {
+	for _, engine := range []string{"pebble", "bolt"} {
+		s.Run(engine, func() { s.exerciseDeadLetters(engine, 100<<10) })
+	}
+}
+
+func (s *DeadLetterDeliverySuite) TestDeliveryChunksFitSmallerReplicaSendLimit() {
+	s.exerciseDeadLetters("pebble", 1<<10)
+}
+
+func (s *DeadLetterDeliverySuite) exerciseDeadLetters(engine string, sendLimit int) {
+	a, hub, producer, _ := openPublishTest(s.T(), engine)
+	a.Config().Delivery.Subscriptions.AllowAutoAck = true
+	a.Config().API.GRPC.MaxSendMessageSize = "100KiB" // publishing replica
+	logger := zap.NewNop()
+	ledger := dispatcher.NewDeliveryLedger(a.DB, hub.LocalDeliveryRecipients, dispatcher.NewDirectDeleteBackend(a.DB, logger), nil)
+	ledger.ConfigureRetryOutcomes(16)
+	ledger.StandaloneReceipts = raft.NewStandaloneReceiptCache(1<<20, 128)
+	producer.StandalonePublishLedger = ledger
+	a.Subscriptions.ApplyLocal = ledger.ApplySubscription
+	deleter := dispatcher.NewDeleter(ledger, time.Millisecond, logger)
+	deleter.AcknowledgeBatch = ledger.Acknowledge
+	deleter.OnAcknowledged = hub.RemoveAcknowledgedBatch
+	d := dispatcher.NewDispatcher(a.DB, hub, deleter, time.Millisecond, 750*time.Millisecond, make(chan struct{}, 1), logger)
+	d.PublishedReceipts = true
+	hub.OnNack = d.RemoveInFlight
+	ledger.OnDelete = hub.RemoveDeletedBatch
+
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	done := make(chan struct{}, 5)
+	for _, run := range []func(context.Context){d.Run, deleter.Run, a.Subscriptions.Run, func(ctx context.Context) {
+		ledger.RunRetryExpiry(ctx, time.Millisecond, nil, logger)
+	}, func(ctx context.Context) {
+		ledger.RunRetryOutcomes(ctx, 2, logger)
+	}} {
+		go func() { defer func() { done <- struct{}{} }(); run(ctx) }()
+	}
+	listener := bufconn.Listen(1 << 20)
+	const publishLimit = 100 << 10
+	server := grpc.NewServer(grpc.MaxRecvMsgSize(publishLimit), grpc.MaxSendMsgSize(sendLimit))
+	s.T().Cleanup(func() {
+		cancel()
+		server.Stop()
+		_ = listener.Close()
+		for range 5 {
+			<-done
+		}
+	})
+	consumer := NewConsumerHandler(logger, hub, deleter)
+	consumer.RetryLedger = ledger
+	consumer.MaxSendBytes = sendLimit
+	pb.RegisterFutureQConsumerServer(server, consumer)
+	pb.RegisterFutureQProducerServer(server, producer)
+	pb.RegisterFutureQDeadLetterServer(server, &DeadLetterHandler{Ledger: ledger, MaxSendBytes: sendLimit})
+	go func() { _ = server.Serve(listener) }()
+	conn, err := grpc.NewClient("passthrough:///dead-letters", grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) {
+		return listener.Dial()
+	}), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	s.Require().NoError(err)
+	s.T().Cleanup(func() { _ = conn.Close() })
+	client := pb.NewFutureQConsumerClient(conn)
+	dlq := pb.NewFutureQDeadLetterClient(conn)
+	workers, err := client.CreateSubscription(ctx, &pb.SubscriptionRequest{Topic: "orders", GroupId: "workers"})
+	s.Require().NoError(err)
+	_, err = client.CreateSubscription(ctx, &pb.SubscriptionRequest{Topic: "orders", SubscriberId: "audit"})
+	s.Require().NoError(err)
+	connect := func(init *pb.SubscribeInit) grpc.BidiStreamingClient[pb.ConsumerFrame, pb.QueueMessage] {
+		stream, err := client.Subscribe(ctx)
+		s.Require().NoError(err)
+		s.Require().NoError(stream.Send(&pb.ConsumerFrame{Body: &pb.ConsumerFrame_Init{Init: init}}))
+		_, err = stream.Header()
+		s.Require().NoError(err)
+		return stream
+	}
+	worker := connect(&pb.SubscribeInit{Topic: "orders", GroupId: "workers"})
+	audit := connect(&pb.SubscribeInit{Topic: "orders", SubscriberId: "audit"})
+	publish, err := pb.NewFutureQProducerClient(conn).PublishStream(ctx)
+	s.Require().NoError(err)
+	send := func(payload string, retries uint32) {
+		s.Require().NoError(publish.Send(&pb.PublishBatch{Messages: []*pb.PublishMessage{{
+			Topic: "orders", Payload: []byte(payload), MaxRetries: &retries,
+		}}}))
+		ack, err := publish.Recv()
+		s.Require().NoError(err)
+		s.Require().True(ack.Success, ack.ErrorMessage)
+	}
+	ack := func(stream grpc.BidiStreamingClient[pb.ConsumerFrame, pb.QueueMessage], message *pb.QueueMessage, success bool) {
+		s.Require().NoError(stream.Send(&pb.ConsumerFrame{Body: &pb.ConsumerFrame_Ack{Ack: &pb.AckRequest{
+			DeliveryTag: message.DeliveryTag, Success: success,
+		}}}))
+	}
+	nearLimit := strings.Repeat("r", publishLimit-100)
+	send(nearLimit, 1)
+	first := s.receiveDelivery(worker, sendLimit)
+	s.Equal(uint64(1), first.Attempt)
+	s.Equal(nearLimit, string(first.Payload))
+	audited := s.receiveDelivery(audit, sendLimit)
+	s.Equal(uint64(1), audited.Attempt)
+	ack(audit, audited, true)
+	ack(worker, first, false)
+	second := s.receiveDelivery(worker, sendLimit)
+	s.Equal(uint64(2), second.Attempt)
+	s.NotEqual(first.DeliveryTag, second.DeliveryTag)
+	ack(worker, first, true)
+	ack(worker, second, false)
+	s.Require().Eventually(func() bool {
+		page, err := dlq.ListDeadLetters(ctx, &pb.ListDeadLettersRequest{Topic: "orders"})
+		return err == nil && len(page.Entries) == 1
+	}, 2*time.Second, 5*time.Millisecond)
+
+	s.Require().NoError(audit.CloseSend())
+	_, err = audit.Recv()
+	s.Require().ErrorIs(err, io.EOF)
+	send("disconnected", 0)
+	unacknowledged, err := worker.Recv()
+	s.Require().NoError(err)
+	s.Equal(uint64(1), unacknowledged.Attempt)
+	s.Require().NoError(worker.CloseSend())
+	s.Require().Eventually(func() bool {
+		page, err := dlq.ListDeadLetters(ctx, &pb.ListDeadLettersRequest{Topic: "orders"})
+		return err == nil && len(page.Entries) == 2
+	}, 3*time.Second, 10*time.Millisecond)
+
+	request := &pb.ListDeadLettersRequest{Topic: "orders", PageSize: 1}
+	page, err := dlq.ListDeadLetters(ctx, request)
+	s.Require().NoError(err)
+	s.Require().Len(page.Entries, 1)
+	s.Require().NotEmpty(page.NextPageToken)
+	request.PageToken = page.NextPageToken
+	next, err := dlq.ListDeadLetters(ctx, request)
+	s.Require().NoError(err)
+	s.Require().Len(next.Entries, 1)
+	s.Empty(next.NextPageToken)
+	for _, summary := range []*pb.DeadLetterSummary{page.Entries[0], next.Entries[0]} {
+		s.Equal(workers.Generation, summary.Generation)
+		s.Equal("workers", summary.GroupId)
+		get := &pb.DeadLetterRequest{Topic: "orders", Id: summary.Id}
+		entry, err := receiveDeadLetter(ctx, dlq, get)
+		s.Require().NoError(err)
+		s.Require().NotNil(entry.Message.MaxRetries)
+		switch summary.Reason {
+		case pb.DeadLetterReason_DEAD_LETTER_REASON_NACK:
+			s.Equal(uint64(2), summary.Attempts)
+			s.Equal(nearLimit, string(entry.Message.Payload))
+			s.Greater(proto.Size(entry), publishLimit, "a single gRPC response would exceed the send limit")
+			s.Equal(uint32(1), *entry.Message.MaxRetries)
+		case pb.DeadLetterReason_DEAD_LETTER_REASON_TIMEOUT:
+			s.Equal(uint64(1), summary.Attempts)
+			s.Equal("disconnected", string(entry.Message.Payload))
+			s.Zero(*entry.Message.MaxRetries)
+		default:
+			s.Fail("unexpected dead-letter reason")
+		}
+		_, err = dlq.DeleteDeadLetter(ctx, get)
+		s.Require().NoError(err)
+		_, err = dlq.DeleteDeadLetter(ctx, get)
+		s.Require().NoError(err)
+		_, err = receiveDeadLetter(ctx, dlq, get)
+		s.Equal(codes.NotFound, status.Code(err))
+	}
+
+	auto := connect(&pb.SubscribeInit{Topic: "orders", SubscriberId: "audit", AutoAck: true})
+	autoMessage, err := auto.Recv()
+	s.Require().NoError(err)
+	s.Equal("disconnected", string(autoMessage.Payload))
+	s.Equal(uint64(1), autoMessage.Attempt)
+	s.Require().Eventually(func() bool {
+		_, closer, err := a.DB.Get(autoMessage.DeliveryTag[:len(autoMessage.DeliveryTag)-raft.AttemptTokenSize])
+		if closer != nil {
+			_ = closer.Close()
+		}
+		return err == storage.ErrNotFound
+	}, 2*time.Second, 5*time.Millisecond)
+	empty, err := dlq.ListDeadLetters(ctx, &pb.ListDeadLettersRequest{Topic: "orders"})
+	s.Require().NoError(err)
+	s.Empty(empty.Entries)
+}
+
+func (s *DeadLetterDeliverySuite) receiveDelivery(stream grpc.BidiStreamingClient[pb.ConsumerFrame, pb.QueueMessage], sendLimit int) *pb.QueueMessage {
+	frame, err := stream.Recv()
+	s.Require().NoError(err)
+	data := frame.GetChunkData()
+	if len(data) == 0 {
+		s.Require().GreaterOrEqual(sendLimit, 100<<10, "the smaller replica must send chunks")
+		return frame
+	}
+	for frame.GetMoreChunks() {
+		frame, err = stream.Recv()
+		s.Require().NoError(err)
+		s.Require().NotEmpty(frame.GetChunkData())
+		s.Require().LessOrEqual(proto.Size(frame), sendLimit)
+		data = append(data, frame.GetChunkData()...)
+	}
+	delivery := new(pb.QueueMessage)
+	s.Require().NoError(proto.Unmarshal(data, delivery))
+	s.Require().Greater(proto.Size(delivery), sendLimit)
+	return delivery
+}
+
+func receiveDeadLetter(ctx context.Context, client pb.FutureQDeadLetterClient, request *pb.DeadLetterRequest) (*pb.DeadLetter, error) {
+	stream, err := client.GetDeadLetter(ctx, request)
+	if err != nil {
+		return nil, err
+	}
+	var data []byte
+	for {
+		chunk, err := stream.Recv()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+		data = append(data, chunk.GetData()...)
+	}
+	entry := new(pb.DeadLetter)
+	return entry, proto.Unmarshal(data, entry)
+}
 
 func TestDurableSubscriptionRPCAndOfflineUniversalDelivery(t *testing.T) {
 	for _, engine := range []string{"pebble", "bolt"} {

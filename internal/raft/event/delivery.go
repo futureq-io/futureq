@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"maps"
 	"sort"
 	"strings"
 
@@ -23,7 +24,8 @@ type DeliveryState struct {
 	Epoch        uint64
 	Recipients   []string // sorted, unique frozen roster
 	Acknowledged []byte   // bit i corresponds to Recipients[i]
-	remaining    int      // derived on read; updated only by the first ACK for a recipient
+	attempts     map[uint32]*deliverypb.DeliveryAttempt
+	remaining    int // derived on read; updated only by the first ACK for a recipient
 }
 
 func (s *DeliveryState) Needs(recipient string) bool {
@@ -42,6 +44,12 @@ func (s *DeliveryState) acknowledge(recipient string) bool {
 	}
 	i := sort.SearchStrings(s.Recipients, recipient)
 	s.Acknowledged[i/8] |= 1 << uint(i%8)
+	if s.attempts != nil {
+		delete(s.attempts, uint32(i))
+		if len(s.attempts) == 0 {
+			s.attempts = nil
+		}
+	}
 	s.remaining--
 	return true
 }
@@ -49,6 +57,12 @@ func (s *DeliveryState) acknowledge(recipient string) bool {
 type DeliveryAck struct {
 	Key       []byte
 	Recipient string
+}
+
+// CompletedAttempt identifies a recipient's attempt removed from its receipt.
+type CompletedAttempt struct {
+	Key   [utils.EventKeySize]byte
+	Token [AttemptTokenSize]byte
 }
 
 type DeliveryPrepare struct {
@@ -153,6 +167,10 @@ type DeliveryBatch struct {
 	standaloneReceipts *StandaloneReceiptCache
 	receiptHits        int
 	receiptMisses      int
+	archiveRefs        map[string]uint32
+	archiveEntries     map[string]bool
+	retryOwners        map[uint64]retryOwnerLease
+	completedAttempts  []CompletedAttempt
 }
 
 func NewDeliveryBatch(db storage.DB, batch storage.Batch) *DeliveryBatch {
@@ -161,7 +179,21 @@ func NewDeliveryBatch(db storage.DB, batch storage.Batch) *DeliveryBatch {
 
 func (b *DeliveryBatch) ObserveStore(key []byte) { b.present[string(key)] = true }
 
+// CompletedAttempts returns token-scoped notifications to publish after commit.
+func (b *DeliveryBatch) CompletedAttempts() []CompletedAttempt { return b.completedAttempts }
+
 func (b *DeliveryBatch) Delete(key []byte) error {
+	state, err := b.load(key)
+	if err != nil {
+		return err
+	}
+	if state != nil {
+		for i, attempt := range state.attempts {
+			if err := b.deleteAttemptDeadline(key, state.Recipients[i], attempt); err != nil {
+				return err
+			}
+		}
+	}
 	if err := b.batch.Delete(key); err != nil {
 		return err
 	}
@@ -171,6 +203,33 @@ func (b *DeliveryBatch) Delete(key []byte) error {
 	b.present[string(key)] = false
 	b.states[string(key)] = nil
 	delete(b.dirty, string(key))
+	return nil
+}
+
+func (b *DeliveryBatch) deleteAttemptDeadline(key []byte, recipient string, attempt *deliverypb.DeliveryAttempt) error {
+	if len(attempt.GetToken()) == 0 {
+		return nil
+	}
+	if err := b.batch.Delete(retryExpiryKey(&deliverypb.DeliveryAttemptTarget{
+		Key: key, Recipient: recipient, Token: attempt.Token, DeadlineMs: attempt.DeadlineMs,
+	})); err != nil {
+		return err
+	}
+	b.completedAttempts = append(b.completedAttempts, CompletedAttempt{
+		Key: [utils.EventKeySize]byte(key), Token: [AttemptTokenSize]byte(attempt.Token),
+	})
+	return nil
+}
+
+func (b *DeliveryBatch) acknowledgeRecipient(key []byte, state *DeliveryState, recipient string) error {
+	if len(state.attempts) > 0 && state.Needs(recipient) {
+		i := uint32(sort.SearchStrings(state.Recipients, recipient))
+		attempt := state.attempts[i]
+		if err := b.deleteAttemptDeadline(key, recipient, attempt); err != nil {
+			return err
+		}
+	}
+	state.acknowledge(recipient)
 	return nil
 }
 
@@ -190,6 +249,7 @@ func (b *DeliveryBatch) load(key []byte) (*DeliveryState, error) {
 			state := *committed
 			// The roster is immutable. ACKs mutate the bitmap in the batch copy.
 			state.Acknowledged = bytes.Clone(state.Acknowledged)
+			state.attempts = maps.Clone(state.attempts) // attempt values are immutable
 			b.states[string(key)] = &state
 			return &state, nil
 		}
@@ -284,7 +344,9 @@ func (b *DeliveryBatch) Acknowledge(acks []DeliveryAck) ([][]byte, error) {
 		if state == nil || !state.Needs(recipient) {
 			continue
 		}
-		state.acknowledge(recipient)
+		if err := b.acknowledgeRecipient(ack.Key, state, recipient); err != nil {
+			return nil, err
+		}
 		if state.complete() {
 			if err := b.Delete(ack.Key); err != nil {
 				return nil, err
@@ -372,7 +434,9 @@ func (b *DeliveryBatch) prepare(prepare DeliveryPrepare) (*DeliveryState, bool, 
 		// vanished ephemeral universal interests are completed on epoch change.
 		for _, recipient := range state.Recipients {
 			if strings.HasPrefix(recipient, "u:") && !active[recipient] {
-				state.acknowledge(recipient)
+				if err := b.acknowledgeRecipient(prepare.Key, state, recipient); err != nil {
+					return nil, false, err
+				}
 			}
 		}
 		state.Epoch = prepare.Epoch

@@ -38,6 +38,7 @@ type deliveryRecord struct {
 	epoch      uint64
 	sending    bool // true only after the sender authorizes an actual stream send
 	ackPending bool // ACK received, but persistence has not completed
+	token      []byte
 }
 
 func (h *Hub) SetDeliveryTimeout(timeout time.Duration) {
