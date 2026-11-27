@@ -659,10 +659,11 @@ func (l *DeliveryLedger) commitRetryOutcome(ctx context.Context, outcome retryOu
 	}
 }
 
-// ApplyRetry uses the same mutation lock and receipt cache as standalone ACKs.
-// Attempts and outcomes are synced before the caller uses the result.
+// ApplyRetry uses the broker-scoped proposer when running with Raft.
+// Standalone operations are synced under the delivery ledger's mutation lock.
 func (l *DeliveryLedger) ApplyRetry(command *deliverypb.RetryCommand) (uint64, error) {
-	return l.applyRetry(context.TODO(), command)
+	result, err := l.applyRetryWithProposer(command, l.propose)
+	return result.Value, err
 }
 
 func (l *DeliveryLedger) applyRetry(ctx context.Context, command *deliverypb.RetryCommand) (uint64, error) {
@@ -671,6 +672,16 @@ func (l *DeliveryLedger) applyRetry(ctx context.Context, command *deliverypb.Ret
 }
 
 func (l *DeliveryLedger) applyRetryResult(ctx context.Context, command *deliverypb.RetryCommand) (statemachine.Result, error) {
+	propose := l.propose
+	if l.ProposeContext != nil {
+		propose = func(cmd []byte) (statemachine.Result, error) {
+			return l.ProposeContext(ctx, cmd)
+		}
+	}
+	return l.applyRetryWithProposer(command, propose)
+}
+
+func (l *DeliveryLedger) applyRetryWithProposer(command *deliverypb.RetryCommand, propose func([]byte) (statemachine.Result, error)) (statemachine.Result, error) {
 	var result statemachine.Result
 	if len(l.retry.owner) != 0 && command.Operation != deliverypb.RetryCommand_RENEW_OWNER &&
 		command.Operation != deliverypb.RetryCommand_DELETE_DEAD_LETTER {
@@ -686,12 +697,9 @@ func (l *DeliveryLedger) applyRetryResult(ctx context.Context, command *delivery
 	if err != nil {
 		return result, err
 	}
-	switch {
-	case ctx != nil && l.ProposeContext != nil:
-		result, err = l.ProposeContext(ctx, cmd)
-	case l.propose != nil:
-		result, err = l.propose(cmd)
-	default:
+	if propose != nil {
+		result, err = propose(cmd)
+	} else {
 		err = l.applyLocal(storage.Sync, func(batch *raft.DeliveryBatch) ([][]byte, error) {
 			var deleted [][]byte
 			var err error

@@ -59,6 +59,44 @@ func (s *RetryExpirySuite) beginRetryTransport(ledger *DeliveryLedger, start *de
 	s.Require().True(ledger.BeginRetryTransport(tag, func() bool { return true }))
 }
 
+func (s *RetryExpirySuite) TestApplyRetryUsesBrokerProposer() {
+	db, err := storage.NewPebble(config.Pebble{Mode: "memory"}, zap.NewNop())
+	s.Require().NoError(err)
+	defer db.Close() //nolint:errcheck
+	command := s.storeRetryFixture(db, 1, time.Now().Add(time.Minute))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var brokerCalls, callerCalls int
+	ledger := NewDeliveryLedger(db, nil, nil, func([]byte) (statemachine.Result, error) {
+		brokerCalls++
+		return statemachine.Result{Value: 1}, nil
+	})
+	ledger.ProposeContext = func(proposalCtx context.Context, raw []byte) (statemachine.Result, error) {
+		callerCalls++
+		if proposalCtx != ctx {
+			return statemachine.Result{}, errors.New("broker-owned call entered the caller-context proposer")
+		}
+		var retry deliverypb.RetryCommand
+		if err := proto.Unmarshal(raw[1:], &retry); err != nil {
+			return statemachine.Result{}, err
+		}
+		value, err := ledger.ApplyRetry(&retry)
+		return statemachine.Result{Value: value}, err
+	}
+
+	value, err := ledger.ApplyRetry(command)
+	s.NoError(err)
+	s.Equal(uint64(1), value)
+	s.Equal(1, brokerCalls)
+	s.Zero(callerCalls)
+
+	value, err = ledger.applyRetry(ctx, command)
+	s.NoError(err)
+	s.Equal(uint64(1), value)
+	s.Equal(2, brokerCalls)
+	s.Equal(1, callerCalls)
+}
+
 func (s *RetryExpirySuite) TestAuthorizationCapacityIsCheckedBeforeReservation() {
 	db, err := storage.NewPebble(config.Pebble{Mode: "memory"}, zap.NewNop())
 	s.Require().NoError(err)
@@ -225,7 +263,7 @@ func (s *RetryExpirySuite) TestExpiredFirstFrameStaysProtectedUntilRefundCommits
 			failRefund = false
 			return statemachine.Result{}, errors.New("transient refund failure")
 		}
-		return local.applyRetryResult(nil, &cmd)
+		return local.applyRetryResult(ctx, &cmd)
 	})
 	ledger.ConfigureRetryOutcomes(1)
 	start := s.storeRetryFixture(db, 1, time.Now().Add(time.Minute))
