@@ -205,25 +205,37 @@ func (l *DeliveryLedger) AuthorizeRetrySend(streamCtx context.Context, start *de
 	return true, nil
 }
 
-// BeginRetryTransport is called immediately before the first transport call.
-// An expired attempt stays protected until its refund commits or is queued.
-func (l *DeliveryLedger) BeginRetryTransport(tag []byte) bool {
+// BeginRetryTransport checks the delivery permit and deadlines immediately
+// before the first frame, using the same lock that arbitrates expiry.
+func (l *DeliveryLedger) BeginRetryTransport(tag []byte, canSend func() bool) bool {
 	id := retryIdentity(tag)
 	key := [utils.EventKeySize]byte(id[:utils.EventKeySize])
 	l.retry.mu.Lock()
 	transport, exists := l.retry.transports[key][id]
-	if !exists {
+	_, expiring := l.retry.expiring[id]
+	if !exists || expiring {
 		delete(l.retry.authorizing, id)
 		l.retry.mu.Unlock()
 		return false
 	}
+	permitted := canSend() && l.retryOwnerActive()
 	now := time.Now()
-	if transport.messageExpiresAtMs == 0 ||
-		(now.UnixMilli() < transport.messageExpiresAtMs && now.Before(transport.deadline)) {
+	beforeDeadline := now.Before(transport.deadline)
+	if permitted && beforeDeadline &&
+		(transport.messageExpiresAtMs == 0 || now.UnixMilli() < transport.messageExpiresAtMs) {
 		delete(l.retry.authorizing, id)
 		l.retry.mu.Unlock()
 		return true
 	}
+	// Leave a timed-out attempt eligible for expiry unless authorization
+	// still holds it for a TTL check at the first frame.
+	if _, held := l.retry.authorizing[id]; !held && !beforeDeadline {
+		l.retry.mu.Unlock()
+		return false
+	}
+	// Keep expiry out until the refund commits or is queued. Attempts
+	// without a TTL released their initial authorization protection.
+	l.retry.authorizing[id] = struct{}{}
 	l.retry.mu.Unlock()
 	l.refundUnsentRetry(&deliverypb.DeliveryAttemptTarget{
 		Key: tag[:utils.EventKeySize], Recipient: transport.recipient, Token: tag[utils.EventKeySize:],

@@ -264,9 +264,7 @@ func (h *ConsumerHandler) sender(
 			// Observe before entering transport, where consumer backpressure
 			// can block the send.
 			metrics.DeliverySendLatenessMs.WithLabelValues(msg.Topic).Observe(float64(time.Now().UnixNano())/1e6 - float64(msg.EnqueuedAtUnixMs+msg.DelayMs))
-			if err := h.sendDelivery(stream, frames, func() error {
-				return h.checkDeliveryChunk(consumerID, recipient, msg, frames.QueueMessage)
-			}); err != nil {
+			if err := h.sendDelivery(ctx, stream, consumerID, recipient, msg, frames); err != nil {
 				if frames.autoACK != nil {
 					frames.autoACK.Finish(false)
 				} else if msg.MaxRetries != nil {
@@ -352,10 +350,11 @@ func (h *ConsumerHandler) prepareDeliveryFrames(message *pb.QueueMessage) (*deli
 
 var errRetryTransportSkipped = errors.New("delivery attempt ended before the first frame")
 
-func (h *ConsumerHandler) sendDelivery(stream grpc.BidiStreamingServer[pb.ConsumerFrame, pb.QueueMessage], frames *deliveryFrames, checkChunk func() error) error {
+func (h *ConsumerHandler) sendDelivery(ctx context.Context, stream grpc.BidiStreamingServer[pb.ConsumerFrame, pb.QueueMessage], consumerID, recipient string, queued *pb.QueueMessage, frames *deliveryFrames) error {
 	first := true
+	canSend := func() bool { return h.hub.CanSend(consumerID, queued) && ctx.Err() == nil }
 	send := func(frame *pb.QueueMessage) error {
-		if first && frames.MaxRetries != nil && !h.RetryLedger.BeginRetryTransport(frames.DeliveryTag) {
+		if first && frames.MaxRetries != nil && !h.RetryLedger.BeginRetryTransport(frames.DeliveryTag, canSend) {
 			return errRetryTransportSkipped
 		}
 		first = false
@@ -370,7 +369,7 @@ func (h *ConsumerHandler) sendDelivery(stream grpc.BidiStreamingServer[pb.Consum
 	data := frames.encoded
 	for len(data) > 0 {
 		if check {
-			if err := checkChunk(); err != nil {
+			if err := h.checkDeliveryChunk(consumerID, recipient, queued, frames.QueueMessage); err != nil {
 				return err
 			}
 		}

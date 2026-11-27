@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"strings"
 	"sync"
@@ -243,9 +244,7 @@ func (s *LimitedConsumerSuite) TestTTLExpiresBetweenAuthorizationAndFirstFrame()
 				sendCalls++
 				return nil
 			}}
-			err = handler.sendDelivery(stream, frames, func() error {
-				return handler.checkDeliveryChunk("consumer", subscription.Recipient, message, frames.QueueMessage)
-			})
+			err = handler.sendDelivery(ctx, stream, "consumer", subscription.Recipient, message, frames)
 			s.ErrorIs(err, errRetryTransportSkipped)
 			s.Zero(sendCalls)
 			due, err := raft.DueDeliveryAttempts(a.DB, time.Now().Add(time.Minute).UnixMilli())
@@ -257,6 +256,64 @@ func (s *LimitedConsumerSuite) TestTTLExpiresBetweenAuthorizationAndFirstFrame()
 			page, err := (raft.DeadLetterQuery{Topic: "orders", Limit: 10}).Read(a.DB)
 			s.Require().NoError(err)
 			s.Empty(page.Page.Entries)
+		})
+	}
+}
+
+func (s *LimitedConsumerSuite) TestAssignmentChangesBetweenAuthorizationAndFirstFrame() {
+	for _, maxSendBytes := range []int{0, 256} {
+		s.Run(fmt.Sprintf("frame-limit-%d", maxSendBytes), func() {
+			a, hub, producer, _ := openPublishTest(s.T(), "pebble")
+			ctx := context.Background()
+			subscription, err := a.Subscriptions.Create(ctx, "orders", "workers", "")
+			s.Require().NoError(err)
+			payload := bytes.Repeat([]byte("message"), 100)
+			ack, err := producer.processBatch(ctx, &pb.PublishBatch{Messages: []*pb.PublishMessage{{
+				Topic: "orders", Payload: payload, MaxRetries: new(uint32(0)),
+			}}})
+			s.Require().NoError(err)
+			s.Require().True(ack.GetSuccess())
+			keys := publishedKeys(s.T(), a.DB)
+			s.Require().Len(keys, 1)
+			key := keys[0]
+
+			group := strings.TrimPrefix(subscription.Recipient, "g:")
+			queue := make(chan *pb.QueueMessage, 1)
+			hub.Register("consumer", "orders", group, queue)
+			defer hub.Unregister("consumer")
+			epoch := uint64(1)
+			hub.SetDeliveryFence(func() (uint64, bool) { return epoch, true }, time.Minute)
+			hub.GrantDeliveryPermit(epoch, time.Now())
+			s.Require().NotEmpty(hub.DispatchToTopic("orders", &pb.QueueMessage{
+				Topic: "orders", Payload: payload, MaxRetries: new(uint32(0)),
+			}, key))
+			message := <-queue
+			ledger := dispatcher.NewDeliveryLedger(a.DB, nil, nil, nil)
+			ledger.ConfigureRetryOutcomes(1)
+			defer ledger.RemoveRetryTransports([][]byte{key})
+			handler := NewConsumerHandler(zap.NewNop(), hub, nil)
+			handler.RetryLedger, handler.MaxSendBytes = ledger, maxSendBytes
+			frames, err := handler.beginLimitedSend(ctx, "consumer", &pb.SubscribeInit{Topic: "orders", GroupId: group}, message)
+			s.Require().NoError(err)
+			s.Require().NotNil(frames)
+			s.Require().Equal(maxSendBytes > 0, len(frames.encoded) > 0)
+
+			epoch++
+			s.Require().False(hub.CanSend("consumer", message))
+			sendCalls := 0
+			stream := &autoAckSendStream{send: func(*pb.QueueMessage) error {
+				sendCalls++
+				return nil
+			}}
+			err = handler.sendDelivery(ctx, stream, "consumer", subscription.Recipient, message, frames)
+			s.ErrorIs(err, errRetryTransportSkipped)
+			s.Zero(sendCalls)
+			due, err := raft.DueDeliveryAttempts(a.DB, time.Now().Add(time.Minute).UnixMilli())
+			s.Require().NoError(err)
+			s.Empty(due)
+			state, err := raft.ReadDeliveryState(a.DB, key)
+			s.Require().NoError(err)
+			s.True(state.Ready(subscription.Recipient), "the fenced send must refund the attempt")
 		})
 	}
 }

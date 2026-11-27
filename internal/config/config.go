@@ -368,6 +368,8 @@ func validAddress(address string, advertised bool) bool {
 }
 
 func (c *Config) validateAPI() error {
+	// A compact DLQ page with one entry and a continuation cursor needs 90 bytes.
+	const minSendBytes = 90
 	g := c.API.GRPC
 	if !validAddress(g.Listen, false) {
 		return fmt.Errorf("api.grpc.listen must be a host:port address")
@@ -382,6 +384,9 @@ func (c *Config) validateAPI() error {
 		bytes, err := size.Bytes()
 		if err != nil || bytes > int64(int(^uint(0)>>1)) {
 			return fmt.Errorf("api.grpc.%s must be a positive supported size: %v", name, err)
+		}
+		if name == "maxSendMessageSize" && bytes < minSendBytes {
+			return fmt.Errorf("api.grpc.maxSendMessageSize must be at least %dB for dead letter pagination", minSendBytes)
 		}
 	}
 	return nil

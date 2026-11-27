@@ -20,11 +20,12 @@ import (
 var ErrDeadLetterPageTooSmall = errors.New("gRPC send limit cannot fit one dead letter summary and its page token")
 
 const (
-	deadLetterEntries          = "metadata/dead-letter/entries/"
-	deadLetterPayload          = "metadata/dead-letter/payload/"
-	deadLetterRefs             = "metadata/dead-letter/refs/"
-	deadLetterPageBytes        = 32 << 10
-	compactDeadLetterTokenSize = utils.EventKeySize + 1 + 16
+	deadLetterEntries           = "metadata/dead-letter/entries/"
+	deadLetterPayload           = "metadata/dead-letter/payload/"
+	deadLetterRefs              = "metadata/dead-letter/refs/"
+	deadLetterPageBytes         = 32 << 10
+	compactDeadLetterTokenSize  = utils.EventKeySize + 16
+	prefixedDeadLetterTokenSize = compactDeadLetterTokenSize + 1
 )
 
 func ValidateDeadLetterID(topic string, id []byte) error {
@@ -33,7 +34,11 @@ func ValidateDeadLetterID(topic string, id []byte) error {
 }
 
 func parseDeadLetterID(topic string, id []byte) ([]byte, error) {
-	if len(id) == compactDeadLetterTokenSize && id[utils.EventKeySize] == 0 {
+	if len(id) == compactDeadLetterTokenSize && id[utils.EventKeySize] < 0x10 {
+		generation := uuid.UUID(id[utils.EventKeySize:])
+		generation[0], generation[6] = generation[6], 0x40|generation[0]
+		id = append(bytes.Clone(id[:utils.EventKeySize]), subscriptionRecipientPrefix+generation.String()...)
+	} else if len(id) == prefixedDeadLetterTokenSize && id[utils.EventKeySize] == 0 {
 		generation := uuid.UUID(id[utils.EventKeySize+1:])
 		id = append(bytes.Clone(id[:utils.EventKeySize]), subscriptionRecipientPrefix+generation.String()...)
 	}
@@ -65,9 +70,16 @@ func compactDeadLetterToken(id []byte) []byte {
 	if err != nil || parsed.String() != generation {
 		return id
 	}
-	token := make([]byte, 0, compactDeadLetterTokenSize)
+	token := make([]byte, 0, prefixedDeadLetterTokenSize)
 	token = append(token, id[:utils.EventKeySize]...)
-	token = append(token, 0)
+	if parsed.Version() == 4 {
+		// A v4 subscription UUID has a fixed high nibble in byte 6.
+		// Move the remaining nibble to byte 0, which distinguishes the
+		// compact suffix from a full recipient starting with "g:" or "u:".
+		parsed[0], parsed[6] = parsed[6]&0x0f, parsed[0]
+	} else {
+		token = append(token, 0)
+	}
 	return append(token, parsed[:]...)
 }
 

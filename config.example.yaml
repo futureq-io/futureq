@@ -12,6 +12,7 @@ api:
     advertise: ""
     maxConcurrentStreams: 10
     maxReceiveMessageSize: 100KiB
+    # Dead letter pagination requires at least 90B.
     maxSendMessageSize: 100KiB
     keepaliveTimeout: 5s
     maxConnectionIdle: 30s

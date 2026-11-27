@@ -12,8 +12,10 @@ import (
 	"github.com/futureq-io/futureq/internal/dispatcher"
 	raft "github.com/futureq-io/futureq/internal/raft/event"
 	"github.com/futureq-io/futureq/internal/storage"
+	"github.com/futureq-io/futureq/pkg/utils"
 	pb "github.com/futureq-io/protocol/proto/go"
 	deliverypb "github.com/futureq-io/protocol/proto/go/delivery"
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 	"go.uber.org/zap"
@@ -159,6 +161,8 @@ func (s *DeadLetterDeliverySuite) TestSummaryAndCursorFitSmallSendLimits() {
 		{"128-byte-frame", 128, 1},
 		{"128-byte-frame-default-size", 128, 0},
 		{"96-byte-frame", 96, 1},
+		{"91-byte-frame", 91, 1},
+		{"90-byte-frame", 90, 1},
 	} {
 		s.Run(tc.name, func() {
 			listener := bufconn.Listen(1 << 20)
@@ -183,14 +187,20 @@ func (s *DeadLetterDeliverySuite) TestSummaryAndCursorFitSmallSendLimits() {
 				s.Require().Len(page.Entries, 1)
 				s.LessOrEqual(proto.Size(page), tc.limit)
 				id := page.Entries[0].GetId()
-				if tc.limit == 96 && i == 0 {
+				if tc.limit <= 96 && i == 0 {
 					s.Less(len(id), len(entry.GetId()))
+					canonicalID, err := raft.ParseDeadLetterPageToken(topic, id)
+					s.Require().NoError(err)
+					s.Equal(entry.GetId(), canonicalID)
 					compactID = id
 				} else {
 					s.Equal(entry.GetId(), id)
 				}
 				if i == 0 {
 					s.True(page.Entries[0].GetIdentityOmitted())
+					if tc.limit <= 91 {
+						s.Equal(90, proto.Size(page))
+					}
 					token := page.GetNextPageToken()
 					canonicalID, err := raft.ParseDeadLetterPageToken(topic, token)
 					s.Require().NoError(err)
@@ -205,7 +215,16 @@ func (s *DeadLetterDeliverySuite) TestSummaryAndCursorFitSmallSendLimits() {
 				}
 				request.PageToken = page.GetNextPageToken()
 			}
-			if tc.limit == 96 {
+			if tc.limit == 90 {
+				firstID := original.Page.Entries[0].GetId()
+				generation := uuid.MustParse(strings.TrimPrefix(subscription.Recipient, "g:s:"))
+				legacyToken := append(append([]byte{}, firstID[:utils.EventKeySize]...), 0)
+				legacyToken = append(legacyToken, generation[:]...)
+				next, err := client.ListDeadLetters(ctx, &pb.ListDeadLettersRequest{Topic: topic, PageSize: 1, PageToken: legacyToken})
+				s.Require().NoError(err)
+				s.Require().Len(next.Entries, 1)
+				s.Equal(original.Page.Entries[1].GetId(), next.Entries[0].GetId())
+
 				record := &pb.DeadLetterRequest{Topic: topic, Id: compactID}
 				stream, err := client.GetDeadLetter(ctx, record)
 				s.Require().NoError(err)
@@ -224,7 +243,7 @@ func (s *DeadLetterDeliverySuite) TestSummaryAndCursorFitSmallSendLimits() {
 				s.Equal("w", entry.GetSummary().GetGroupId())
 				_, err = client.DeleteDeadLetter(ctx, record)
 				s.Require().NoError(err)
-				next, err := client.ListDeadLetters(ctx, &pb.ListDeadLettersRequest{Topic: topic, PageSize: 1})
+				next, err = client.ListDeadLetters(ctx, &pb.ListDeadLettersRequest{Topic: topic, PageSize: 1})
 				s.Require().NoError(err)
 				s.Require().Len(next.Entries, 1)
 				s.Equal(original.Page.Entries[1].GetId(), next.Entries[0].GetId())

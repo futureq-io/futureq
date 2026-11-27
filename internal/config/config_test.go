@@ -204,6 +204,7 @@ func (s *ConfigSuite) TestRejectsUnknownAndInvalidValues() {
 		{"unknown nested key", "api:\n  grpc:\n    maxConns: 10\n", "maxconns"},
 		{"version", "configVersion: 2\n", "configVersion"},
 		{"size", "api:\n  grpc:\n    maxSendMessageSize: 0KiB\n", "maxSendMessageSize"},
+		{"send limit below DLQ minimum", "api:\n  grpc:\n    maxSendMessageSize: 89B\n", "maxSendMessageSize must be at least 90B"},
 		{"missing advertise", "cluster:\n  enabled: true\n", "api.grpc.advertise"},
 		{"unspecified advertise", "cluster:\n  enabled: true\napi:\n  grpc:\n    advertise: '0.0.0.0:8443'\n", "api.grpc.advertise"},
 		{"bootstrap and join", "cluster:\n  enabled: true\n  joinSeeds: ['node2.example:8443']\n  raft:\n    advertise: 'node1.example:50005'\n    initialMembers: {1: 'node1.example:50005'}\napi:\n  grpc:\n    advertise: 'node1.example:8443'\n", "cannot both be set"},
@@ -218,6 +219,12 @@ func (s *ConfigSuite) TestRejectsUnknownAndInvalidValues() {
 			s.Require().ErrorContains(err, tt.want)
 		})
 	}
+}
+
+func (s *ConfigSuite) TestMinimumGRPCSendLimit() {
+	cfg, err := Load(s.writeConfig("api:\n  grpc:\n    maxSendMessageSize: 90B\n"))
+	s.Require().NoError(err)
+	s.Equal(Size("90B"), cfg.API.GRPC.MaxSendMessageSize)
 }
 
 func (s *ConfigSuite) TestMemoryPebbleAndBolt() {
