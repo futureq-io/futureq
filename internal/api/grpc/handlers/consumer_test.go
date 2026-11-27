@@ -185,6 +185,82 @@ func (s *LimitedConsumerSuite) TestAuthorizationResumingAfterTTLDoesNotReturnDel
 	}
 }
 
+func (s *LimitedConsumerSuite) TestTTLExpiresBetweenAuthorizationAndFirstFrame() {
+	for _, tc := range []struct {
+		name         string
+		maxSendBytes int
+		autoAck      bool
+	}{
+		{name: "unchunked"},
+		{name: "chunked", maxSendBytes: 256, autoAck: true},
+	} {
+		s.Run(tc.name, func() {
+			a, hub, producer, _ := openPublishTest(s.T(), "pebble")
+			ctx := context.Background()
+			subscription, err := a.Subscriptions.Create(ctx, "orders", "workers", "")
+			s.Require().NoError(err)
+			ack, err := producer.processBatch(ctx, &pb.PublishBatch{Messages: []*pb.PublishMessage{{
+				Topic: "orders", Payload: bytes.Repeat([]byte("message"), 100), TtlMs: 500, MaxRetries: new(uint32(0)),
+			}}})
+			s.Require().NoError(err)
+			s.Require().True(ack.GetSuccess())
+			keys := publishedKeys(s.T(), a.DB)
+			s.Require().Len(keys, 1)
+			key := keys[0]
+			data, closer, err := a.DB.Get(key)
+			s.Require().NoError(err)
+			var stored storagepb.StoredMessage
+			decodeErr := proto.Unmarshal(data, &stored)
+			s.Require().NoError(closer.Close())
+			s.Require().NoError(decodeErr)
+			expires := time.UnixMilli(stored.EnqueuedAtUnixMs + stored.TtlMs)
+
+			group := strings.TrimPrefix(subscription.Recipient, "g:")
+			queue := make(chan *pb.QueueMessage, 1)
+			hub.Register("consumer", "orders", group, queue)
+			defer hub.Unregister("consumer")
+			s.Require().NotEmpty(hub.DispatchToTopic("orders", &pb.QueueMessage{
+				Topic: "orders", Payload: stored.Payload, EnqueuedAtUnixMs: stored.EnqueuedAtUnixMs, MaxRetries: stored.MaxRetries,
+			}, key))
+			logger := zap.NewNop()
+			ledger := dispatcher.NewDeliveryLedger(a.DB, nil, nil, nil)
+			ledger.ConfigureRetryOutcomes(1)
+			defer ledger.RemoveRetryTransports([][]byte{key})
+			handler := NewConsumerHandler(logger, hub, nil)
+			handler.RetryLedger = ledger
+			handler.MaxSendBytes = tc.maxSendBytes
+			message := <-queue
+			init := &pb.SubscribeInit{Topic: "orders", GroupId: group, AutoAck: tc.autoAck}
+			frames, err := handler.beginLimitedSend(ctx, "consumer", init, message)
+			s.Require().NoError(err)
+			s.Require().NotNil(frames)
+			s.Require().Equal(tc.maxSendBytes > 0, len(frames.encoded) > 0)
+
+			// Stall after authorization, at the same boundary as send metrics.
+			time.Sleep(time.Until(expires))
+			sendCalls := 0
+			stream := &autoAckSendStream{send: func(*pb.QueueMessage) error {
+				sendCalls++
+				return nil
+			}}
+			err = handler.sendDelivery(stream, frames, func() error {
+				return handler.checkDeliveryChunk("consumer", subscription.Recipient, message, frames.QueueMessage)
+			})
+			s.ErrorIs(err, errRetryTransportSkipped)
+			s.Zero(sendCalls)
+			due, err := raft.DueDeliveryAttempts(a.DB, time.Now().Add(time.Minute).UnixMilli())
+			s.Require().NoError(err)
+			s.Empty(due, "the first frame was skipped and its attempt refunded")
+			state, err := raft.ReadDeliveryState(a.DB, key)
+			s.Require().NoError(err)
+			s.True(state.Ready(subscription.Recipient))
+			page, err := (raft.DeadLetterQuery{Topic: "orders", Limit: 10}).Read(a.DB)
+			s.Require().NoError(err)
+			s.Empty(page.Page.Entries)
+		})
+	}
+}
+
 func (s *LimitedConsumerSuite) exerciseCanceledSend(blockAt deliverypb.RetryCommand_Operation, stall bool) {
 	a, hub, producer, _ := openPublishTest(s.T(), "pebble")
 	a.Config().Publish.ProposalTimeout = 25 * time.Millisecond

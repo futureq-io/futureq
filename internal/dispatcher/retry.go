@@ -95,8 +95,8 @@ func (l *DeliveryLedger) releaseManualRetryOutcomeLocked(id retryIdentity) {
 	}
 }
 
-// AuthorizeRetrySend holds capacity before reserving the attempt and protects
-// it from expiry until preparation and the final transport check have passed.
+// AuthorizeRetrySend holds capacity before reserving the attempt. For a
+// message with a TTL, protection continues until BeginRetryTransport.
 func (l *DeliveryLedger) AuthorizeRetrySend(streamCtx context.Context, start *deliverypb.RetryCommand, ackWindow time.Duration, prepare func(uint64) (bool, error), checkTransport func() (time.Time, error)) (authorized bool, err error) {
 	target := start.Attempts[0]
 	id := identifyRetry(target)
@@ -126,34 +126,17 @@ func (l *DeliveryLedger) AuthorizeRetrySend(streamCtx context.Context, start *de
 	recovery := l.retry.recovery
 	l.retry.mu.Unlock()
 	needsRefund := true
+	holdForFirstFrame := false
 	defer func() {
-		var refund *deliverypb.RetryCommand
 		if needsRefund && !authorized {
-			cancel := &deliverypb.RetryCommand{
-				Operation: deliverypb.RetryCommand_CANCEL_RESERVATION,
-				NowMs:     time.Now().UnixMilli(),
-				Attempts: []*deliverypb.DeliveryAttemptTarget{{
-					Key: target.Key, Recipient: target.Recipient, Token: target.Token,
-				}},
-			}
-			// Hold the protection until this commits or is transferred to
-			// the refund worker. The broker-scoped proposal survives stream
-			// cancellation, and refunds bypass the consumer outcome queue.
-			if _, err := l.ApplyRetry(cancel); err != nil {
-				refund = cancel
-			}
+			l.refundUnsentRetry(target)
+			return
 		}
-
 		l.retry.mu.Lock()
-		delete(l.retry.authorizing, id)
-		_, stillExists := l.retry.transports[key][id]
-		// Receipt cleanup may have completed while the refund was in flight.
-		if refund != nil && stillExists {
-			if l.retry.refunds == nil {
-				l.retry.refunds = make(map[retryIdentity]*retryRefund)
-			}
-			l.retry.refunds[id] = &retryRefund{command: refund}
-		} else if !authorized {
+		if !holdForFirstFrame {
+			delete(l.retry.authorizing, id)
+		}
+		if !authorized {
 			l.removeRetryTransportLocked(id)
 		}
 		l.retry.mu.Unlock()
@@ -212,6 +195,7 @@ func (l *DeliveryLedger) AuthorizeRetrySend(streamCtx context.Context, start *de
 	if expiresAtMs != 0 && time.Now().UnixMilli() >= expiresAtMs {
 		return false, nil
 	}
+	holdForFirstFrame = expiresAtMs != 0
 	// The durable deadline is set before SENT. The local owner gives the
 	// consumer its full monotonic ACK window starting at transport.
 	transports[id] = retryTransport{
@@ -221,9 +205,64 @@ func (l *DeliveryLedger) AuthorizeRetrySend(streamCtx context.Context, start *de
 	return true, nil
 }
 
+// BeginRetryTransport is called immediately before the first transport call.
+// An expired attempt stays protected until its refund commits or is queued.
+func (l *DeliveryLedger) BeginRetryTransport(tag []byte) bool {
+	id := retryIdentity(tag)
+	key := [utils.EventKeySize]byte(id[:utils.EventKeySize])
+	l.retry.mu.Lock()
+	transport, exists := l.retry.transports[key][id]
+	if !exists {
+		delete(l.retry.authorizing, id)
+		l.retry.mu.Unlock()
+		return false
+	}
+	now := time.Now()
+	if transport.messageExpiresAtMs == 0 ||
+		(now.UnixMilli() < transport.messageExpiresAtMs && now.Before(transport.deadline)) {
+		delete(l.retry.authorizing, id)
+		l.retry.mu.Unlock()
+		return true
+	}
+	l.retry.mu.Unlock()
+	l.refundUnsentRetry(&deliverypb.DeliveryAttemptTarget{
+		Key: tag[:utils.EventKeySize], Recipient: transport.recipient, Token: tag[utils.EventKeySize:],
+	})
+	return false
+}
+
+func (l *DeliveryLedger) refundUnsentRetry(target *deliverypb.DeliveryAttemptTarget) {
+	id := identifyRetry(target)
+	key := [utils.EventKeySize]byte(id[:utils.EventKeySize])
+	cancel := &deliverypb.RetryCommand{
+		Operation: deliverypb.RetryCommand_CANCEL_RESERVATION,
+		NowMs:     time.Now().UnixMilli(),
+		Attempts: []*deliverypb.DeliveryAttemptTarget{{
+			Key: target.Key, Recipient: target.Recipient, Token: target.Token,
+		}},
+	}
+	// The broker-scoped proposal survives stream cancellation. Keep expiry
+	// blocked until the proposal commits or the refund worker takes over.
+	_, err := l.ApplyRetry(cancel)
+	l.retry.mu.Lock()
+	defer l.retry.mu.Unlock()
+	delete(l.retry.authorizing, id)
+	if _, exists := l.retry.transports[key][id]; exists && err != nil {
+		if l.retry.refunds == nil {
+			l.retry.refunds = make(map[retryIdentity]*retryRefund)
+		}
+		l.retry.refunds[id] = &retryRefund{command: cancel}
+		return
+	}
+	l.removeRetryTransportLocked(id)
+}
+
 func (l *DeliveryLedger) onRetryTransportDeadline(id retryIdentity) {
 	l.retry.mu.Lock()
 	defer l.retry.mu.Unlock()
+	if _, authorizing := l.retry.authorizing[id]; authorizing {
+		return
+	}
 	if l.retry.draining {
 		l.releaseManualRetryOutcomeLocked(id)
 	}
@@ -529,6 +568,9 @@ func (l *DeliveryLedger) StopRetryOutcomeAdmission() {
 		}
 		now := time.Now()
 		for id := range l.retry.manualSlots {
+			if _, authorizing := l.retry.authorizing[id]; authorizing {
+				continue
+			}
 			key := [utils.EventKeySize]byte(id[:utils.EventKeySize])
 			deadline := l.retry.transports[key][id].deadline
 			// These timers fired before shutdown and left the slot for the

@@ -137,7 +137,8 @@ deadline includes two `publish.proposalTimeout` windows and one
 `delivery.inFlightTimeout` window. Disconnecting cancels the broker's wait
 for the authorization proposals. Refund proposals can still commit after
 the stream closes. Raft checks the message TTL when authorizing the send.
-The sender checks it again after authorization and before each later chunk.
+The sender checks it again after authorization and before each frame. If the
+TTL expires before the first frame, the broker refunds the attempt.
 The full ACK window starts when the
 sender is ready to enter transport, after authorization commits and the
 sender checks its permit and reservation deadline. If either check fails, it

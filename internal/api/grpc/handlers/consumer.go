@@ -261,8 +261,8 @@ func (h *ConsumerHandler) sender(
 				h.hub.RejectQueuedAttempt(consumerID, msg)
 				continue // expired, ACKed, or fenced buffered delivery
 			}
-			// Observe before Send: consumer backpressure can block this call.
-			// Count attempted sends here, including attempts that fail in Send.
+			// Observe before entering transport, where consumer backpressure
+			// can block the send.
 			metrics.DeliverySendLatenessMs.WithLabelValues(msg.Topic).Observe(float64(time.Now().UnixNano())/1e6 - float64(msg.EnqueuedAtUnixMs+msg.DelayMs))
 			if err := h.sendDelivery(stream, frames, func() error {
 				return h.checkDeliveryChunk(consumerID, recipient, msg, frames.QueueMessage)
@@ -271,6 +271,10 @@ func (h *ConsumerHandler) sender(
 					frames.autoACK.Finish(false)
 				} else if msg.MaxRetries != nil {
 					h.RetryLedger.AbandonManualRetryOutcome(frames.DeliveryTag)
+				}
+				if errors.Is(err, errRetryTransportSkipped) {
+					h.hub.ReleaseRetrySend(consumerID, msg.DeliveryTag, frames.DeliveryTag[utils.EventKeySize:])
+					continue
 				}
 				errCh <- err
 				return
@@ -346,9 +350,19 @@ func (h *ConsumerHandler) prepareDeliveryFrames(message *pb.QueueMessage) (*deli
 	return &deliveryFrames{QueueMessage: message, encoded: data, chunkSize: chunkSize}, nil
 }
 
+var errRetryTransportSkipped = errors.New("delivery attempt ended before the first frame")
+
 func (h *ConsumerHandler) sendDelivery(stream grpc.BidiStreamingServer[pb.ConsumerFrame, pb.QueueMessage], frames *deliveryFrames, checkChunk func() error) error {
+	first := true
+	send := func(frame *pb.QueueMessage) error {
+		if first && frames.MaxRetries != nil && !h.RetryLedger.BeginRetryTransport(frames.DeliveryTag) {
+			return errRetryTransportSkipped
+		}
+		first = false
+		return stream.Send(frame)
+	}
 	if frames.encoded == nil {
-		return stream.Send(frames.QueueMessage)
+		return send(frames.QueueMessage)
 	}
 	// The first check for a limited delivery ran under refund protection.
 	// Every subsequent frame must still verify that the attempt is active.
@@ -362,7 +376,7 @@ func (h *ConsumerHandler) sendDelivery(stream grpc.BidiStreamingServer[pb.Consum
 		}
 		check = true
 		size := min(frames.chunkSize, len(data))
-		if err := stream.Send(&pb.QueueMessage{ChunkData: data[:size], MoreChunks: size < len(data)}); err != nil {
+		if err := send(&pb.QueueMessage{ChunkData: data[:size], MoreChunks: size < len(data)}); err != nil {
 			return err
 		}
 		data = data[size:]
