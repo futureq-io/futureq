@@ -28,27 +28,29 @@ const (
 )
 
 func ValidateDeadLetterID(topic string, id []byte) error {
+	_, err := parseDeadLetterID(topic, id)
+	return err
+}
+
+func parseDeadLetterID(topic string, id []byte) ([]byte, error) {
+	if len(id) == compactDeadLetterTokenSize && id[utils.EventKeySize] == 0 {
+		generation := uuid.UUID(id[utils.EventKeySize+1:])
+		id = append(bytes.Clone(id[:utils.EventKeySize]), subscriptionRecipientPrefix+generation.String()...)
+	}
 	if err := ValidateTopicName(topic); err != nil {
-		return err
+		return nil, err
 	}
 	if len(id) <= utils.EventKeySize || !validRetryRecipient(string(id[utils.EventKeySize:])) ||
 		binary.BigEndian.Uint64(id) != utils.TopicHash(topic) {
-		return fmt.Errorf("invalid dead letter ID for topic")
+		return nil, fmt.Errorf("invalid dead letter ID for topic")
 	}
-	return nil
+	return id, nil
 }
 
 // ParseDeadLetterPageToken resolves a full ID or a compact cursor to the same
 // storage position. Compact tokens still carry the topic hash in the event key.
 func ParseDeadLetterPageToken(topic string, token []byte) ([]byte, error) {
-	if len(token) == compactDeadLetterTokenSize && token[utils.EventKeySize] == 0 {
-		generation := uuid.UUID(token[utils.EventKeySize+1:])
-		token = append(bytes.Clone(token[:utils.EventKeySize]), subscriptionRecipientPrefix+generation.String()...)
-	}
-	if err := ValidateDeadLetterID(topic, token); err != nil {
-		return nil, err
-	}
-	return token, nil
+	return parseDeadLetterID(topic, token)
 }
 
 func compactDeadLetterToken(id []byte) []byte {
@@ -151,6 +153,10 @@ func (b *DeliveryBatch) writeDeadLetterRefCount(key []byte, count uint32) error 
 }
 
 func (b *DeliveryBatch) deleteDeadLetter(topic string, id []byte) error {
+	id, err := parseDeadLetterID(topic, id)
+	if err != nil {
+		return err
+	}
 	entryKey := append(deadLetterEntryPrefix(topic), id...)
 	present, known := b.archiveEntries[string(entryKey)]
 	if !known {
@@ -220,7 +226,8 @@ func (q DeadLetterQuery) Read(db storage.DB) (DeadLetterResult, error) {
 }
 
 func (q DeadLetterQuery) get(db storage.DB) (*pb.DeadLetter, error) {
-	if err := ValidateDeadLetterID(q.Topic, q.ID); err != nil {
+	id, err := parseDeadLetterID(q.Topic, q.ID)
+	if err != nil {
 		return nil, err
 	}
 	// Both reads use one snapshot so concurrent deletion cannot expose a
@@ -230,7 +237,7 @@ func (q DeadLetterQuery) get(db storage.DB) (*pb.DeadLetter, error) {
 		return nil, err
 	}
 	defer iter.Close() //nolint:errcheck
-	entryKey := append(deadLetterEntryPrefix(q.Topic), q.ID...)
+	entryKey := append(deadLetterEntryPrefix(q.Topic), id...)
 	if !iter.SeekGE(entryKey) || !bytes.Equal(iter.Key(), entryKey) {
 		return nil, iter.Error()
 	}
@@ -238,7 +245,8 @@ func (q DeadLetterQuery) get(db storage.DB) (*pb.DeadLetter, error) {
 	if err := deliveryUnmarshal.Unmarshal(iter.Value(), summary); err != nil {
 		return nil, err
 	}
-	payloadKey := append([]byte(deadLetterPayload), q.ID[:utils.EventKeySize]...)
+	summary.Id = q.ID
+	payloadKey := append([]byte(deadLetterPayload), id[:utils.EventKeySize]...)
 	if !iter.SeekGE(payloadKey) || !bytes.Equal(iter.Key(), payloadKey) {
 		return nil, errors.Join(fmt.Errorf("dead letter payload missing"), iter.Error())
 	}
@@ -317,6 +325,12 @@ func (q DeadLetterQuery) list(db storage.DB) (*pb.ListDeadLettersResponse, error
 		}
 		if entrySize+tokenSize > budget {
 			summary = &pb.DeadLetterSummary{Id: summary.Id, IdentityOmitted: true}
+			entrySize = protowire.SizeTag(1) + protowire.SizeBytes(proto.Size(summary))
+		}
+		if entrySize+tokenSize > budget {
+			// When the compact cursor alone is insufficient, return the
+			// entry ID in the same reversible format.
+			summary.Id = compactDeadLetterToken(summary.Id)
 			entrySize = protowire.SizeTag(1) + protowire.SizeBytes(proto.Size(summary))
 		}
 		if size+entrySize+tokenSize > budget {

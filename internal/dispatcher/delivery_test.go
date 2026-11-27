@@ -1168,6 +1168,84 @@ func (s *RetryExpirySuite) TestSweepDrainsMultipleBatchesAcrossTopics() {
 	}
 }
 
+func (s *RetryExpirySuite) TestExpiryCannotClaimAttemptBetweenACKValidationAndAdmission() {
+	logger := zap.NewNop()
+	db, err := storage.NewPebble(config.Pebble{Mode: "memory"}, logger)
+	s.Require().NoError(err)
+	defer db.Close() //nolint:errcheck
+	ledger := NewDeliveryLedger(db, nil, nil, nil)
+	ledger.ConfigureRetryOutcomes(1)
+	deadline := time.Now().Add(time.Second)
+	start := s.storeRetryFixture(db, 1, deadline)
+	value, err := ledger.ApplyRetry(start)
+	s.Require().NoError(err)
+	s.Require().Equal(uint64(1), value)
+	value, err = ledger.ApplyRetry(&deliverypb.RetryCommand{
+		Operation: deliverypb.RetryCommand_SENT, NowMs: start.NowMs, Attempts: start.Attempts,
+	})
+	s.Require().NoError(err)
+	s.Require().Equal(uint64(1), value)
+	target := start.Attempts[0]
+	command := &deliverypb.RetryCommand{
+		Operation: deliverypb.RetryCommand_ACK, NowMs: deadline.UnixMilli() - 1,
+		Attempts: []*deliverypb.DeliveryAttemptTarget{{Key: target.Key, Recipient: target.Recipient, Token: target.Token}},
+	}
+	validated := make(chan struct{})
+	resume := make(chan struct{})
+	admitted := make(chan bool, 1)
+	var tasks sync.WaitGroup
+	tasks.Go(func() {
+		valid, accepted := ledger.TryManualRetryOutcome(command, func() bool {
+			close(validated)
+			<-resume
+			return true
+		}, func() {})
+		admitted <- valid && accepted
+	})
+	defer tasks.Wait()
+	resumed := false
+	defer func() {
+		if !resumed {
+			close(resume)
+		}
+	}()
+	select {
+	case <-validated:
+	case <-time.After(time.Second):
+		s.FailNow("ACK validation did not start")
+	}
+	expiryStarted := make(chan struct{})
+	expired := make(chan error, 1)
+	tasks.Go(func() {
+		close(expiryStarted)
+		expired <- ledger.expireDueRetryAttempts(context.Background(), deadline.UnixMilli(), nil)
+	})
+	<-expiryStarted
+	select {
+	case err := <-expired:
+		s.Require().NoError(err)
+		s.FailNow("expiry ran before the validated ACK could queue")
+	case <-time.After(25 * time.Millisecond):
+	}
+	close(resume)
+	resumed = true
+	s.True(<-admitted)
+	s.Require().NoError(<-expired)
+	// A queued ACK must also retain protection until its worker commits.
+	s.Require().NoError(ledger.expireDueRetryAttempts(context.Background(), deadline.UnixMilli(), nil))
+	ledger.StopRetryOutcomeAdmission()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	ledger.RunRetryOutcomes(ctx, 1, logger)
+	s.Require().NoError(ctx.Err())
+	page, err := (raft.DeadLetterQuery{Topic: "orders", Limit: 10}).Read(db)
+	s.Require().NoError(err)
+	s.Empty(page.Page.Entries)
+	state, err := raft.ReadDeliveryState(db, target.Key)
+	s.Require().NoError(err)
+	s.Nil(state, "the ACK must complete the delivery")
+}
+
 func (s *RetryExpirySuite) TestReceivedACKSurvivesExpiryWhileOutcomeWorkersAreBlocked() {
 	logger := zap.NewNop()
 	db, err := storage.NewPebble(config.Pebble{Mode: "memory"}, logger)

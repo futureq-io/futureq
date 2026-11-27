@@ -549,19 +549,22 @@ func (h *ConsumerHandler) beginLimitedSend(ctx context.Context, consumerID strin
 
 func (h *ConsumerHandler) finishLimitedSend(consumerID string, init *pb.SubscribeInit, tag []byte, success bool) (bool, error) {
 	key, token := tag[:utils.EventKeySize], tag[utils.EventKeySize:]
-	if !h.hub.MarkRetryOutcome(consumerID, key, token) {
-		return false, nil
-	}
 	op := deliverypb.RetryCommand_ACK
 	if !success {
 		op = deliverypb.RetryCommand_NACK
 	}
-	if !h.RetryLedger.TryRetryOutcome(limitedOutcome(consumerID, init, tag, op), func() {
+	valid, accepted := h.RetryLedger.TryManualRetryOutcome(limitedOutcome(consumerID, init, tag, op), func() bool {
+		return h.hub.MarkRetryOutcome(consumerID, key, token)
+	}, func() {
 		h.hub.ReleaseRetrySend(consumerID, key, token)
 		if !success && h.hub.OnNack != nil {
 			h.hub.OnNack(key)
 		}
-	}) {
+	})
+	if !valid {
+		return false, nil
+	}
+	if !accepted {
 		return false, status.Error(codes.Unavailable, "delivery outcome admission unavailable; retry subscription")
 	}
 	return true, nil

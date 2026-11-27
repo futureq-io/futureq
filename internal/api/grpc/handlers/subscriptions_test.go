@@ -158,31 +158,77 @@ func (s *DeadLetterDeliverySuite) TestSummaryAndCursorFitSmallSendLimits() {
 		{"256-byte-frame", 256, 1},
 		{"128-byte-frame", 128, 1},
 		{"128-byte-frame-default-size", 128, 0},
+		{"96-byte-frame", 96, 1},
 	} {
 		s.Run(tc.name, func() {
-			h := &DeadLetterHandler{Ledger: ledger, MaxSendBytes: tc.limit}
+			listener := bufconn.Listen(1 << 20)
+			defer listener.Close() //nolint:errcheck
+			server := grpc.NewServer(grpc.MaxSendMsgSize(tc.limit))
+			defer server.Stop()
+			pb.RegisterFutureQDeadLetterServer(server, &DeadLetterHandler{Ledger: ledger, MaxSendBytes: tc.limit})
+			go func() { _ = server.Serve(listener) }()
+			conn, err := grpc.NewClient("passthrough:///dead-letter-pages", grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) {
+				return listener.DialContext(ctx)
+			}), grpc.WithTransportCredentials(insecure.NewCredentials()))
+			s.Require().NoError(err)
+			defer conn.Close() //nolint:errcheck
+			client := pb.NewFutureQDeadLetterClient(conn)
+			ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			defer cancel()
 			request := &pb.ListDeadLettersRequest{Topic: topic, PageSize: tc.pageSize}
+			var compactID []byte
 			for i, entry := range original.Page.Entries {
-				page, err := h.ListDeadLetters(ctx, request)
+				page, err := client.ListDeadLetters(ctx, request)
 				s.Require().NoError(err)
 				s.Require().Len(page.Entries, 1)
 				s.LessOrEqual(proto.Size(page), tc.limit)
-				s.Equal(entry.GetId(), page.Entries[0].GetId())
+				id := page.Entries[0].GetId()
+				if tc.limit == 96 && i == 0 {
+					s.Less(len(id), len(entry.GetId()))
+					compactID = id
+				} else {
+					s.Equal(entry.GetId(), id)
+				}
 				if i == 0 {
 					s.True(page.Entries[0].GetIdentityOmitted())
 					token := page.GetNextPageToken()
-					id, err := raft.ParseDeadLetterPageToken(topic, token)
+					canonicalID, err := raft.ParseDeadLetterPageToken(topic, token)
 					s.Require().NoError(err)
-					s.Equal(entry.GetId(), id)
-					if tc.limit == 128 {
-						s.Less(len(token), len(id))
-						_, err := h.ListDeadLetters(ctx, &pb.ListDeadLettersRequest{Topic: "orders", PageToken: token})
+					s.Equal(entry.GetId(), canonicalID)
+					if tc.limit <= 128 {
+						s.Less(len(token), len(canonicalID))
+						_, err := client.ListDeadLetters(ctx, &pb.ListDeadLettersRequest{Topic: "orders", PageToken: token})
 						s.Equal(codes.InvalidArgument, status.Code(err))
 					}
 				} else {
 					s.Empty(page.GetNextPageToken())
 				}
 				request.PageToken = page.GetNextPageToken()
+			}
+			if tc.limit == 96 {
+				record := &pb.DeadLetterRequest{Topic: topic, Id: compactID}
+				stream, err := client.GetDeadLetter(ctx, record)
+				s.Require().NoError(err)
+				var data []byte
+				for {
+					chunk, err := stream.Recv()
+					if err == io.EOF {
+						break
+					}
+					s.Require().NoError(err)
+					data = append(data, chunk.GetData()...)
+				}
+				entry := new(pb.DeadLetter)
+				s.Require().NoError(proto.Unmarshal(data, entry))
+				s.Equal(compactID, entry.GetSummary().GetId())
+				s.Equal("w", entry.GetSummary().GetGroupId())
+				_, err = client.DeleteDeadLetter(ctx, record)
+				s.Require().NoError(err)
+				next, err := client.ListDeadLetters(ctx, &pb.ListDeadLettersRequest{Topic: topic, PageSize: 1})
+				s.Require().NoError(err)
+				s.Require().Len(next.Entries, 1)
+				s.Equal(original.Page.Entries[1].GetId(), next.Entries[0].GetId())
+				s.Empty(next.NextPageToken)
 			}
 		})
 	}

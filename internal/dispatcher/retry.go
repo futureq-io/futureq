@@ -529,30 +529,40 @@ func (l *DeliveryLedger) ConfigureRetryOutcomes(capacity int) {
 }
 
 func (l *DeliveryLedger) TryRetryOutcome(command *deliverypb.RetryCommand, onCommitted func()) bool {
+	_, accepted := l.TryManualRetryOutcome(command, nil, onCommitted)
+	return accepted
+}
+
+// TryManualRetryOutcome validates the stream's attempt and queues its outcome
+// under the same lock used to claim attempts for expiry.
+func (l *DeliveryLedger) TryManualRetryOutcome(command *deliverypb.RetryCommand, validate func() bool, onCommitted func()) (valid, accepted bool) {
 	id := identifyRetry(command.Attempts[0])
 	l.retry.mu.Lock()
 	defer l.retry.mu.Unlock()
+	if validate != nil && !validate() {
+		return false, false
+	}
 	_, reserved := l.retry.manualSlots[id]
 	if _, expiring := l.retry.expiring[id]; (l.retry.draining && !reserved) || expiring || !l.retryOwnerActive() {
-		return false
+		return true, false
 	}
 	if _, pending := l.retry.outcomes[id]; pending {
-		return true
+		return true, true
 	}
 	if l.retry.autoACKs[id] != nil {
-		return false
+		return true, false
 	}
 	if !reserved && len(l.retry.manualSlots) != 0 &&
 		len(l.retryOutcomes)+len(l.retry.manualSlots) >= cap(l.retryOutcomes) {
-		return false
+		return true, false
 	}
 	select {
 	case l.retryOutcomes <- retryOutcome{command: command, onCommitted: onCommitted}:
 		l.releaseManualRetryOutcomeLocked(id)
 		l.trackRetryOutcomeLocked(id)
-		return true
+		return true, true
 	default:
-		return false
+		return true, false
 	}
 }
 

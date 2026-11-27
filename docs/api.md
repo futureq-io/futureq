@@ -141,7 +141,7 @@ cause duplicates.
 
 | RPC | Request and result |
 | --- | --- |
-| `ListDeadLetters` | Provide a topic and optional page size and token. Returns summaries ordered by storage key, with a token when more records are available. The default is 100 summaries and the maximum is 256. At small frame limits, the broker can shorten the opaque continuation token and omit summary fields with `identity_omitted` set. Pass the token back unchanged and use the entry ID to get the full summary. |
+| `ListDeadLetters` | Provide a topic and optional page size and token. Returns summaries ordered by storage key, with a token when more records are available. The default is 100 summaries and the maximum is 256. At small frame limits, the broker can shorten opaque entry IDs and continuation tokens and omit summary fields with `identity_omitted` set. Pass the token back unchanged and use the returned entry ID for retrieval or deletion. |
 | `GetDeadLetter` | Provide the topic and an opaque ID from the list. Concatenate the streamed chunk bytes and decode them as a `DeadLetter` with the summary and original publish fields. A missing record returns `NotFound`. |
 | `DeleteDeadLetter` | Provide the topic and ID. Deletion is idempotent. |
 
