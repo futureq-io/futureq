@@ -348,6 +348,71 @@ func (s *LimitedConsumerSuite) TestAutoACKReservesOutcomeSpaceBeforeTransport() 
 	s.exerciseRetryOutcomeCapacity(true)
 }
 
+func (s *LimitedConsumerSuite) TestCanceledAutoACKDuringAuthorizationRefundsWithoutSend() {
+	a, hub, producer, _ := openPublishTest(s.T(), "pebble")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	subscription, err := a.Subscriptions.Create(ctx, "orders", "workers", "")
+	s.Require().NoError(err)
+	ack, err := producer.processBatch(ctx, &pb.PublishBatch{Messages: []*pb.PublishMessage{{
+		Topic: "orders", MaxRetries: new(uint32(0)),
+	}}})
+	s.Require().NoError(err)
+	s.Require().True(ack.GetSuccess())
+	keys := publishedKeys(s.T(), a.DB)
+	s.Require().Len(keys, 1)
+	key := keys[0]
+	group := strings.TrimPrefix(subscription.Recipient, "g:")
+	queue := make(chan *pb.QueueMessage, 1)
+	hub.Register("consumer", "orders", group, queue)
+	defer hub.Unregister("consumer")
+	input := &pb.QueueMessage{Topic: "orders", MaxRetries: new(uint32(0))}
+	s.Require().NotEmpty(hub.DispatchToTopic("orders", input, key))
+
+	logger := zap.NewNop()
+	local := dispatcher.NewDeliveryLedger(a.DB, nil, nil, nil)
+	sentCommitted := false
+	ledger := dispatcher.NewDeliveryLedger(a.DB, nil, nil, func(raw []byte) (statemachine.Result, error) {
+		var cmd deliverypb.RetryCommand
+		if err := proto.Unmarshal(raw[1:], &cmd); err != nil {
+			return statemachine.Result{}, err
+		}
+		value, err := local.ApplyRetry(&cmd)
+		if cmd.Operation == deliverypb.RetryCommand_SENT && err == nil && value != 0 && !sentCommitted {
+			sentCommitted = true
+			cancel()
+		}
+		return statemachine.Result{Value: value}, err
+	})
+	ledger.ConfigureRetryOutcomes(1)
+	defer ledger.RemoveRetryTransports([][]byte{key})
+	handler := NewConsumerHandler(logger, hub, nil)
+	handler.RetryLedger = ledger
+	init := &pb.SubscribeInit{Topic: "orders", GroupId: group, AutoAck: true}
+	sendCalls := 0
+	stream := &autoAckSendStream{send: func(*pb.QueueMessage) error {
+		sendCalls++
+		return ctx.Err()
+	}}
+	errCh := make(chan error, 1)
+	handler.sender(ctx, stream, "consumer", init, queue, errCh)
+	s.Require().ErrorIs(<-errCh, context.Canceled)
+	s.Require().True(sentCommitted, "cancellation followed a successful SENT apply")
+	s.Zero(sendCalls)
+	due, err := raft.DueDeliveryAttempts(a.DB, time.Now().Add(time.Minute).UnixMilli())
+	s.Require().NoError(err)
+	s.Empty(due)
+	state, err := raft.ReadDeliveryState(a.DB, key)
+	s.Require().NoError(err)
+	s.True(state.Ready(subscription.Recipient))
+
+	s.Require().NotEmpty(hub.DispatchToTopic("orders", input, key))
+	next, err := handler.beginLimitedSend(context.Background(), "consumer", init, <-queue)
+	s.Require().NoError(err)
+	s.Require().NotNil(next, "the canceled authorization must release its auto-ACK slot")
+	s.Equal(uint64(1), next.Attempt)
+}
+
 func (s *LimitedConsumerSuite) TestManualACKReservesOutcomeSpaceBeforeTransport() {
 	s.exerciseRetryOutcomeCapacity(false)
 }

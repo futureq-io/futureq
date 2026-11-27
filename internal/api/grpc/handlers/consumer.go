@@ -512,7 +512,7 @@ func (h *ConsumerHandler) beginLimitedSend(ctx context.Context, consumerID strin
 	var authorized bool
 	var err error
 	if init.AutoAck {
-		authorized, err = h.RetryLedger.AuthorizeRetrySend(start, ackWindow, prepare, checkTransport)
+		authorized, err = h.RetryLedger.AuthorizeRetrySend(ctx, start, ackWindow, prepare, checkTransport)
 	} else {
 		authorized, err = h.RetryLedger.AuthorizeManualRetrySend(ctx, start, ackWindow, prepare, checkTransport)
 	}

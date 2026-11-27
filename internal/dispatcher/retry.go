@@ -63,7 +63,7 @@ func (l *DeliveryLedger) AuthorizeManualRetrySend(streamCtx context.Context, sta
 	l.retry.manualSlots[id] = context.AfterFunc(streamCtx, func() { l.releaseManualRetryOutcome(id) })
 	l.retry.mu.Unlock()
 
-	authorized, err := l.authorizeRetrySend(streamCtx, start, ackWindow, prepare, checkTransport)
+	authorized, err := l.AuthorizeRetrySend(streamCtx, start, ackWindow, prepare, checkTransport)
 	if !authorized {
 		l.releaseManualRetryOutcome(id)
 	}
@@ -95,11 +95,7 @@ func (l *DeliveryLedger) releaseManualRetryOutcomeLocked(id retryIdentity) {
 
 // AuthorizeRetrySend holds capacity before reserving the attempt and protects
 // it from expiry until preparation and the final transport check have passed.
-func (l *DeliveryLedger) AuthorizeRetrySend(start *deliverypb.RetryCommand, ackWindow time.Duration, prepare func(uint64) (bool, error), checkTransport func() (time.Time, error)) (authorized bool, err error) {
-	return l.authorizeRetrySend(context.Background(), start, ackWindow, prepare, checkTransport)
-}
-
-func (l *DeliveryLedger) authorizeRetrySend(streamCtx context.Context, start *deliverypb.RetryCommand, ackWindow time.Duration, prepare func(uint64) (bool, error), checkTransport func() (time.Time, error)) (authorized bool, err error) {
+func (l *DeliveryLedger) AuthorizeRetrySend(streamCtx context.Context, start *deliverypb.RetryCommand, ackWindow time.Duration, prepare func(uint64) (bool, error), checkTransport func() (time.Time, error)) (authorized bool, err error) {
 	target := start.Attempts[0]
 	id := identifyRetry(target)
 	key := [utils.EventKeySize]byte(id[:utils.EventKeySize])
@@ -180,7 +176,7 @@ func (l *DeliveryLedger) authorizeRetrySend(streamCtx context.Context, start *de
 			DeadlineMs: max(now.UnixMilli()+1, now.Add(ackWindow).UnixMilli()),
 		}},
 	})
-	if err != nil || result == 0 {
+	if err != nil || result == 0 || streamCtx.Err() != nil {
 		return false, err
 	}
 	transportDeadline, err := checkTransport()
