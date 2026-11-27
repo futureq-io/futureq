@@ -36,7 +36,8 @@ cluster:
     snapshotEntries: 10000
     compactionOverhead: 5000
     logDB:
-      backend: tan # tan or pebble. Choose before using a new Raft data directory.
+      # Tan is experimental and designed to reduce write amplification.
+      backend: pebble # Set tan to reopen an existing Tan Raft data directory.
       pebbleWALMinSyncInterval: 500µs # Pebble only. Use 0s to disable the delay.
       compactionConcurrency: 1 # Regular compactions per Pebble LogDB shard.
       # Engine.ExecShards controls workers that persist Raft updates.

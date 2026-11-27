@@ -22,7 +22,7 @@ var defaultConfig = Config{
 			InitialMembers: map[uint64]string{}, RTT: 200 * time.Millisecond,
 			SnapshotEntries: 10000, CompactionOverhead: 5000,
 			LogDB: LogDB{
-				Backend:                  LogDBTan,
+				Backend:                  LogDBPebble,
 				PebbleWALMinSyncInterval: 500 * time.Microsecond,
 				CompactionConcurrency:    1,
 

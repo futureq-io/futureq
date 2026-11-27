@@ -59,9 +59,15 @@ export FUTUREQ_CLUSTER_RAFT_INITIALMEMBERS='{1: "10.0.0.1:50005"}'
 
 ### cluster.raft.logDB
 
-`backend` selects `tan` or `pebble` when the node first opens its Raft data
-directory. Tan is the default. Stormoar rejects a backend change against an
-existing directory. The two formats require separate Raft data directories.
+`backend` defaults to `pebble` and also accepts `tan`. Choose the backend when
+initializing a Raft data directory. Stormoar rejects a backend change against an
+existing directory. Before upgrading a node with an existing Tan directory,
+set `cluster.raft.logDB.backend` to `tan` explicitly.
+
+Tan is an experimental, high-throughput LogDB designed as a replacement for
+Pebble's Raft log storage. Its Raft-specific log format aims to reduce the
+write amplification of a general-purpose key-value store.
+[Tan design notes](https://github.com/futureq-io/stormoar/blob/f93af638f99ef46b24088cb343705a40abb1ee42/internal/tan/README.md)
 
 `pebbleWALMinSyncInterval` sets the minimum time between WAL syncs on each
 Pebble LogDB shard. It defaults to `500us`. Use `0s` to disable the delay.
@@ -90,7 +96,7 @@ are separate from application storage under `storage.pebble`.
 
 | Key below `cluster.raft.logDB` | Default |
 |---|---:|
-| `backend` | `tan` |
+| `backend` | `pebble` |
 | `pebbleWALMinSyncInterval` | `500us` |
 | `compactionConcurrency` | `1` |
 | `workers` | `16` |
