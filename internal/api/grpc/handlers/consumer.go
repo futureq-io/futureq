@@ -277,13 +277,15 @@ func (h *ConsumerHandler) sender(
 				errCh <- err
 				return
 			}
+			// Queue the auto-ACK before metrics or hub bookkeeping can delay it.
+			autoACKAccepted := frames.autoACK == nil || frames.autoACK.Finish(true)
 			metrics.DeliveryGRPCSendsTotal.WithLabelValues(msg.Topic).Inc()
+			if !autoACKAccepted {
+				errCh <- status.Error(codes.Unavailable, "automatic delivery ACK no longer active")
+				return
+			}
 			if frames.autoACK != nil {
 				h.hub.MarkRetryOutcome(consumerID, msg.DeliveryTag, frames.DeliveryTag[utils.EventKeySize:])
-				if !frames.autoACK.Finish(true) {
-					errCh <- status.Error(codes.Unavailable, "automatic delivery ACK no longer active")
-					return
-				}
 				continue
 			}
 			if init.AutoAck {

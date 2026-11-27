@@ -21,6 +21,7 @@ import (
 	deliverypb "github.com/futureq-io/protocol/proto/go/delivery"
 	storagepb "github.com/futureq-io/protocol/proto/go/storage"
 	"github.com/futureq-io/stormoar/v4/statemachine"
+	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
@@ -546,6 +547,72 @@ func (s *LimitedConsumerSuite) TestLaterACKCommitsWhileFirstOutcomeIsStalled() {
 
 func (s *LimitedConsumerSuite) TestAutoACKReservesOutcomeSpaceBeforeTransport() {
 	s.exerciseRetryOutcomeCapacity(true)
+}
+
+func (s *LimitedConsumerSuite) TestSuccessfulAutoACKSendWinsExpiryWhileMetricsWait() {
+	t := s.T()
+	a, hub, producer, _ := openPublishTest(t, "pebble")
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+	subscription, err := a.Subscriptions.Create(ctx, "orders", "workers", "")
+	require.NoError(t, err)
+	published, err := producer.processBatch(ctx, &pb.PublishBatch{Messages: []*pb.PublishMessage{{
+		Topic: "orders", MaxRetries: new(uint32(0)),
+	}}})
+	require.NoError(t, err)
+	require.True(t, published.GetSuccess())
+	keys := publishedKeys(t, a.DB)
+	require.Len(t, keys, 1)
+	key := keys[0]
+
+	const worker = "consumer"
+	group := strings.TrimPrefix(subscription.Recipient, "g:")
+	queue := make(chan *pb.QueueMessage, 1)
+	hub.SetDeliveryTimeout(300 * time.Millisecond)
+	hub.Register(worker, "orders", group, queue)
+	defer hub.Unregister(worker)
+	require.NotEmpty(t, hub.DispatchToTopic("orders", &pb.QueueMessage{
+		Topic: "orders", MaxRetries: new(uint32(0)),
+	}, key))
+	queued := <-queue
+	queue <- queued
+
+	logger := zap.NewNop()
+	ledger := dispatcher.NewDeliveryLedger(a.DB, nil, nil, nil)
+	ledger.ConfigureRetryOutcomes(1)
+	defer ledger.RemoveRetryTransports(keys)
+	var workers sync.WaitGroup
+	workers.Go(func() { ledger.RunRetryOutcomes(ctx, 1, logger) })
+	workers.Go(func() { ledger.RunRetryExpiry(ctx, 25*time.Millisecond, nil, logger) })
+	defer func() { cancel(); workers.Wait() }()
+
+	original := metrics.DeliveryGRPCSendsTotal
+	defer func() { metrics.DeliveryGRPCSendsTotal = original }()
+	metrics.DeliveryGRPCSendsTotal = prometheus.V2.NewCounterVec(prometheus.CounterVecOpts{
+		CounterOpts: prometheus.CounterOpts{Name: "test_delivery_grpc_sends"},
+		VariableLabels: prometheus.ConstrainedLabels{{Name: "topic", Constraint: func(topic string) string {
+			// Wait for the ACK or expiry to settle the delivery before telemetry returns.
+			require.Eventually(t, func() bool {
+				state, err := raft.ReadDeliveryState(a.DB, key)
+				return err == nil && state == nil
+			}, 2*time.Second, 10*time.Millisecond)
+			page, err := (raft.DeadLetterQuery{Topic: "orders", Limit: 1}).Read(a.DB)
+			require.NoError(t, err)
+			require.Empty(t, page.Page.Entries)
+			cancel()
+			return topic
+		}}},
+	})
+
+	handler := NewConsumerHandler(logger, hub, nil)
+	handler.RetryLedger = ledger
+	stream := &autoAckSendStream{send: func(*pb.QueueMessage) error {
+		require.True(t, hub.CanSend(worker, queued), "the send must succeed within the attempt window")
+		return nil
+	}}
+	errs := make(chan error, 1)
+	handler.sender(ctx, stream, worker, &pb.SubscribeInit{Topic: "orders", GroupId: group, AutoAck: true}, queue, errs)
+	require.ErrorIs(t, <-errs, context.Canceled)
 }
 
 func (s *LimitedConsumerSuite) TestCanceledAutoACKDuringAuthorizationRefundsWithoutSend() {
