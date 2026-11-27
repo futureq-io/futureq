@@ -30,6 +30,11 @@ func openDiscoveryIterator(db storage.IteratorSource, view InterestView, hash ui
 	}
 	if shards != nil {
 		lower, upper = shards.bounds(hash, lower, upper)
+	} else if view.standaloneShardScans {
+		first := shardScanBound(hash, 1)
+		if bytes.Compare(lower, first) < 0 {
+			lower = first
+		}
 	}
 	iter, err := db.NewIter(&storage.IterOptions{LowerBound: lower, UpperBound: upper})
 	if err != nil {

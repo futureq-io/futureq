@@ -121,9 +121,9 @@ func (s *EventRepositorySuite) TestStoreWithBatch_UsesSuppliedID() {
 	}
 
 	b := s.db.NewBatch()
-	key1, err := repo.StoreWithBatch(b, 7, msg)
+	key1, err := repo.StoreWithBatch(b, 7, msg, 1)
 	require.NoError(err)
-	key2, err := repo.StoreWithBatch(b, 8, msg)
+	key2, err := repo.StoreWithBatch(b, 8, msg, 1)
 	require.NoError(err)
 	require.NoError(b.Commit(storage.Sync))
 	require.NoError(b.Close())
@@ -151,7 +151,7 @@ func (s *EventRepositorySuite) TestStoreWithBatch_KeyLayout() {
 	}
 
 	b := s.db.NewBatch()
-	key, err := repo.StoreWithBatch(b, 1, msg)
+	key, err := repo.StoreWithBatch(b, 1, msg, 64)
 	require.NoError(err)
 	require.NoError(b.Commit(storage.Sync))
 	require.NoError(b.Close())
@@ -160,6 +160,7 @@ func (s *EventRepositorySuite) TestStoreWithBatch_KeyLayout() {
 	require.NoError(err)
 	require.Equal(utils.TopicHash("payments"), th)
 	require.Equal(uint64(19), bucket)
+	require.Equal(64, utils.SlotShardCount(utils.EventShardSlot(key)))
 }
 
 func (s *EventRepositorySuite) TestStoreWithBatch_StoredValueIsMarshalledMessage() {
@@ -175,7 +176,7 @@ func (s *EventRepositorySuite) TestStoreWithBatch_StoredValueIsMarshalledMessage
 	}
 
 	b := s.db.NewBatch()
-	key, err := repo.StoreWithBatch(b, 1, msg)
+	key, err := repo.StoreWithBatch(b, 1, msg, 1)
 	require.NoError(err)
 	require.NoError(b.Commit(storage.Sync))
 	require.NoError(b.Close())
@@ -204,7 +205,7 @@ func (s *EventRepositorySuite) TestStoreWithBatch_IndexesAreStored() {
 	}
 
 	b := s.db.NewBatch()
-	key, err := repo.StoreWithBatch(b, 1, msg)
+	key, err := repo.StoreWithBatch(b, 1, msg, 1)
 	require.NoError(err)
 	require.NoError(b.Commit(storage.Sync))
 	require.NoError(b.Close())
@@ -288,7 +289,7 @@ func (s *EventRepositorySuite) TestDeleteWithBatch_RemovesKey() {
 	key, err := repo.StoreWithBatch(b1, 1, &storagepb.StoredMessage{
 		Topic:            "del-topic",
 		EnqueuedAtUnixMs: 5000,
-	})
+	}, 1)
 	require.NoError(err)
 	require.NoError(b1.Commit(storage.Sync))
 	require.NoError(b1.Close())

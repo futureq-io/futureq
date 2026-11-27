@@ -28,12 +28,13 @@ type shardScanState struct {
 }
 
 // Split each layout independently so a mixed backlog cannot put all of the
-// active layout's shards in one lane. Lane zero also covers unsharded keys.
+// active layout's shards in one lane. In cluster mode lane zero also covers
+// unsharded keys.
 func splitShardScans(view InterestView, workers int, layouts int) []shardScanState {
 	// Each layout has at most this many slots to split into nonempty ranges.
 	workers = min(workers, utils.MaxVirtualShards)
 	lanes := make([]shardScanState, workers)
-	lanes[0].rangeKeys.includeLegacy = true
+	lanes[0].rangeKeys.includeLegacy = !view.standaloneShardScans
 	lanes[0].rangeKeys.epoch = view.Epoch
 	lanes[0].rangeKeys.assignmentEpoch = view.assignmentEpoch
 	used := 1
@@ -99,6 +100,9 @@ func discoverShardLayouts(source storage.IteratorSource, hash uint64) (int, erro
 
 func (r *shardScanRange) bounds(hash uint64, lower, upper []byte) ([]byte, []byte) {
 	if !r.includeLegacy {
+		if len(r.slots) == 0 {
+			return upper, upper
+		}
 		first := shardScanBound(hash, r.slots[0].first)
 		if bytes.Compare(lower, first) < 0 {
 			lower = first

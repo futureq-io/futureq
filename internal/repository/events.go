@@ -60,13 +60,15 @@ func (er *EventRepository) NextID() uint64 {
 	return er.nextID.Add(1)
 }
 
-// StoreWithBatch marshals msg and adds it to an existing Pebble batch using
-// the caller-supplied leader-assigned ID. It returns the 25-byte event key.
-func (er *EventRepository) StoreWithBatch(b storage.Batch, id uint64, msg *storagepb.StoredMessage) ([]byte, error) {
+// StoreWithBatch writes a standalone event to the batch in a randomly selected
+// virtual shard. It returns the 25-byte event key.
+func (er *EventRepository) StoreWithBatch(b storage.Batch, id uint64, msg *storagepb.StoredMessage, shardCount int) ([]byte, error) {
 	fireAtMs := msg.EnqueuedAtUnixMs + msg.DelayMs
 	bucket := utils.CalculateBucket(fireAtMs, er.bucketSize)
-	topicHash := utils.TopicHash(msg.Topic)
-	key := utils.EventKey(bucket, topicHash, id)
+	// Standalone always uses a virtual shard. The payload retains the exact
+	// due time when the time bucket exceeds what fits in the key.
+	bucket, slot := utils.ChooseStorageBucket(min(bucket, utils.MaxVirtualTimeBucket), shardCount)
+	key := utils.ShardStorageBucket(slot, bucket).EventKey(utils.TopicHash(msg.Topic), id)
 
 	data, err := proto.Marshal(msg)
 	if err != nil {

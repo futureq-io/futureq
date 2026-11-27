@@ -144,6 +144,67 @@ func TestShardScanRangesCoverOnlyOwnedShards(t *testing.T) {
 	}
 }
 
+func TestStandaloneShardWorkersDeliverBothRangesFromOneSnapshot(t *testing.T) {
+	d, _ := newPipelineTest(t)
+	d.hub.EnableStandaloneShardScans()
+	d.DiscoveryWorkers, d.ShardWorkers = 1, 2
+	d.MaintenanceRecipients = nil
+	const topic = "orders"
+	hash := utils.TopicHash(topic)
+	messages := make(chan *pb.QueueMessage, 3)
+	d.hub.Register("local", topic, "workers", messages)
+	due := time.Now().Add(-time.Second)
+	putPipelineEvent(t, d, topic, 1, due.UnixMilli()) // slot zero
+	first := putShardBudgetPayload(t, d, topic, 2, 2, 32, due)
+	second := putShardBudgetPayload(t, d, topic, 3, 3, 32, due)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	release := make(chan struct{})
+	db := &parallelScanDB{
+		DB: d.db, ctx: ctx,
+		started: make(chan parallelScanStart, 16),
+		release: map[uint64]chan struct{}{hash: release},
+	}
+	d.db = db
+	done := make(chan struct{})
+	go func() { defer close(done); d.Run(ctx) }()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Error("standalone dispatcher did not stop")
+		}
+	})
+
+	var snapshot *parallelScanSnapshot
+	for range 2 {
+		select {
+		case scan := <-db.started:
+			require.Equal(t, hash, scan.topic)
+			if snapshot == nil {
+				snapshot = scan.snapshot
+			} else {
+				require.Same(t, snapshot, scan.snapshot)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("both shard workers must start before either finishes")
+		}
+	}
+	close(release)
+
+	var tags [][]byte
+	for range 2 {
+		select {
+		case msg := <-messages:
+			tags = append(tags, msg.DeliveryTag)
+		case <-time.After(5 * time.Second):
+			t.Fatal("standalone dispatcher did not deliver both shards")
+		}
+	}
+	require.ElementsMatch(t, [][]byte{first, second}, tags)
+}
+
 func TestShardScansFindDueAndFutureKeysInBothRanges(t *testing.T) {
 	d, _ := newPipelineTest(t)
 	d.Limits.WorkTime, d.PreloadLookahead = time.Second, time.Minute

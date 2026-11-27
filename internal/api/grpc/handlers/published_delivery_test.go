@@ -26,7 +26,7 @@ func openPublishTest(t *testing.T, engine string) (*app.App, *dispatcher.Hub, *P
 	t.Helper()
 	root := t.TempDir()
 	cfg := &config.Config{
-		Storage: config.Storage{Engine: engine,
+		Storage: config.Storage{Engine: engine, VirtualShards: 1,
 			Pebble: config.Pebble{Mode: "disk", DataDir: filepath.Join(root, "pebble"), WALEnabled: true},
 			Bolt:   config.Bolt{File: filepath.Join(root, "bolt.db")}},
 		Delivery: config.DefaultDelivery(), Publish: config.Publish{MinAckLevel: config.Quorum},
@@ -37,6 +37,7 @@ func openPublishTest(t *testing.T, engine string) (*app.App, *dispatcher.Hub, *P
 	require.NoError(t, a.WithRepositories())
 	require.NoError(t, a.Subscriptions.CreateTopic(context.Background(), "orders", nil))
 	hub := dispatcher.NewHub(dispatcher.NewRoundRobinStrategy(), zap.NewNop(), make(chan struct{}, 1))
+	hub.EnableStandaloneShardScans()
 	producer := NewProducerHandler(zap.NewNop())
 	reopen := func() {
 		require.NoError(t, a.DB.Close())
@@ -227,4 +228,30 @@ func TestStandalonePublishUsesOneSyncCommitAndFailsAtomically(t *testing.T) {
 	_, err = producer.processBatch(context.Background(), batch)
 	require.ErrorIs(t, err, errBatchSave)
 	require.Len(t, publishedKeys(t, wrapped), 1, "a failed commit cannot publish another payload")
+}
+
+func TestStandalonePublishUsesConfiguredVirtualShardsWithOneScanWorker(t *testing.T) {
+	for _, engine := range []string{"pebble", "bolt"} {
+		t.Run(engine, func(t *testing.T) {
+			a, _, producer, _ := openPublishTest(t, engine)
+			a.Config().Storage.VirtualShards = 256
+			require.Equal(t, 1, a.Config().Delivery.ShardWorkers)
+			require.NoError(t, createTestInterest(context.Background(), "orders", "workers"))
+
+			ack, err := producer.processBatch(context.Background(), &pb.PublishBatch{Messages: []*pb.PublishMessage{
+				{Topic: "orders"},
+				{Topic: "orders", DelayMs: int64(utils.MaxVirtualTimeBucket)},
+			}})
+			require.NoError(t, err)
+			require.True(t, ack.Success)
+			keys := publishedKeys(t, a.DB)
+			require.Len(t, keys, 2)
+			for _, key := range keys {
+				require.GreaterOrEqual(t, utils.EventShardSlot(key), 256)
+				require.Less(t, utils.EventShardSlot(key), 512)
+				_, err := raft.ReadDeliveryState(a.DB, key)
+				require.NoError(t, err)
+			}
+		})
+	}
 }

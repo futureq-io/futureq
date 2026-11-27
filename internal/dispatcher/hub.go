@@ -209,6 +209,8 @@ type Hub struct {
 	assignmentEpoch uint64
 	inFlightTimeout time.Duration
 
+	standaloneShardScans bool
+
 	// topics: topic → *TopicSubscription
 	topics map[string]*TopicSubscription
 
@@ -251,6 +253,14 @@ func (h *Hub) SetLocalReplica(nodeID uint64) {
 	h.deliveryMu.Lock()
 	defer h.deliveryMu.Unlock()
 	h.localReplica = nodeID
+	h.assignmentEpoch++
+}
+
+// EnableStandaloneShardScans lets local consumers read all virtual shards.
+func (h *Hub) EnableStandaloneShardScans() {
+	h.deliveryMu.Lock()
+	defer h.deliveryMu.Unlock()
+	h.standaloneShardScans = true
 	h.assignmentEpoch++
 }
 
@@ -807,13 +817,14 @@ type localGroup struct {
 // used to filter a chunk. Queueing still validates the live epoch under the
 // rebalance lock; this view is never itself a delivery permit.
 type InterestView struct {
-	Epoch           uint64
-	Active          bool
-	Recipients      []string
-	groups          []localGroup
-	universal       []*ConsumerEntry
-	sharded         bool
-	assignmentEpoch uint64
+	Epoch                uint64
+	Active               bool
+	Recipients           []string
+	groups               []localGroup
+	universal            []*ConsumerEntry
+	sharded              bool
+	standaloneShardScans bool
+	assignmentEpoch      uint64
 }
 
 func (h *Hub) SetDeliveryView(source func(string) metadata.TopicDeliveryView) {
@@ -838,7 +849,10 @@ func (h *Hub) InterestView(topic string) InterestView {
 		}
 		return InterestView{}
 	}
-	view := InterestView{Active: true, Epoch: h.registryEpoch, sharded: h.localReplica != 0, assignmentEpoch: h.assignmentEpoch}
+	view := InterestView{
+		Active: true, Epoch: h.registryEpoch, assignmentEpoch: h.assignmentEpoch,
+		sharded: h.localReplica != 0 || h.standaloneShardScans, standaloneShardScans: h.standaloneShardScans,
+	}
 	var global metadata.TopicDeliveryView
 	if h.deliveryView != nil {
 		global = h.deliveryView(topic)
@@ -864,7 +878,7 @@ func (h *Hub) InterestView(topic string) InterestView {
 		if (h.deliveryView != nil || h.groupMembers != nil) && len(entry.members) == 0 {
 			continue
 		}
-		if view.sharded {
+		if h.localReplica != 0 {
 			entry.replica = describeReplica(entry.members, h.localReplica, distribution)
 			entry.local = entry.replica.localWorkers(entry.members, consumers)
 		}
