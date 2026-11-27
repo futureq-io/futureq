@@ -38,6 +38,7 @@ cluster:
     logDB:
       backend: tan # tan or pebble. Choose before using a new Raft data directory.
       pebbleWALMinSyncInterval: 500µs # Pebble only. Use 0s to disable the delay.
+      compactionConcurrency: 1 # Regular compactions per Pebble LogDB shard.
       # Engine.ExecShards controls workers that persist Raft updates.
       # Changing workers/shards requires fresh Raft storage.
       workers: 16

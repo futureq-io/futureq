@@ -67,6 +67,11 @@ existing directory. The two formats require separate Raft data directories.
 Pebble LogDB shard. It defaults to `500us`. Use `0s` to disable the delay.
 Tan ignores this setting. Changes take effect on restart.
 
+`compactionConcurrency` sets the number of regular compactions allowed in
+parallel per Pebble LogDB shard. It defaults to `1`, must be positive, and
+takes effect on restart. Tan ignores this setting. Delete-only compactions may
+run outside this limit.
+
 Byte quantities use `B`, `KiB`, `MiB`, or `GiB`. Optional byte settings accept `0B`.
 Environment overrides follow the nesting, for example
 `FUTUREQ_CLUSTER_RAFT_LOGDB_KVWRITEBUFFERSIZE=4MiB` and
@@ -87,6 +92,7 @@ are separate from application storage under `storage.pebble`.
 |---|---:|
 | `backend` | `tan` |
 | `pebbleWALMinSyncInterval` | `500us` |
+| `compactionConcurrency` | `1` |
 | `workers` | `16` |
 | `shards` | `16` |
 | `kvKeepLogFileNum` | `16` |

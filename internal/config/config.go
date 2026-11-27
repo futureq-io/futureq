@@ -98,6 +98,7 @@ const (
 type LogDB struct {
 	Backend                  string        `mapstructure:"backend" yaml:"backend"`
 	PebbleWALMinSyncInterval time.Duration `mapstructure:"pebbleWALMinSyncInterval" yaml:"pebbleWALMinSyncInterval"`
+	CompactionConcurrency    int           `mapstructure:"compactionConcurrency" yaml:"compactionConcurrency"`
 
 	Workers                            uint64 `mapstructure:"workers" yaml:"workers"`
 	Shards                             uint64 `mapstructure:"shards" yaml:"shards"`
@@ -132,12 +133,16 @@ func (c LogDB) DragonboatConfig() (raftconfig.LogDBConfig, error) {
 	if c.PebbleWALMinSyncInterval < 0 {
 		return raftconfig.LogDBConfig{}, fmt.Errorf("cluster.raft.logDB.pebbleWALMinSyncInterval must be nonnegative")
 	}
+	if c.CompactionConcurrency < 1 {
+		return raftconfig.LogDBConfig{}, fmt.Errorf("cluster.raft.logDB.compactionConcurrency must be at least 1")
+	}
 	maxInt := uint64(int(^uint(0) >> 1))
 	if c.Workers == 0 || c.Shards == 0 || c.Workers > maxInt || c.Shards > maxInt {
 		return raftconfig.LogDBConfig{}, fmt.Errorf("cluster.raft.logDB.workers and shards must be positive supported counts")
 	}
 	result := raftconfig.LogDBConfig{
-		PebbleWALMinSyncInterval: c.PebbleWALMinSyncInterval,
+		PebbleWALMinSyncInterval:    c.PebbleWALMinSyncInterval,
+		PebbleCompactionConcurrency: c.CompactionConcurrency,
 
 		Shards: c.Shards, KVKeepLogFileNum: c.KVKeepLogFileNum,
 		KVMaxBackgroundCompactions: c.KVMaxBackgroundCompactions, KVMaxBackgroundFlushes: c.KVMaxBackgroundFlushes,
