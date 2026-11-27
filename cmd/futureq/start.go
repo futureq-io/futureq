@@ -214,7 +214,7 @@ func startRun(cmd *cobra.Command, _ []string) {
 		if err := a.StartRaft(joining, func(keys [][]byte) {
 			ledger.RemoveRetryTransports(keys)
 			ledger.OnDelete(keys)
-		}, ledger.CompleteRetryAttempts); err != nil {
+		}, ledger.CompleteRetryAttempts, ledger.ReconcileRetryAttempts); err != nil {
 			logger.Fatal("failed to start raft", zap.Error(err))
 		}
 		hub.SetGroupMembership(a.MetadataSM.ConsumerGroup)

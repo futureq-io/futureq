@@ -36,11 +36,20 @@ func (s *DeliveryState) Ready(recipient string) bool {
 }
 
 func (s *DeliveryState) HasActiveAttempt(recipient string, token []byte) bool {
-	if len(token) != AttemptTokenSize || !s.Needs(recipient) {
-		return false
+	attempt := s.retryAttempt(recipient)
+	return len(token) == AttemptTokenSize && !attempt.GetReserved() && bytes.Equal(attempt.GetToken(), token)
+}
+
+// HasRetryAttempt matches a token before or after send authorization.
+func (s *DeliveryState) HasRetryAttempt(recipient string, token []byte) bool {
+	return len(token) == AttemptTokenSize && bytes.Equal(s.retryAttempt(recipient).GetToken(), token)
+}
+
+func (s *DeliveryState) retryAttempt(recipient string) *deliverypb.DeliveryAttempt {
+	if !s.Needs(recipient) {
+		return nil
 	}
-	attempt := s.attempts[uint32(sort.SearchStrings(s.Recipients, recipient))]
-	return !attempt.GetReserved() && bytes.Equal(attempt.GetToken(), token)
+	return s.attempts[uint32(sort.SearchStrings(s.Recipients, recipient))]
 }
 
 func MarshalRetryCommand(cmd *deliverypb.RetryCommand) ([]byte, error) {

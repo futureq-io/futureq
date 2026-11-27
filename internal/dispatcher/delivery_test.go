@@ -357,6 +357,73 @@ func (s *RetryExpirySuite) TestDeletionDuringAuthorizationCannotInstallTransport
 	s.Empty(ledger.retry.transports)
 }
 
+func (s *RetryExpirySuite) TestSnapshotRecoveryReleasesOnlyMissingManualSlots() {
+	logger := zap.NewNop()
+	db, err := storage.NewPebble(config.Pebble{Mode: "memory"}, logger)
+	s.Require().NoError(err)
+	defer db.Close() //nolint:errcheck
+	repo, err := repository.NewEventRepository(db, logger, time.Second)
+	s.Require().NoError(err)
+	ledger := NewDeliveryLedger(db, nil, nil, nil)
+	ledger.ConfigureRetryOutcomes(2)
+	sm := raft.NewEventStateMachineFactoryWithReceiptCache(db, repo, nil, nil, ledger.ReconcileRetryAttempts, logger, 0, 0)(1, 1)
+	deadline := time.Now().Add(time.Hour)
+	retained := s.storeRetryFixture(db, 1, deadline)
+	stale := s.storeRetryFixture(db, 2, deadline)
+	newDelivery := s.storeRetryFixture(db, 3, deadline)
+	defer ledger.RemoveRetryTransports([][]byte{retained.Attempts[0].Key, stale.Attempts[0].Key, newDelivery.Attempts[0].Key})
+	authorize := func(start *deliverypb.RetryCommand) bool {
+		allowed, err := ledger.AuthorizeManualRetrySend(start, time.Hour,
+			func(uint64) (bool, error) { return true, nil },
+			func() (time.Time, error) { return deadline, nil })
+		s.Require().NoError(err)
+		return allowed
+	}
+	s.Require().True(authorize(retained))
+	snapshot, err := sm.PrepareSnapshot()
+	s.Require().NoError(err)
+	var encoded bytes.Buffer
+	s.Require().NoError(sm.SaveSnapshot(snapshot, &encoded, nil))
+
+	s.Require().True(authorize(stale))
+	staleTarget := stale.Attempts[0]
+	staleID := identifyRetry(staleTarget)
+	staleTimer := ledger.retry.transports[[utils.EventKeySize]byte(staleTarget.Key)][staleID].timer
+	s.Require().NotNil(staleTimer)
+	s.False(authorize(newDelivery), "both slots are reserved before recovery")
+	s.Require().NoError(sm.RecoverFromSnapshot(&encoded, nil))
+	s.Len(ledger.retry.manualSlots, 1)
+	s.Contains(ledger.retry.manualSlots, identifyRetry(retained.Attempts[0]))
+	s.NotContains(ledger.retry.manualSlots, staleID)
+	s.False(staleTimer.Stop(), "recovery must have stopped the stale timer")
+	s.True(authorize(newDelivery), "the restored broker can use the freed slot")
+}
+
+func (s *RetryExpirySuite) TestShutdownReleasesManualSlotWhenACKWindowEnds() {
+	logger := zap.NewNop()
+	db, err := storage.NewPebble(config.Pebble{Mode: "memory"}, logger)
+	s.Require().NoError(err)
+	defer db.Close() //nolint:errcheck
+	ledger := NewDeliveryLedger(db, nil, nil, nil)
+	ledger.ConfigureRetryOutcomes(1)
+	start := s.storeRetryFixture(db, 1, time.Now().Add(time.Minute))
+	target := start.Attempts[0]
+	defer ledger.RemoveRetryTransports([][]byte{target.Key})
+	const ackWindow = 100 * time.Millisecond
+	allowed, err := ledger.AuthorizeManualRetrySend(start, ackWindow,
+		func(uint64) (bool, error) { return true, nil },
+		func() (time.Time, error) { return time.Now().Add(ackWindow), nil })
+	s.Require().NoError(err)
+	s.Require().True(allowed)
+	ledger.StopRetryOutcomeAdmission()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	ledger.RunRetryOutcomes(ctx, 1, logger)
+	s.Require().NoError(ctx.Err(), "the drain should finish once the ACK window ends")
+	s.Empty(ledger.retry.manualSlots)
+}
+
 func (s *RetryExpirySuite) TestRetiringRecipientStopsOnlyItsTransportTimer() {
 	for _, mode := range []string{"standalone", "raft"} {
 		s.Run(mode, func() {
@@ -371,7 +438,7 @@ func (s *RetryExpirySuite) TestRetiringRecipientStopsOnlyItsTransportTimer() {
 			if mode == "raft" {
 				repo, err := repository.NewEventRepository(db, logger, time.Second)
 				s.Require().NoError(err)
-				sm := raft.NewEventStateMachineFactoryWithReceiptCache(db, repo, nil, ledger.CompleteRetryAttempts, logger, 0, 0)(1, 1)
+				sm := raft.NewEventStateMachineFactoryWithReceiptCache(db, repo, nil, ledger.CompleteRetryAttempts, nil, logger, 0, 0)(1, 1)
 				var index uint64
 				ledger.propose = func(cmd []byte) (statemachine.Result, error) {
 					index++

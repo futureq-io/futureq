@@ -142,7 +142,7 @@ func TestReceiptCacheByteBudget(t *testing.T) {
 func TestDisabledReceiptCacheFallsBackToPebble(t *testing.T) {
 	defaultSM, db := newDeliveryTestSM(t)
 	observed := &applyReceiptReadDB{DB: db}
-	sm := NewEventStateMachineFactoryWithReceiptCache(observed, defaultSM.repo, nil, nil, defaultSM.logger, 0, 2)(1, 1).(*EventStateMachine)
+	sm := NewEventStateMachineFactoryWithReceiptCache(observed, defaultSM.repo, nil, nil, nil, defaultSM.logger, 0, 2)(1, 1).(*EventStateMachine)
 	key := utils.EventKey(1, 2, 3)
 	receipt, err := MarshalPublishReceipt(1, []string{"g:a"})
 	require.NoError(t, err)

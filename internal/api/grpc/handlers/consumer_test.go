@@ -436,10 +436,10 @@ func (s *LimitedConsumerSuite) exerciseRetryOutcomeCapacity(auto bool) {
 	s.True(bytes.HasPrefix(second.DeliveryTag, keys[1]))
 	s.Equal(uint64(1), second.Attempt)
 	if !auto {
+		ledger.StopRetryOutcomeAdmission()
 		accepted, err := handler.finishLimitedSend(consumerID, init, second.DeliveryTag, true)
 		s.Require().NoError(err)
-		s.Require().True(accepted)
-		ledger.StopRetryOutcomeAdmission()
+		s.Require().True(accepted, "shutdown must honor the active manual reservation")
 	}
 	select {
 	case <-outcomesDone:

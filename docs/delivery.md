@@ -155,10 +155,11 @@ separate manual and automatic outcome queues and persistence workers.
 Each queue reserves capacity before the broker charges an attempt and
 counts its outstanding reservations toward `delivery.ackQueueCapacity`.
 A manual ACK or NACK uses its reserved slot when received. An automatic
-ACK uses its slot after transport succeeds. On graceful shutdown, the broker
-stops accepting new authorizations and outcomes. It keeps proposals and lease
-renewal active while it drains accepted outcomes and refunds unsent attempts
-within the shutdown window. Clustered brokers renew
+ACK uses its slot after transport succeeds. Snapshot recovery releases slots
+for attempts missing from the restored receipts. On graceful shutdown, the
+broker stops granting new reservations and honors active reservations within
+the shutdown window. It keeps proposals and lease renewal active while it
+drains accepted outcomes and refunds unsent attempts. Clustered brokers renew
 `delivery.retryOwnerLease` every fifth of its duration (every 3 seconds by
 default). Leaders wait an additional `delivery.retryOwnerMaxClockSkew`
 (default 2 seconds) before recovering another broker's expired attempts.

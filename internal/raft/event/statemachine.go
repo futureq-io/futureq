@@ -42,6 +42,8 @@ type EventStateMachine struct {
 	// OnCompletedAttempts releases recipient-specific transport tracking after
 	// commit, including when the event still has other recipients.
 	OnCompletedAttempts func([]CompletedAttempt)
+	// OnSnapshotRecovered reconciles local delivery state with restored receipts.
+	OnSnapshotRecovered func() error
 }
 
 // NewEventStateMachineFactory returns the factory function that Dragonboat
@@ -49,11 +51,11 @@ type EventStateMachine struct {
 func NewEventStateMachineFactory(db storage.DB, repo *repository.EventRepository, onDeleteKeys func(keys [][]byte), logger *zap.Logger) func(uint64, uint64) statemachine.IOnDiskStateMachine {
 	limits := config.DefaultDelivery().ReceiptCache
 	maxBytes, _ := limits.Bytes()
-	return NewEventStateMachineFactoryWithReceiptCache(db, repo, onDeleteKeys, nil, logger, maxBytes, limits.MaxEntries)
+	return NewEventStateMachineFactoryWithReceiptCache(db, repo, onDeleteKeys, nil, nil, logger, maxBytes, limits.MaxEntries)
 }
 
 // NewEventStateMachineFactoryWithReceiptCache uses validated per-replica cache limits.
-func NewEventStateMachineFactoryWithReceiptCache(db storage.DB, repo *repository.EventRepository, onDeleteKeys func(keys [][]byte), onCompletedAttempts func([]CompletedAttempt), logger *zap.Logger, maxBytes int64, maxEntries int) func(uint64, uint64) statemachine.IOnDiskStateMachine {
+func NewEventStateMachineFactoryWithReceiptCache(db storage.DB, repo *repository.EventRepository, onDeleteKeys func(keys [][]byte), onCompletedAttempts func([]CompletedAttempt), onSnapshotRecovered func() error, logger *zap.Logger, maxBytes int64, maxEntries int) func(uint64, uint64) statemachine.IOnDiskStateMachine {
 	return func(clusterID uint64, nodeID uint64) statemachine.IOnDiskStateMachine {
 		return &EventStateMachine{
 			clusterID:           clusterID,
@@ -64,6 +66,7 @@ func NewEventStateMachineFactoryWithReceiptCache(db storage.DB, repo *repository
 			receipts:            newReceiptCache(maxBytes, maxEntries),
 			OnDeleteKeys:        onDeleteKeys,
 			OnCompletedAttempts: onCompletedAttempts,
+			OnSnapshotRecovered: onSnapshotRecovered,
 		}
 	}
 }
@@ -421,6 +424,11 @@ func (s *EventStateMachine) RecoverFromSnapshot(r io.Reader, stopc <-chan struct
 	lastID, err := s.readStoredUint64(repository.LastIDKey)
 	if err != nil {
 		return err
+	}
+	if s.OnSnapshotRecovered != nil {
+		if err := s.OnSnapshotRecovered(); err != nil {
+			return fmt.Errorf("raft: reconcile restored delivery attempts: %w", err)
+		}
 	}
 	s.lastApplied = index
 	s.lastPersistedID = lastID
