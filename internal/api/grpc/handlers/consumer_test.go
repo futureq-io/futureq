@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -28,7 +29,9 @@ import (
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
+	"google.golang.org/grpc/test/bufconn"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -245,7 +248,7 @@ func (s *LimitedConsumerSuite) TestTTLExpiresBetweenAuthorizationAndFirstFrame()
 				sendCalls++
 				return nil
 			}}
-			err = handler.sendDelivery(ctx, stream, "consumer", subscription.Recipient, message, frames)
+			err = handler.sendDelivery(ctx, stream, "consumer", subscription.Recipient, message, frames, func() {})
 			s.ErrorIs(err, errRetryTransportSkipped)
 			s.Zero(sendCalls)
 			due, err := raft.DueDeliveryAttempts(a.DB, time.Now().Add(time.Minute).UnixMilli())
@@ -306,7 +309,7 @@ func (s *LimitedConsumerSuite) TestAssignmentChangesBetweenAuthorizationAndFirst
 				sendCalls++
 				return nil
 			}}
-			err = handler.sendDelivery(ctx, stream, "consumer", subscription.Recipient, message, frames)
+			err = handler.sendDelivery(ctx, stream, "consumer", subscription.Recipient, message, frames, func() {})
 			s.ErrorIs(err, errRetryTransportSkipped)
 			s.Zero(sendCalls)
 			due, err := raft.DueDeliveryAttempts(a.DB, time.Now().Add(time.Minute).UnixMilli())
@@ -663,7 +666,7 @@ func (s *LimitedConsumerSuite) TestSuccessfulAutoACKSendWinsExpiryBeforeAdmissio
 
 			sent := 0
 			stream := &autoAckSendStream{send: func(*pb.QueueMessage) error { sent++; return nil }}
-			s.Require().NoError(handler.sendDelivery(ctx, stream, "consumer", subscription.Recipient, queued, frames))
+			s.Require().NoError(handler.sendDelivery(ctx, stream, "consumer", subscription.Recipient, queued, frames, func() {}))
 			s.Positive(sent)
 			s.Equal(tc.maxSendBytes > 0, sent > 1)
 
@@ -695,6 +698,77 @@ func (s *LimitedConsumerSuite) TestSuccessfulAutoACKSendWinsExpiryBeforeAdmissio
 			s.Empty(page.Page.Entries)
 		})
 	}
+}
+
+func (s *LimitedConsumerSuite) TestBlockedAutoACKFinalFrameClosesSubscription() {
+	a, hub, producer, _ := openPublishTest(s.T(), "pebble")
+	a.Config().Delivery.Subscriptions.AllowAutoAck = true
+	hub.SetDeliveryTimeout(300 * time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err := a.Subscriptions.Create(ctx, "orders", "workers", "")
+	s.Require().NoError(err)
+	// Four 32 KiB chunks fill the unread client's stream window and the
+	// server's write quota. The fifth and final chunk blocks inside gRPC Send.
+	const chunkSize = 32 << 10
+	payload := bytes.Repeat([]byte("x"), 4*chunkSize+1024)
+	published, err := producer.processBatch(ctx, &pb.PublishBatch{Messages: []*pb.PublishMessage{{
+		Topic: "orders", Payload: payload, MaxRetries: new(uint32(0)),
+	}}})
+	s.Require().NoError(err)
+	s.Require().True(published.GetSuccess())
+	keys := publishedKeys(s.T(), a.DB)
+	s.Require().Len(keys, 1)
+
+	logger := zap.NewNop()
+	ledger := dispatcher.NewDeliveryLedger(a.DB, nil, nil, nil)
+	ledger.ConfigureRetryOutcomes(1)
+	defer ledger.RemoveRetryTransports(keys)
+	var workers sync.WaitGroup
+	workers.Go(func() { ledger.RunRetryExpiry(ctx, time.Millisecond, nil, logger) })
+	defer func() { cancel(); workers.Wait() }()
+	handler := NewConsumerHandler(logger, hub, nil)
+	handler.RetryLedger = ledger
+	handler.MaxSendBytes = chunkSize + 32
+	server := grpc.NewServer(grpc.MaxSendMsgSize(handler.MaxSendBytes))
+	defer server.Stop()
+	pb.RegisterFutureQConsumerServer(server, handler)
+	listener := bufconn.Listen(1 << 20)
+	defer listener.Close() //nolint:errcheck
+	go func() { _ = server.Serve(listener) }()
+	conn, err := grpc.NewClient("passthrough:///stalled-final-frame",
+		grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) { return listener.DialContext(ctx) }),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithStaticStreamWindowSize(64<<10-1),
+	)
+	s.Require().NoError(err)
+	defer conn.Close() //nolint:errcheck
+	stream, err := pb.NewFutureQConsumerClient(conn).Subscribe(ctx)
+	s.Require().NoError(err)
+	s.Require().NoError(stream.Send(&pb.ConsumerFrame{Body: &pb.ConsumerFrame_Init{Init: &pb.SubscribeInit{
+		Topic: "orders", GroupId: "workers", AutoAck: true,
+	}}}))
+	_, err = stream.Header()
+	s.Require().NoError(err)
+	s.Require().NotEmpty(hub.DispatchToTopic("orders", &pb.QueueMessage{
+		Topic: "orders", Payload: payload, MaxRetries: new(uint32(0)),
+	}, keys[0]))
+
+	// Wait without reading or canceling the client stream.
+	s.Require().Eventually(func() bool {
+		page, err := (raft.DeadLetterQuery{Topic: "orders", Limit: 1}).Read(a.DB)
+		return err == nil && len(page.Page.Entries) == 1 &&
+			page.Page.Entries[0].GetReason() == pb.DeadLetterReason_DEAD_LETTER_REASON_TIMEOUT
+	}, 2*time.Second, 5*time.Millisecond, "stalled final frame must release its attempt to expiry")
+	for range 4 {
+		frame, err := stream.Recv()
+		s.Require().NoError(err)
+		s.True(frame.GetMoreChunks())
+	}
+	_, err = stream.Recv()
+	s.Equal(codes.DeadlineExceeded, status.Code(err))
+	s.Equal("automatic delivery final frame exceeded the attempt deadline", status.Convert(err).Message())
+	s.Empty(hub.LocalConsumers())
 }
 
 func (s *LimitedConsumerSuite) TestCanceledAutoACKDuringAuthorizationRefundsWithoutSend() {

@@ -239,11 +239,23 @@ func (h *ConsumerHandler) sender(
 	ch chan *pb.QueueMessage,
 	errCh chan error,
 ) {
+	ctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	onFinalSendTimeout := func() {
+		err := status.Error(codes.DeadlineExceeded, "automatic delivery final frame exceeded the attempt deadline")
+		cancel(err)
+		// Returning from Subscribe cancels the actual gRPC transport and
+		// unblocks Send. Keep the attempt protected until Send returns.
+		select {
+		case errCh <- err:
+		default:
+		}
+	}
 	recipient := metadata.DeliveryRecipient(init.GroupId, consumerID)
 	for {
 		select {
 		case <-ctx.Done():
-			errCh <- ctx.Err()
+			errCh <- context.Cause(ctx)
 			return
 		case msg := <-ch:
 			var frames *deliveryFrames
@@ -264,7 +276,7 @@ func (h *ConsumerHandler) sender(
 			// Observe before entering transport, where consumer backpressure
 			// can block the send.
 			metrics.DeliverySendLatenessMs.WithLabelValues(msg.Topic).Observe(float64(time.Now().UnixNano())/1e6 - float64(msg.EnqueuedAtUnixMs+msg.DelayMs))
-			if err := h.sendDelivery(ctx, stream, consumerID, recipient, msg, frames); err != nil {
+			if err := h.sendDelivery(ctx, stream, consumerID, recipient, msg, frames, onFinalSendTimeout); err != nil {
 				if frames.autoACK != nil {
 					frames.autoACK.Finish(false)
 				} else if msg.MaxRetries != nil {
@@ -352,17 +364,20 @@ func (h *ConsumerHandler) prepareDeliveryFrames(message *pb.QueueMessage) (*deli
 
 var errRetryTransportSkipped = errors.New("delivery attempt ended before the first frame")
 
-func (h *ConsumerHandler) sendDelivery(ctx context.Context, stream grpc.BidiStreamingServer[pb.ConsumerFrame, pb.QueueMessage], consumerID, recipient string, queued *pb.QueueMessage, frames *deliveryFrames) error {
+func (h *ConsumerHandler) sendDelivery(ctx context.Context, stream grpc.BidiStreamingServer[pb.ConsumerFrame, pb.QueueMessage], consumerID, recipient string, queued *pb.QueueMessage, frames *deliveryFrames, onFinalSendTimeout func()) error {
 	first := true
 	canSend := func() bool { return h.hub.CanSend(consumerID, queued) && ctx.Err() == nil }
 	send := func(frame *pb.QueueMessage) error {
 		if frames.autoACK != nil && !frame.GetMoreChunks() {
-			if !frames.autoACK.BeginFinalFrame(first, canSend) {
+			deadline := frames.autoACK.BeginFinalFrame(first, canSend)
+			if deadline.IsZero() {
 				if first {
 					return errRetryTransportSkipped
 				}
 				return status.Error(codes.Aborted, "delivery attempt ended before the final chunk")
 			}
+			timer := time.AfterFunc(time.Until(deadline), onFinalSendTimeout)
+			defer timer.Stop()
 		} else if first && frames.MaxRetries != nil && !h.RetryLedger.BeginRetryTransport(frames.DeliveryTag, canSend) {
 			return errRetryTransportSkipped
 		}

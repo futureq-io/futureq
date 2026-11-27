@@ -204,10 +204,10 @@ func (l *DeliveryLedger) AuthorizeRetrySend(streamCtx context.Context, start *de
 // BeginRetryTransport checks the delivery permit and deadlines immediately
 // before the first frame, using the same lock that arbitrates expiry.
 func (l *DeliveryLedger) BeginRetryTransport(tag []byte, canSend func() bool) bool {
-	return l.beginRetryFrame(retryIdentity(tag), true, nil, canSend)
+	return !l.beginRetryFrame(retryIdentity(tag), true, nil, canSend).IsZero()
 }
 
-func (l *DeliveryLedger) beginRetryFrame(id retryIdentity, first bool, autoACK *RetryAutoACK, canSend func() bool) bool {
+func (l *DeliveryLedger) beginRetryFrame(id retryIdentity, first bool, autoACK *RetryAutoACK, canSend func() bool) time.Time {
 	key := [utils.EventKeySize]byte(id[:utils.EventKeySize])
 	l.retry.mu.Lock()
 	transport, exists := l.retry.transports[key][id]
@@ -215,7 +215,7 @@ func (l *DeliveryLedger) beginRetryFrame(id retryIdentity, first bool, autoACK *
 	_, expiring := l.retry.expiring[id]
 	if (first && !held) || !exists || expiring {
 		l.retry.mu.Unlock()
-		return false
+		return time.Time{}
 	}
 	permitted := (autoACK == nil || (l.retry.autoACKs[id] == autoACK && !autoACK.sendingFinalFrame)) &&
 		canSend() && l.retryOwnerActive()
@@ -227,7 +227,7 @@ func (l *DeliveryLedger) beginRetryFrame(id retryIdentity, first bool, autoACK *
 			autoACK.sendingFinalFrame = true
 		}
 		l.retry.mu.Unlock()
-		return true
+		return transport.deadline
 	}
 	l.retry.mu.Unlock()
 	if first {
@@ -236,7 +236,7 @@ func (l *DeliveryLedger) beginRetryFrame(id retryIdentity, first bool, autoACK *
 			Key: key[:], Recipient: transport.recipient, Token: id[utils.EventKeySize:],
 		})
 	}
-	return false
+	return time.Time{}
 }
 
 func (l *DeliveryLedger) refundUnsentRetry(target *deliverypb.DeliveryAttemptTarget) {
@@ -479,9 +479,9 @@ type RetryAutoACK struct {
 	sendingFinalFrame bool // guarded by ledger.retry.mu until Finish
 }
 
-// BeginFinalFrame holds off expiry until Finish can report the transport result.
-// Earlier chunks remain subject to the normal attempt deadline.
-func (a *RetryAutoACK) BeginFinalFrame(first bool, canSend func() bool) bool {
+// BeginFinalFrame returns the deadline for closing a stalled send and holds off
+// expiry until Finish can report the result. A zero deadline rejects transport.
+func (a *RetryAutoACK) BeginFinalFrame(first bool, canSend func() bool) time.Time {
 	return a.ledger.beginRetryFrame(a.id, first, a, canSend)
 }
 
@@ -662,7 +662,7 @@ func (l *DeliveryLedger) commitRetryOutcome(ctx context.Context, outcome retryOu
 // ApplyRetry uses the same mutation lock and receipt cache as standalone ACKs.
 // Attempts and outcomes are synced before the caller uses the result.
 func (l *DeliveryLedger) ApplyRetry(command *deliverypb.RetryCommand) (uint64, error) {
-	return l.applyRetry(nil, command)
+	return l.applyRetry(context.TODO(), command)
 }
 
 func (l *DeliveryLedger) applyRetry(ctx context.Context, command *deliverypb.RetryCommand) (uint64, error) {
